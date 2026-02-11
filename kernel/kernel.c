@@ -12,6 +12,8 @@ extern void keyboard_wrapper(void);
 #define GRID_SIZE 10    // Number of neurons in our initial grid
 #define REFRACTORY_TICKS 10 // 10 ticks = 100ms of "silence" after a spike
 #define CRITICAL_THRESHOLD 15 // Spikes per second to trigger phase change
+#define PIXELS_COUNT 2
+#define NEURONS_PER_PIXEL 5
 
 int recent_spikes = 0;
 uint8_t current_bg_color = 0x1F; // Default Blue
@@ -24,7 +26,14 @@ typedef struct {
     int refractory_timer;  /* Ticks remaining in recovery */
 } Neuron;
 
-Neuron neural_grid[GRID_SIZE];
+
+typedef struct {
+    Neuron neurons[NEURONS_PER_PIXEL];
+    uint8_t current_phase;   /* 0 = FLUID (Responsive), 1 = RIGID (Protected) */
+    int pixel_recent_spikes; /* Local activity for this cluster */
+} NeuralPixel;
+
+NeuralPixel os_memory_map[PIXELS_COUNT];
 
 
 /* 2. Low-level Hardware Helpers */
@@ -87,58 +96,70 @@ void timer_handler(void) {
     tick++;
     unsigned short *video = (unsigned short *)0xB8000;
 
-    for (int i = 0; i < GRID_SIZE; i++) {
-        // --- Refractory Logic ---
-        if (neural_grid[i].refractory_timer > 0) {
-            neural_grid[i].refractory_timer--;
-            neural_grid[i].voltage = 0; // Lock voltage at 0 during recovery
+    // Iterate through each Pixelated Cluster
+    for (int p = 0; p < PIXELS_COUNT; p++) {
+        // Iterate through neurons within the current pixel
+        for (int i = 0; i < NEURONS_PER_PIXEL; i++) {
+            Neuron *n = &os_memory_map[p].neurons[i];
             
-            // Visual: Show a '#' to indicate the neuron is "recovering"
-            video[80 + i] = 0x1800 | '#'; 
-            continue; // Skip integration/firing for this neuron
-        }
+            // Calculate screen position: Line 2 (offset 80) + Pixel grouping
+            int screen_pos = 80 + (p * NEURONS_PER_PIXEL) + i;
 
-        // 1. Integration (Background Noise)
-        if (tick % (i + 5) == 0) neural_grid[i].voltage += 30;
-
-        // 2. Leakage (Bio-decay)
-        if (neural_grid[i].voltage > 0) neural_grid[i].voltage -= DECAY;
-
-        // 2.5 Weight Decay (Homeostasis)
-        // Every 100 ticks (~1 second), slightly weaken the synapses
-        if (tick % 100 == 0 && neural_grid[i].synaptic_weight > 100) {
-            neural_grid[i].synaptic_weight -= 5; 
-        }
-
-        // 3. Fire & Synaptic Propagation
-        if (neural_grid[i].voltage >= THRESHOLD) {
-            neural_grid[i].voltage = 0;
-            neural_grid[i].spike_count++;
-            neural_grid[i].refractory_timer = REFRACTORY_TICKS; // Enter recovery
-            int next = (i + 1) % GRID_SIZE;
-    
-            // 1. Apply weighted stimulus to the next neuron
-            neural_grid[next].voltage += neural_grid[i].synaptic_weight;
-    
-            // 2. Hebbian Learning: Strengthen the synapse (Plasticity)
-            // We cap it at 800 so it doesn't become an infinite feedback loop
-            if (neural_grid[i].synaptic_weight < 800) {
-                neural_grid[i].synaptic_weight += 10; 
+            // --- Refractory Logic ---
+            if (n->refractory_timer > 0) {
+                n->refractory_timer--;
+                n->voltage = 0; // Lock voltage at 0 during recovery
+                
+                // Visual: Show a '#' to indicate the neuron is "recovering"
+                video[screen_pos] = 0x1800 | '#'; 
+                continue; // Skip integration/firing for this neuron
             }
-            unsigned char color = 0x1A; // Default Green on Blue
-            if (neural_grid[i].synaptic_weight > 500) color = 0x1C; // Red on Blue
-            else if (neural_grid[i].synaptic_weight > 300) color = 0x1E; // Yellow on Blue
 
-            video[80 + i] = (color << 8) | '!';
-        } else {
-            // Visualize potential levels with different characters
-            if (neural_grid[i].voltage > 700) video[80 + i] = 0x1700 | '^';
-            else if (neural_grid[i].voltage > 300) video[80 + i] = 0x1700 | '.';
-            else video[80 + i] = 0x1F20;  // Clear 
+            // 1. Integration (Background Noise)
+            // RIGID PHASE (1) applies a dampening factor to voltage gain
+            int base_gain = (os_memory_map[p].current_phase == 1) ? 10 : 30;
+            if (tick % (i + p + 5) == 0) n->voltage += base_gain;
+
+            // 2. Leakage (Bio-decay)
+            if (n->voltage > 0) n->voltage -= DECAY;
+
+            // 2.5 Weight Decay (Homeostasis)
+            if (tick % 100 == 0 && n->synaptic_weight > 100) {
+                n->synaptic_weight -= 5; 
+            }
+
+            // 3. Fire & Synaptic Propagation
+            if (n->voltage >= THRESHOLD) {
+                n->voltage = 0;
+                n->spike_count++;
+                n->refractory_timer = REFRACTORY_TICKS; // Enter recovery
+                
+                // Propagate within the same pixel cluster
+                int next = (i + 1) % NEURONS_PER_PIXEL;
+                os_memory_map[p].neurons[next].voltage += n->synaptic_weight;
+        
+                // Hebbian Learning: Strengthen the synapse (Plasticity)
+                if (n->synaptic_weight < 800) {
+                    n->synaptic_weight += 10; 
+                }
+
+                unsigned char color = 0x1A; // Default Green on Blue
+                if (n->synaptic_weight > 500) color = 0x1C; // Red on Blue
+                else if (n->synaptic_weight > 300) color = 0x1E; // Yellow on Blue
+
+                video[screen_pos] = (color << 8) | '!';
+            } else {
+                // Visualize potential levels
+                if (n->voltage > 700) video[screen_pos] = 0x1700 | '^';
+                else if (n->voltage > 300) video[screen_pos] = 0x1700 | '.';
+                else video[screen_pos] = 0x1F20;  // Clear 
+            }
         }
     }
+
     // Keep the master heartbeat blinking in the corner
     video[79] = (tick % 20 < 10) ? 0x1F2A : 0x1F20; 
+    
     if (tick % 10 == 0) { // Update monitor every 10 ticks to save cycles
         update_monitor();
     }
@@ -173,44 +194,53 @@ void itoa(int n, char *str) {
 
 void update_monitor() {
     int total_spikes = 0;
-    for (int i = 0; i < GRID_SIZE; i++) {
-        total_spikes += neural_grid[i].spike_count;
-    }
-
-    // Calculate spikes in the last interval
-    static int last_total = 0;
-    recent_spikes = total_spikes - last_total;
-    last_total = total_spikes;
-
     unsigned short *video = (unsigned short *)0xB8000;
-    
-    // --- UPDATED: Obvious Phase Change Logic with Global Stiffness ---
-    const char *status_msg;
-    unsigned char phase_attr;
 
-    // Lowered to 5 for manual testing; if recent spikes > 5, we enter Critical Phase
-    if (recent_spikes > 5) { 
-        phase_attr = 0x4E; // Bright Yellow text on RED background
-        status_msg = "PHASE: CRITICAL (RIGID)  ";
-
-        // GLOBAL STIFFNESS: Actively suppress voltage to stabilize the system
-        // This is the "Phase-Change Metamaterial" logic in action.
-        for(int i = 0; i < GRID_SIZE; i++) {
-            if (neural_grid[i].voltage > 200) {
-                neural_grid[i].voltage -= 200; 
-            }
+    // Loop through each Pixelated Cluster to manage local phases
+    for (int p = 0; p < PIXELS_COUNT; p++) {
+        int pixel_spikes = 0;
+        
+        // Aggregate spikes for this specific pixel
+        for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
+            pixel_spikes += os_memory_map[p].neurons[n].spike_count;
         }
-    } else {
-        phase_attr = 0x1F; // White text on BLUE background
-        status_msg = "PHASE: STABLE (FLUID)    ";
+        total_spikes += pixel_spikes;
+
+        // Calculate local recent spikes (delta) for this pixel
+        static int last_pixel_totals[PIXELS_COUNT] = {0, 0};
+        int local_recent = pixel_spikes - last_pixel_totals[p];
+        last_pixel_totals[p] = pixel_spikes;
+
+        // --- PIXELATED Phase Change Logic ---
+        const char *pixel_msg;
+        unsigned char attr;
+
+        // Check criticality per pixel
+        if (local_recent > (CRITICAL_THRESHOLD / 2)) { 
+            os_memory_map[p].current_phase = 1; // RIGID
+            attr = 0x4E; // Yellow text on RED
+            pixel_msg = "P: RIGID ";
+
+            // LOCAL STIFFNESS: Suppress only this pixel's voltage
+            for(int i = 0; i < NEURONS_PER_PIXEL; i++) {
+                if (os_memory_map[p].neurons[i].voltage > 200) {
+                    os_memory_map[p].neurons[i].voltage -= 200; 
+                }
+            }
+        } else {
+            os_memory_map[p].current_phase = 0; // FLUID
+            attr = 0x1F; // White on BLUE
+            pixel_msg = "P: FLUID ";
+        }
+
+        // Print localized status for each pixel side-by-side on line 7
+        int phase_offset = (80 * 6) + (p * 15); 
+        for (int i = 0; pixel_msg[i] != '\0'; i++) {
+            video[phase_offset + i] = (attr << 8) | pixel_msg[i];
+        }
     }
 
-    // Print the status message on line 7
-    int phase_offset = 80 * 6; 
-    for (int i = 0; status_msg[i] != '\0'; i++) {
-        video[phase_offset + i] = (phase_attr << 8) | status_msg[i];
-    }
-
+    // --- Global UI Reporting ---
     char spike_str[10];
     itoa(total_spikes, spike_str);
 
@@ -233,9 +263,19 @@ void keyboard_handler(void) {
     __asm__ volatile("inb $0x60, %0" : "=a"(scancode));
 
     // Scancodes below 0x80 are "key down" events
-if (scancode < 0x80) {
-        // Stimulate Neuron 0 with a massive 500mV jolt
-            neural_grid[0].voltage += 500;
+    if (scancode < 0x80) {
+        // --- Neural Probe (The 'T' key for testing) ---
+        if (scancode == 0x14) { // 0x14 is the scancode for 'T'
+            // Artificially stimulate ALL neurons in Pixel 0 to test Critical Phase
+            // This allows testing without "destroying" biological constants.
+            for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
+                os_memory_map[0].neurons[n].spike_count += 5; 
+            }
+        } else {
+            // Normal Operation: Stimulate the FIRST neuron of the FIRST pixel
+            // This targets the specific cluster instead of a flat grid.
+            os_memory_map[0].neurons[0].voltage += 500;
+        }
 
         // Visual feedback on the monitor line
         unsigned short *video = (unsigned short *)0xB8000;
@@ -258,12 +298,20 @@ void kernel_main(void) {
         : : : "ax"
     );
 
-    for (int i = 0; i < GRID_SIZE; i++) {
-    neural_grid[i].voltage = 0;
-    neural_grid[i].spike_count = 0;
-    neural_grid[i].id = i;
-    neural_grid[i].synaptic_weight = 100; // Start with a base weight
-}
+// --- Initialize the Pixelated Memory Map ---
+    for (int p = 0; p < PIXELS_COUNT; p++) {
+        os_memory_map[p].current_phase = 0;     // Start in FLUID phase
+        os_memory_map[p].pixel_recent_spikes = 0;
+        
+        for (int i = 0; i < NEURONS_PER_PIXEL; i++) {
+            os_memory_map[p].neurons[i].voltage = 0;
+            os_memory_map[p].neurons[i].spike_count = 0;
+            os_memory_map[p].neurons[i].synaptic_weight = 100; // Base weight
+            os_memory_map[p].neurons[i].refractory_timer = 0;
+            // ID can be unique across the whole system: (pixel_index * size + neuron_index)
+            os_memory_map[p].neurons[i].id = (p * NEURONS_PER_PIXEL) + i;
+        }
+    }
 
     /* Setup the NeuroCore pulse */
     init_timer(100);  /* 100Hz frequency */
