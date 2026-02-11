@@ -5,7 +5,7 @@ typedef unsigned int uint32_t;
 
 /* External assembly wrapper for the timer */
 extern void timer_wrapper(void);
-
+extern void keyboard_wrapper(void);
 
 #define THRESHOLD 1000  // Membrane potential required to spike
 #define DECAY 5         // Voltage lost per clock tick (leaky behavior)
@@ -67,6 +67,8 @@ void init_idt() {
 
     /* Register our timer wrapper (IRQ0 -> Index 32) */
     set_idt_gate(32, (uint32_t)timer_wrapper);
+    
+    set_idt_gate(33, (uint32_t)keyboard_wrapper); // Keyboard
 
     /* Load the IDT into the CPU and enable interrupts */
     __asm__ volatile("lidt (%0)" : : "r" (&idtp));
@@ -173,6 +175,22 @@ void update_monitor() {
     // Print the actual count
     for (int i = 0; spike_str[i] != '\0'; i++) {
         video[offset + 19 + i] = 0x0E00 | spike_str[i];
+    }
+}
+
+void keyboard_handler(void) {
+    // Read the scancode from the keyboard data port
+    uint8_t scancode = 0;
+    __asm__ volatile("inb $0x60, %0" : "=a"(scancode));
+
+    // Scancodes below 0x80 are "key down" events
+    if (scancode < 0x80) {
+        // Stimulate Neuron 0 with a massive 500mV jolt
+        neural_grid[0].voltage += 500;
+
+        // Visual feedback on the monitor line
+        unsigned short *video = (unsigned short *)0xB8000;
+        video[80 * 5] = 0x0F00 | 'K'; // Show 'K' for Keyboard event
     }
 }
 

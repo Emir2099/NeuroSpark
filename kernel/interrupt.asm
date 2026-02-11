@@ -12,3 +12,19 @@ timer_wrapper:
     
     popa                ; Restore registers
     iretd               ; Return to whatever the CPU was doing
+
+
+; New keyboard wrapper
+global keyboard_wrapper
+extern keyboard_handler
+
+keyboard_wrapper:
+    pusha
+    call keyboard_handler
+    
+    ; Send End-of-Interrupt to PIC
+    mov al, 0x20
+    out 0x20, al
+    
+    popa
+    iretd
