@@ -2,7 +2,6 @@
 typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
-#define REFRACTORY_TICKS 10 // 10 ticks = 100ms of "silence" after a spike
 
 /* External assembly wrapper for the timer */
 extern void timer_wrapper(void);
@@ -11,6 +10,11 @@ extern void keyboard_wrapper(void);
 #define THRESHOLD 1000  // Membrane potential required to spike
 #define DECAY 5         // Voltage lost per clock tick (leaky behavior)
 #define GRID_SIZE 10    // Number of neurons in our initial grid
+#define REFRACTORY_TICKS 10 // 10 ticks = 100ms of "silence" after a spike
+#define CRITICAL_THRESHOLD 15 // Spikes per second to trigger phase change
+
+int recent_spikes = 0;
+uint8_t current_bg_color = 0x1F; // Default Blue
 
 typedef struct {
     int voltage;        /* Current membrane potential */
@@ -173,10 +177,43 @@ void update_monitor() {
         total_spikes += neural_grid[i].spike_count;
     }
 
+    // Calculate spikes in the last interval
+    static int last_total = 0;
+    recent_spikes = total_spikes - last_total;
+    last_total = total_spikes;
+
+    unsigned short *video = (unsigned short *)0xB8000;
+    
+    // --- UPDATED: Obvious Phase Change Logic with Global Stiffness ---
+    const char *status_msg;
+    unsigned char phase_attr;
+
+    // Lowered to 5 for manual testing; if recent spikes > 5, we enter Critical Phase
+    if (recent_spikes > 5) { 
+        phase_attr = 0x4E; // Bright Yellow text on RED background
+        status_msg = "PHASE: CRITICAL (RIGID)  ";
+
+        // GLOBAL STIFFNESS: Actively suppress voltage to stabilize the system
+        // This is the "Phase-Change Metamaterial" logic in action.
+        for(int i = 0; i < GRID_SIZE; i++) {
+            if (neural_grid[i].voltage > 200) {
+                neural_grid[i].voltage -= 200; 
+            }
+        }
+    } else {
+        phase_attr = 0x1F; // White text on BLUE background
+        status_msg = "PHASE: STABLE (FLUID)    ";
+    }
+
+    // Print the status message on line 7
+    int phase_offset = 80 * 6; 
+    for (int i = 0; status_msg[i] != '\0'; i++) {
+        video[phase_offset + i] = (phase_attr << 8) | status_msg[i];
+    }
+
     char spike_str[10];
     itoa(total_spikes, spike_str);
 
-    unsigned short *video = (unsigned short *)0xB8000;
     const char *label = "TOTAL GRID SPIKES: ";
     
     // Print label on the 5th line (80 * 4)
@@ -196,9 +233,9 @@ void keyboard_handler(void) {
     __asm__ volatile("inb $0x60, %0" : "=a"(scancode));
 
     // Scancodes below 0x80 are "key down" events
-    if (scancode < 0x80) {
+if (scancode < 0x80) {
         // Stimulate Neuron 0 with a massive 500mV jolt
-        neural_grid[0].voltage += 500;
+            neural_grid[0].voltage += 500;
 
         // Visual feedback on the monitor line
         unsigned short *video = (unsigned short *)0xB8000;
