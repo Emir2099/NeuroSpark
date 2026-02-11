@@ -15,6 +15,7 @@ typedef struct {
     int voltage;        /* Current membrane potential */
     int spike_count;    /* Total spikes fired by this neuron */
     int id;             /* Unique identifier */
+    int synaptic_weight; /* Strength of connection to the next neuron */
 } Neuron;
 
 Neuron neural_grid[GRID_SIZE];
@@ -89,11 +90,17 @@ void timer_handler(void) {
         if (neural_grid[i].voltage >= THRESHOLD) {
             neural_grid[i].voltage = 0;
             neural_grid[i].spike_count++;
-            
-            // If this neuron fires, stimulate the NEXT neuron in the grid
-            int next_neuron = (i + 1) % GRID_SIZE;
-            neural_grid[next_neuron].voltage += 400; // Significant jolt!
-            // --------------------------
+    
+            int next = (i + 1) % GRID_SIZE;
+    
+            // 1. Apply weighted stimulus to the next neuron
+            neural_grid[next].voltage += neural_grid[i].synaptic_weight;
+    
+            // 2. Hebbian Learning: Strengthen the synapse (Plasticity)
+            // We cap it at 800 so it doesn't become an infinite feedback loop
+            if (neural_grid[i].synaptic_weight < 800) {
+                neural_grid[i].synaptic_weight += 10; 
+            }
 
             video[80 + i] = 0x1E00 | '!'; 
         } else {
@@ -179,6 +186,7 @@ void kernel_main(void) {
     neural_grid[i].voltage = 0;
     neural_grid[i].spike_count = 0;
     neural_grid[i].id = i;
+    neural_grid[i].synaptic_weight = 100; // Start with a base weight
 }
 
     /* Setup the NeuroCore pulse */
