@@ -79,34 +79,30 @@ void timer_handler(void) {
     unsigned short *video = (unsigned short *)0xB8000;
 
     for (int i = 0; i < GRID_SIZE; i++) {
-        // 1. Integration: Add simulated input (noise)
-        // We use the tick and ID to create varied input patterns
-        if (tick % (i + 3) == 0) {
-            neural_grid[i].voltage += 40; 
-        }
+        // 1. Integration (Background Noise)
+        if (tick % (i + 5) == 0) neural_grid[i].voltage += 30;
 
-        // 2. Leakage: Voltage slowly drops back to zero
-        if (neural_grid[i].voltage > 0) {
-            neural_grid[i].voltage -= DECAY;
-        }
+        // 2. Leakage (Bio-decay)
+        if (neural_grid[i].voltage > 0) neural_grid[i].voltage -= DECAY;
 
-        // 3. Fire: Check if threshold is reached
+        // 3. Fire & Synaptic Propagation
         if (neural_grid[i].voltage >= THRESHOLD) {
-            neural_grid[i].voltage = 0; // Reset potential
+            neural_grid[i].voltage = 0;
             neural_grid[i].spike_count++;
             
-            // Visual Spike: Print a bright '!' on the second line
+            // If this neuron fires, stimulate the NEXT neuron in the grid
+            int next_neuron = (i + 1) % GRID_SIZE;
+            neural_grid[next_neuron].voltage += 400; // Significant jolt!
+            // --------------------------
+
             video[80 + i] = 0x1E00 | '!'; 
         } else {
-            // Visual Potential: Show a small dot if building charge
-            if (neural_grid[i].voltage > 500) {
-                video[80 + i] = 0x1700 | '.';
-            } else {
-                video[80 + i] = 0x1F20; // Clear
-            }
+            // Visualize potential levels with different characters
+            if (neural_grid[i].voltage > 700) video[80 + i] = 0x1700 | '^';
+            else if (neural_grid[i].voltage > 300) video[80 + i] = 0x1700 | '.';
+            else video[80 + i] = 0x1F20;  // Clear 
         }
     }
-
     // Keep the master heartbeat blinking in the corner
     video[79] = (tick % 20 < 10) ? 0x1F2A : 0x1F20; 
 }
