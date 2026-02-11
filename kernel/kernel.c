@@ -2,6 +2,7 @@
 typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
+#define REFRACTORY_TICKS 10 // 10 ticks = 100ms of "silence" after a spike
 
 /* External assembly wrapper for the timer */
 extern void timer_wrapper(void);
@@ -16,6 +17,7 @@ typedef struct {
     int spike_count;    /* Total spikes fired by this neuron */
     int id;             /* Unique identifier */
     int synaptic_weight; /* Strength of connection to the next neuron */
+    int refractory_timer;  /* Ticks remaining in recovery */
 } Neuron;
 
 Neuron neural_grid[GRID_SIZE];
@@ -67,7 +69,7 @@ void init_idt() {
 
     /* Register our timer wrapper (IRQ0 -> Index 32) */
     set_idt_gate(32, (uint32_t)timer_wrapper);
-    
+
     set_idt_gate(33, (uint32_t)keyboard_wrapper); // Keyboard
 
     /* Load the IDT into the CPU and enable interrupts */
@@ -82,6 +84,16 @@ void timer_handler(void) {
     unsigned short *video = (unsigned short *)0xB8000;
 
     for (int i = 0; i < GRID_SIZE; i++) {
+        // --- Refractory Logic ---
+        if (neural_grid[i].refractory_timer > 0) {
+            neural_grid[i].refractory_timer--;
+            neural_grid[i].voltage = 0; // Lock voltage at 0 during recovery
+            
+            // Visual: Show a '#' to indicate the neuron is "recovering"
+            video[80 + i] = 0x1800 | '#'; 
+            continue; // Skip integration/firing for this neuron
+        }
+
         // 1. Integration (Background Noise)
         if (tick % (i + 5) == 0) neural_grid[i].voltage += 30;
 
@@ -98,7 +110,7 @@ void timer_handler(void) {
         if (neural_grid[i].voltage >= THRESHOLD) {
             neural_grid[i].voltage = 0;
             neural_grid[i].spike_count++;
-    
+            neural_grid[i].refractory_timer = REFRACTORY_TICKS; // Enter recovery
             int next = (i + 1) % GRID_SIZE;
     
             // 1. Apply weighted stimulus to the next neuron
