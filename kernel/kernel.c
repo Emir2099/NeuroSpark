@@ -86,6 +86,12 @@ void timer_handler(void) {
         // 2. Leakage (Bio-decay)
         if (neural_grid[i].voltage > 0) neural_grid[i].voltage -= DECAY;
 
+        // 2.5 Weight Decay (Homeostasis)
+        // Every 100 ticks (~1 second), slightly weaken the synapses
+        if (tick % 100 == 0 && neural_grid[i].synaptic_weight > 100) {
+            neural_grid[i].synaptic_weight -= 5; 
+        }
+
         // 3. Fire & Synaptic Propagation
         if (neural_grid[i].voltage >= THRESHOLD) {
             neural_grid[i].voltage = 0;
@@ -101,8 +107,11 @@ void timer_handler(void) {
             if (neural_grid[i].synaptic_weight < 800) {
                 neural_grid[i].synaptic_weight += 10; 
             }
+            unsigned char color = 0x1A; // Default Green on Blue
+            if (neural_grid[i].synaptic_weight > 500) color = 0x1C; // Red on Blue
+            else if (neural_grid[i].synaptic_weight > 300) color = 0x1E; // Yellow on Blue
 
-            video[80 + i] = 0x1E00 | '!'; 
+            video[80 + i] = (color << 8) | '!';
         } else {
             // Visualize potential levels with different characters
             if (neural_grid[i].voltage > 700) video[80 + i] = 0x1700 | '^';
