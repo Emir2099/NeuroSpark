@@ -6,6 +6,20 @@ typedef unsigned int uint32_t;
 /* External assembly wrapper for the timer */
 extern void timer_wrapper(void);
 
+
+#define THRESHOLD 1000  // Membrane potential required to spike
+#define DECAY 5         // Voltage lost per clock tick (leaky behavior)
+#define GRID_SIZE 10    // Number of neurons in our initial grid
+
+typedef struct {
+    int voltage;        /* Current membrane potential */
+    int spike_count;    /* Total spikes fired by this neuron */
+    int id;             /* Unique identifier */
+} Neuron;
+
+Neuron neural_grid[GRID_SIZE];
+
+
 /* 2. Low-level Hardware Helpers */
 static inline void outb(uint16_t port, uint8_t val) {
     __asm__ volatile ( "outb %0, %1" : : "a"(val), "Nd"(port) );
@@ -62,15 +76,39 @@ void init_idt() {
 uint32_t tick = 0;
 void timer_handler(void) {
     tick++;
-    unsigned short *video_memory = (unsigned short *)0xB8000;
-    
-    /* Create a blinking heart (pixel) in top-right corner */
-    /* This proves the interrupt is firing asynchronously. */
-    if (tick % 20 == 0) {
-        video_memory[79] = 0x1F00 | '*'; // Asterisk visible
-    } else if (tick % 10 == 0) {
-        video_memory[79] = 0x1F20;       // Space (hidden)
+    unsigned short *video = (unsigned short *)0xB8000;
+
+    for (int i = 0; i < GRID_SIZE; i++) {
+        // 1. Integration: Add simulated input (noise)
+        // We use the tick and ID to create varied input patterns
+        if (tick % (i + 3) == 0) {
+            neural_grid[i].voltage += 40; 
+        }
+
+        // 2. Leakage: Voltage slowly drops back to zero
+        if (neural_grid[i].voltage > 0) {
+            neural_grid[i].voltage -= DECAY;
+        }
+
+        // 3. Fire: Check if threshold is reached
+        if (neural_grid[i].voltage >= THRESHOLD) {
+            neural_grid[i].voltage = 0; // Reset potential
+            neural_grid[i].spike_count++;
+            
+            // Visual Spike: Print a bright '!' on the second line
+            video[80 + i] = 0x1E00 | '!'; 
+        } else {
+            // Visual Potential: Show a small dot if building charge
+            if (neural_grid[i].voltage > 500) {
+                video[80 + i] = 0x1700 | '.';
+            } else {
+                video[80 + i] = 0x1F20; // Clear
+            }
+        }
     }
+
+    // Keep the master heartbeat blinking in the corner
+    video[79] = (tick % 20 < 10) ? 0x1F2A : 0x1F20; 
 }
 
 void init_timer(uint32_t frequency) {
@@ -93,6 +131,12 @@ void kernel_main(void) {
         "mov %%ax, %%ss\n"
         : : : "ax"
     );
+
+    for (int i = 0; i < GRID_SIZE; i++) {
+    neural_grid[i].voltage = 0;
+    neural_grid[i].spike_count = 0;
+    neural_grid[i].id = i;
+}
 
     /* Setup the NeuroCore pulse */
     init_timer(100);  /* 100Hz frequency */
