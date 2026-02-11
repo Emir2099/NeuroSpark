@@ -105,6 +105,9 @@ void timer_handler(void) {
     }
     // Keep the master heartbeat blinking in the corner
     video[79] = (tick % 20 < 10) ? 0x1F2A : 0x1F20; 
+    if (tick % 10 == 0) { // Update monitor every 10 ticks to save cycles
+        update_monitor();
+    }
 }
 
 void init_timer(uint32_t frequency) {
@@ -113,6 +116,50 @@ void init_timer(uint32_t frequency) {
     outb(0x40, (uint8_t)(divisor & 0xFF));
     outb(0x40, (uint8_t)((divisor >> 8) & 0xFF));
 }
+
+
+void itoa(int n, char *str) {
+    int i = 0, is_negative = 0;
+    if (n == 0) { str[i++] = '0'; str[i] = '\0'; return; }
+    if (n < 0) { is_negative = 1; n = -n; }
+    while (n != 0) {
+        str[i++] = (n % 10) + '0';
+        n = n / 10;
+    }
+    if (is_negative) str[i++] = '-';
+    str[i] = '\0';
+    // Reverse the string
+    for (int j = 0; j < i / 2; j++) {
+        char temp = str[j];
+        str[j] = str[i - j - 1];
+        str[i - j - 1] = temp;
+    }
+}
+
+
+void update_monitor() {
+    int total_spikes = 0;
+    for (int i = 0; i < GRID_SIZE; i++) {
+        total_spikes += neural_grid[i].spike_count;
+    }
+
+    char spike_str[10];
+    itoa(total_spikes, spike_str);
+
+    unsigned short *video = (unsigned short *)0xB8000;
+    const char *label = "TOTAL GRID SPIKES: ";
+    
+    // Print label on the 5th line (80 * 4)
+    int offset = 80 * 4;
+    for (int i = 0; label[i] != '\0'; i++) {
+        video[offset + i] = 0x0F00 | label[i];
+    }
+    // Print the actual count
+    for (int i = 0; spike_str[i] != '\0'; i++) {
+        video[offset + 19 + i] = 0x0E00 | spike_str[i];
+    }
+}
+
 
 /* 6. Kernel Entry Point */
 __attribute__((section(".text.entry")))
