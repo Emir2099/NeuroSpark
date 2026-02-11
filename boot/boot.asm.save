@@ -1,0 +1,91 @@
+[org 0x7c00]
+KERNEL_OFFSET equ 0x1000
+
+    jmp 0x0000:start
+`
+start:
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov sp, 0x7c00
+    mov [BOOT_DRIVE], dl
+
+    mov ah, 0x0e
+    mov al, 'A'
+    int 0x10
+
+    call load_disk
+
+    mov ah, 0x0e
+    mov al, 'L'
+    int 0x10
+
+    cli
+    lgdt [gdt_descriptor]
+    mov eax, cr0
+    or eax, 0x1
+    mov cr0, eax
+    jmp 0x08:init_pm
+
+[bits 32]
+init_pm:
+    mov ax, 0x10
+    mov ds, ax
+    mov ss, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ebp, 0x90000
+    mov esp, ebp
+
+    call KERNEL_OFFSET
+    jmp $
+
+
+; Disk Address Packet for LBA read
+dap:
+    db 0x10           ; Size of packet (16 bytes)
+    db 0              ; Reserved
+    dw 10             ; Number of sectors to read
+    dw KERNEL_OFFSET  ; Offset (destination)
+    dw 0x0000         ; Segment (destination)
+    dd 1              ; LBA sector 1 (0-based, sector after bootloader)
+    dd 0              ; Upper 32 bits of LBA (zero)
+
+disk_error:
+    mov bx, ax
+    mov ah, 0x0e
+    mov al, 'E'
+    int 0x10
+    mov al, bh
+    shr al, 4
+    add al, '0'
+    cmp al, '9'
+    jle .p1
+    add al, 7
+.p1:
+    mov ah, 0x0e
+    int 0x10
+    mov al, bh
+    and al, 0x0F
+    add al, '0'
+    cmp al, '9'
+    jle .p2
+    add al, 7
+.p2:
+    mov ah, 0x0e
+    int 0x10
+    jmp $
+
+gdt_start: dq 0x0
+gdt_code:  dw 0xffff, 0x0, 0x9a00, 0x00cf
+gdt_data:  dw 0xffff, 0x0, 0x9200, 0x00cf
+gdt_end:
+gdt_descriptor:
+    dw gdt_end - gdt_start - 1
+    dd gdt_start
+
+BOOT_DRIVE db 0
+times 510-($-$$) db 0
+dw 0xaa55

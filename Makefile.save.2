@@ -1,0 +1,32 @@
+# Use the cross-compiler we built earlier
+CC = i686-elf-gcc
+LD = i686-elf-ld
+# C flags: -ffreestanding means no standard library
+CFLAGS = -ffreestanding -m32 -O2 -fno-stack-protector -fno-pic -fno-pie
+
+all: NeuroSpark.bin
+
+# Smash the bootloader and kernel together and pad with zeros
+NeuroSpark.bin: boot/boot.bin kernel.bin
+	cat boot/boot.bin kernel.bin > temp.bin
+	truncate -s 16384 temp.bin  # FIX: Increased to 16KB (32 sectors)
+	mv temp.bin NeuroSpark.bin
+
+# Assemble the bootloader
+boot/boot.bin: boot/boot.asm
+	nasm -f bin $< -o $@
+
+# Compile and Link the kernel
+kernel.bin: kernel/kernel.c
+	$(CC) $(CFLAGS) -c $< -o kernel.o
+	$(LD) -o $@ -T linker.ld kernel.o --oformat binary --strip-all -z max-page-size=0x1000
+
+# Clean the workspace
+clean:
+	rm -rf *.bin *.o boot/*.bin
+
+run: NeuroSpark.bin
+	@echo "Booting as Hard Disk 0x80..."
+	qemu-system-i386 -drive file=$<,format=raw,index=0,media=disk -display curses
+
+
