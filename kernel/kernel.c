@@ -51,6 +51,9 @@ typedef struct {
     // Stores the 'learned' weights and current potential for 5 neurons
     int saved_voltages[NEURONS_PER_PIXEL];
     int saved_weights[NEURONS_PER_PIXEL];
+
+    int last_spike_count;    /* Spike count from the previous second */
+    int spikes_per_second;   /* Calculated real-time throughput */
 } TaskControlBlock;
 
 // For now, let's define two tasks
@@ -118,7 +121,14 @@ void timer_handler(void) {
 
     // Iterate through each Pixelated Cluster
     for (int p = 0; p < PIXELS_COUNT; p++) {
-        TaskControlBlock *current_task = &task_list[p];
+    // Find which task is assigned to this pixel
+    TaskControlBlock *current_task = 0;
+    for (int t = 0; t < 2; t++) {
+        if (task_list[t].target_pixel == p) {
+            current_task = &task_list[t];
+            break;
+        }
+    }
         // Iterate through neurons within the current pixel
         for (int i = 0; i < NEURONS_PER_PIXEL; i++) {
             Neuron *n = &os_memory_map[p].neurons[i];
@@ -142,13 +152,14 @@ void timer_handler(void) {
             int base_gain = (os_memory_map[p].current_phase == 1) ? 10 : current_task->base_integration;
             
             // --- CONSOLIDATED INTEGRATION LOGIC ---
-            // We apply task-specific rhythms based on the TCB assignment
-            if (p == TASK_IO) {
+            // We apply task-specific rhythms based on the TASK assigned to this pixel
+            if (current_task->task_id == TASK_IO) {
                 // I/O Pixel: Fires based on high-frequency external stimulus
                 if (tick % (i + 2) == 0) n->voltage += base_gain; 
             } else {
                 // Compute Pixel: Fires in a slow, stable rhythmic pulse
-                if (tick % 20 == 0) n->voltage += (base_gain / 2);
+                // if (tick % 20 == 0) n->voltage += (base_gain / 2);
+                if (tick % 4 == 0) n->voltage += 25;
             }
 
             // 2. Leakage (Bio-decay)
@@ -187,14 +198,6 @@ void timer_handler(void) {
             }
 
             
-
-            if (p == TASK_IO) {
-            // I/O Pixel: Fires based on high-frequency external stimulus
-                if (tick % (i + 2) == 0) n->voltage += base_gain; 
-                } else {
-                // Compute Pixel: Fires in a slow, stable rhythmic pulse
-                if (tick % 20 == 0) n->voltage += (base_gain / 2);
-            }
         }
     }
 
@@ -239,6 +242,15 @@ void update_monitor() {
 
     // Loop through each Pixelated Cluster to manage local phases
     for (int p = 0; p < PIXELS_COUNT; p++) {
+    // Find which task is assigned to this pixel
+    TaskControlBlock *current_task = 0;
+    for (int t = 0; t < 2; t++) {
+        if (task_list[t].target_pixel == p) {
+            current_task = &task_list[t];
+            break;
+        }
+    }
+
         int pixel_spikes = 0;
         
         // Aggregate spikes for this specific pixel
@@ -251,6 +263,12 @@ void update_monitor() {
         static int last_pixel_totals[PIXELS_COUNT] = {0, 0};
         int local_recent = pixel_spikes - last_pixel_totals[p];
         last_pixel_totals[p] = pixel_spikes;
+
+        // --- Neural Logging (SPS Calculation) ---
+        // Since update_monitor runs every 10 ticks (100ms), 
+        // we multiply by 10 to get the estimated Spikes Per Second.
+        current_task->spikes_per_second = local_recent * 10;
+        current_task->last_spike_count = pixel_spikes;
 
         // --- PIXELATED Phase Change Logic ---
         const char *pixel_msg;
@@ -279,9 +297,9 @@ void update_monitor() {
 
         // --- Print Task Name + Phase Status ---
         // Format: "IO: FLUID" or "COMP: RIGID"
-        // We use a wider spacing (30 chars) to prevent overlap on Line 7
-        int offset = (80 * 6) + (p * 25);
-        const char *t_name = task_list[p].task_name;
+        // We use a wider spacing (40 chars) to prevent overlap on Line 7
+        int offset = (80 * 6) + (p * 40);
+        const char *t_name = current_task->task_name;
 
         // Print Task Name
         for (int i = 0; t_name[i] != '\0'; i++) {
@@ -299,6 +317,22 @@ void update_monitor() {
         // Clean up: Clear a few trailing characters to ensure old text doesn't ghost
         video[offset + 11] = (attr << 8) | ' ';
         video[offset + 12] = (attr << 8) | ' ';
+
+        // --- Display Neural Logging (SPS) on Line 8 ---
+        int log_offset = (80 * 7) + (p * 40);
+        char sps_str[10];
+        itoa(current_task->spikes_per_second, sps_str);
+
+        const char *sps_label = "SPS: ";
+        for (int i = 0; sps_label[i] != '\0'; i++) {
+            video[log_offset + i] = 0x0700 | sps_label[i]; // Light Grey
+        }
+        for (int i = 0; sps_str[i] != '\0'; i++) {
+            video[log_offset + 5 + i] = 0x0E00 | sps_str[i]; // Yellow
+        }
+        // Clear old digits to prevent 100 becoming 1000 accidentally
+        video[log_offset + 8] = 0x0700 | ' ';
+        video[log_offset + 9] = 0x0700 | ' ';
     }
 
     // --- Global UI Reporting ---
@@ -316,14 +350,51 @@ void update_monitor() {
     for (int i = 0; spike_str[i] != '\0'; i++) {
         video[offset + 19 + i] = 0x0E00 | spike_str[i];
     }
+
+    // --- DEBUG OUTPUT ---
+// Show which task is on which pixel on line 10
+int debug_line = 80 * 9;
+for (int p = 0; p < PIXELS_COUNT; p++) {
+    char debug_msg[20];
+    int idx = 0;
+    
+    // Find task for this pixel
+    TaskControlBlock *dbg_task = 0;
+    for (int t = 0; t < 2; t++) {
+        if (task_list[t].target_pixel == p) {
+            dbg_task = &task_list[t];
+            break;
+        }
+    }
+    
+    // Format: "P0:T0 P1:T1"
+    debug_msg[idx++] = 'P';
+    debug_msg[idx++] = '0' + p;
+    debug_msg[idx++] = ':';
+    debug_msg[idx++] = 'T';
+    debug_msg[idx++] = '0' + dbg_task->task_id;
+    debug_msg[idx++] = ' ';
+    debug_msg[idx] = '\0';
+    
+    for (int i = 0; debug_msg[i] != '\0'; i++) {
+        video[debug_line + (p * 10) + i] = 0x0F00 | debug_msg[i];
+    }
+}
 }
 
 void switch_tasks() {
-    // 1. SAVE current state of Pixel 0 to Task 0 and Pixel 1 to Task 1
+    // 1. SAVE current state - find which task owns which pixel first
     for (int p = 0; p < PIXELS_COUNT; p++) {
-        for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
-            task_list[p].saved_voltages[n] = os_memory_map[p].neurons[n].voltage;
-            task_list[p].saved_weights[n] = os_memory_map[p].neurons[n].synaptic_weight;
+        // Find the task assigned to this pixel
+        for (int t = 0; t < 2; t++) {
+            if (task_list[t].target_pixel == p) {
+                // Save this pixel's state to the correct task
+                for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
+                    task_list[t].saved_voltages[n] = os_memory_map[p].neurons[n].voltage;
+                    task_list[t].saved_weights[n] = os_memory_map[p].neurons[n].synaptic_weight;
+                }
+                break;
+            }
         }
     }
 
@@ -338,10 +409,17 @@ void switch_tasks() {
 
     // 4. LOAD the new state into the Pixels (Neural Persistence)
     // Instead of clearing to 0, we restore the saved state of the incoming task.
-    for (int p = 0; p < PIXELS_COUNT; p++) {
-        for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
-            os_memory_map[p].neurons[n].voltage = task_list[p].saved_voltages[n];
-            os_memory_map[p].neurons[n].synaptic_weight = task_list[p].saved_weights[n];
+     for (int p = 0; p < PIXELS_COUNT; p++) {
+        // Find which task is now assigned to this pixel (after the swap)
+        for (int t = 0; t < 2; t++) {
+            if (task_list[t].target_pixel == p) {
+                // Restore this task's saved state to the pixel
+                for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
+                    os_memory_map[p].neurons[n].voltage = task_list[t].saved_voltages[n];
+                    os_memory_map[p].neurons[n].synaptic_weight = task_list[t].saved_weights[n];
+                }
+                break;
+            }
         }
     }
 
@@ -355,6 +433,7 @@ void switch_tasks() {
         }
     }
     */
+
 }
 
 void keyboard_handler(void) {
@@ -368,13 +447,26 @@ void keyboard_handler(void) {
         if (scancode == 0x14) { // 0x14 is the scancode for 'T'
             // Artificially stimulate ALL neurons in Pixel 0 to test Critical Phase
             // This allows testing without "destroying" biological constants.
+            // for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
+            //     os_memory_map[0].neurons[n].spike_count += 5; 
+            // }
+
+            // Stimulate VOLTAGE instead of SPIKE_COUNT
+            // This allows the RIGID phase to naturally suppress the surge
             for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
-                os_memory_map[0].neurons[n].spike_count += 5; 
+                os_memory_map[0].neurons[n].voltage += 300; 
             }
         }
         else if (scancode == 0x1F) { // 'S' key for Switch
             switch_tasks();
-        } 
+        }
+        
+        else if (scancode == 0x2C) { // 'Z' key
+    // Manually fire the COMPUTE pixel (pixel 1)
+    for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
+        os_memory_map[1].neurons[n].voltage += 1000; // Force a spike
+    }
+}
         else {
             // Normal Operation: Stimulate the FIRST neuron of the FIRST pixel
             // This targets the specific cluster instead of a flat grid.
@@ -428,7 +520,7 @@ void kernel_main(void) {
     // Task 1: Background Computation (Assigned to Pixel 1)
     task_list[1].task_id = 1;
     task_list[1].task_name = "COMP";
-    task_list[1].base_integration = 15; // Slow, stable pulse for systems
+    task_list[1].base_integration = 60; // Slow, stable pulse for systems
     task_list[1].target_pixel = 1;
 
     // ---  Initialize TCB Saved States for Neural Persistence ---
