@@ -47,6 +47,10 @@ typedef struct {
     int fire_threshold;
     
     const char* task_name;
+
+    // Stores the 'learned' weights and current potential for 5 neurons
+    int saved_voltages[NEURONS_PER_PIXEL];
+    int saved_weights[NEURONS_PER_PIXEL];
 } TaskControlBlock;
 
 // For now, let's define two tasks
@@ -315,22 +319,42 @@ void update_monitor() {
 }
 
 void switch_tasks() {
-    // 1. Swap the data in the task_list
+    // 1. SAVE current state of Pixel 0 to Task 0 and Pixel 1 to Task 1
+    for (int p = 0; p < PIXELS_COUNT; p++) {
+        for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
+            task_list[p].saved_voltages[n] = os_memory_map[p].neurons[n].voltage;
+            task_list[p].saved_weights[n] = os_memory_map[p].neurons[n].synaptic_weight;
+        }
+    }
+
+    // 2. SWAP the Task Control Blocks in the list
     TaskControlBlock temp = task_list[0];
     task_list[0] = task_list[1];
     task_list[1] = temp;
 
-    // 2. Reset the target pixels to match the new array positions
+    // 3. Reset the target pixels to match the new array positions
     task_list[0].target_pixel = 0;
     task_list[1].target_pixel = 1;
 
-    // 3. Clear voltages for a 'cold' context switch
+    // 4. LOAD the new state into the Pixels (Neural Persistence)
+    // Instead of clearing to 0, we restore the saved state of the incoming task.
+    for (int p = 0; p < PIXELS_COUNT; p++) {
+        for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
+            os_memory_map[p].neurons[n].voltage = task_list[p].saved_voltages[n];
+            os_memory_map[p].neurons[n].synaptic_weight = task_list[p].saved_weights[n];
+        }
+    }
+
+    // Clear voltages for a 'cold' context switch
     // This prevents residual potential from the previous task from 'polluting' the new one.
+    // Commented out to enable Neural Persistence (State Saving).
+    /* 
     for (int p = 0; p < PIXELS_COUNT; p++) {
         for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
             os_memory_map[p].neurons[n].voltage = 0;
         }
     }
+    */
 }
 
 void keyboard_handler(void) {
