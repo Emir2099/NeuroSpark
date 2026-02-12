@@ -136,7 +136,16 @@ void timer_handler(void) {
             // If the pixel is RIGID (Phase 1), we still use a hardcoded dampener (10) to ensure stability.
             // If it is FLUID (Phase 0), we use the dynamic 'base_integration' from the TCB.
             int base_gain = (os_memory_map[p].current_phase == 1) ? 10 : current_task->base_integration;
-            if (tick % (i + p + 5) == 0) n->voltage += base_gain;
+            
+            // --- CONSOLIDATED INTEGRATION LOGIC ---
+            // We apply task-specific rhythms based on the TCB assignment
+            if (p == TASK_IO) {
+                // I/O Pixel: Fires based on high-frequency external stimulus
+                if (tick % (i + 2) == 0) n->voltage += base_gain; 
+            } else {
+                // Compute Pixel: Fires in a slow, stable rhythmic pulse
+                if (tick % 20 == 0) n->voltage += (base_gain / 2);
+            }
 
             // 2. Leakage (Bio-decay)
             if (n->voltage > 0) n->voltage -= DECAY;
@@ -181,12 +190,6 @@ void timer_handler(void) {
                 } else {
                 // Compute Pixel: Fires in a slow, stable rhythmic pulse
                 if (tick % 20 == 0) n->voltage += (base_gain / 2);
-            }
-
-
-            TaskControlBlock *current_task = &task_list[p]; 
-            if (tick % (i + 5) == 0) {
-                n->voltage += base_gain;
             }
         }
     }
@@ -253,25 +256,45 @@ void update_monitor() {
         if (local_recent > (CRITICAL_THRESHOLD / 2)) { 
             os_memory_map[p].current_phase = 1; // RIGID
             attr = 0x4E; // Yellow text on RED
-            pixel_msg = "P: RIGID ";
+            pixel_msg = "RIGID ";
 
-            // LOCAL STIFFNESS: Suppress only this pixel's voltage
+        } else {
+            os_memory_map[p].current_phase = 0; // FLUID
+            attr = 0x1F; // White on BLUE
+            pixel_msg = "FLUID ";
+        }
+
+        // LOCAL STIFFNESS: Suppress only this pixel's voltage
+        if (os_memory_map[p].current_phase == 1) {
             for(int i = 0; i < NEURONS_PER_PIXEL; i++) {
                 if (os_memory_map[p].neurons[i].voltage > 200) {
                     os_memory_map[p].neurons[i].voltage -= 200; 
                 }
             }
-        } else {
-            os_memory_map[p].current_phase = 0; // FLUID
-            attr = 0x1F; // White on BLUE
-            pixel_msg = "P: FLUID ";
         }
 
-        // Print localized status for each pixel side-by-side on line 7
-        int phase_offset = (80 * 6) + (p * 15); 
-        for (int i = 0; pixel_msg[i] != '\0'; i++) {
-            video[phase_offset + i] = (attr << 8) | pixel_msg[i];
+        // --- Print Task Name + Phase Status ---
+        // Format: "IO: FLUID" or "COMP: RIGID"
+        // We use a wider spacing (30 chars) to prevent overlap on Line 7
+        int offset = (80 * 6) + (p * 25);
+        const char *t_name = task_list[p].task_name;
+
+        // Print Task Name
+        for (int i = 0; t_name[i] != '\0'; i++) {
+            video[offset + i] = (attr << 8) | t_name[i];
         }
+        // Print Separator
+        video[offset + 4] = (attr << 8) | ':';
+        video[offset + 5] = (attr << 8) | ' ';
+
+        // Print Phase Status
+        for (int i = 0; pixel_msg[i] != '\0'; i++) {
+            video[offset + 6 + i] = (attr << 8) | pixel_msg[i];
+        }
+
+        // Clean up: Clear a few trailing characters to ensure old text doesn't ghost
+        video[offset + 11] = (attr << 8) | ' ';
+        video[offset + 12] = (attr << 8) | ' ';
     }
 
     // --- Global UI Reporting ---
@@ -332,7 +355,7 @@ void kernel_main(void) {
         : : : "ax"
     );
 
-// --- Initialize the Pixelated Memory Map ---
+    // --- Initialize the Pixelated Memory Map ---
     for (int p = 0; p < PIXELS_COUNT; p++) {
         os_memory_map[p].current_phase = 0;     // Start in FLUID phase
         os_memory_map[p].pixel_recent_spikes = 0;
