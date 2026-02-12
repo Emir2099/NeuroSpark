@@ -14,6 +14,8 @@ extern void keyboard_wrapper(void);
 #define CRITICAL_THRESHOLD 15 // Spikes per second to trigger phase change
 #define PIXELS_COUNT 2
 #define NEURONS_PER_PIXEL 5
+#define TASK_IO 0
+#define TASK_COMPUTE 1
 
 int recent_spikes = 0;
 uint8_t current_bg_color = 0x1F; // Default Blue
@@ -153,6 +155,16 @@ void timer_handler(void) {
                 if (n->voltage > 700) video[screen_pos] = 0x1700 | '^';
                 else if (n->voltage > 300) video[screen_pos] = 0x1700 | '.';
                 else video[screen_pos] = 0x1F20;  // Clear 
+            }
+
+            
+
+            if (p == TASK_IO) {
+            // I/O Pixel: Fires based on high-frequency external stimulus
+                if (tick % (i + 2) == 0) n->voltage += base_gain; 
+                } else {
+                // Compute Pixel: Fires in a slow, stable rhythmic pulse
+                if (tick % 20 == 0) n->voltage += (base_gain / 2);
             }
         }
     }
