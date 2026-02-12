@@ -37,6 +37,20 @@ typedef struct {
 
 NeuralPixel os_memory_map[PIXELS_COUNT];
 
+typedef struct {
+    int task_id;
+    int priority;        /* 0 = Low, 1 = High */
+    int target_pixel;    /* Which cluster this task is currently assigned to */
+    
+    // Process-specific "Biological" parameters
+    int base_integration; 
+    int fire_threshold;
+    
+    const char* task_name;
+} TaskControlBlock;
+
+// For now, let's define two tasks
+TaskControlBlock task_list[2];
 
 /* 2. Low-level Hardware Helpers */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -100,6 +114,7 @@ void timer_handler(void) {
 
     // Iterate through each Pixelated Cluster
     for (int p = 0; p < PIXELS_COUNT; p++) {
+        TaskControlBlock *current_task = &task_list[p];
         // Iterate through neurons within the current pixel
         for (int i = 0; i < NEURONS_PER_PIXEL; i++) {
             Neuron *n = &os_memory_map[p].neurons[i];
@@ -118,8 +133,9 @@ void timer_handler(void) {
             }
 
             // 1. Integration (Background Noise)
-            // RIGID PHASE (1) applies a dampening factor to voltage gain
-            int base_gain = (os_memory_map[p].current_phase == 1) ? 10 : 30;
+            // If the pixel is RIGID (Phase 1), we still use a hardcoded dampener (10) to ensure stability.
+            // If it is FLUID (Phase 0), we use the dynamic 'base_integration' from the TCB.
+            int base_gain = (os_memory_map[p].current_phase == 1) ? 10 : current_task->base_integration;
             if (tick % (i + p + 5) == 0) n->voltage += base_gain;
 
             // 2. Leakage (Bio-decay)
@@ -165,6 +181,12 @@ void timer_handler(void) {
                 } else {
                 // Compute Pixel: Fires in a slow, stable rhythmic pulse
                 if (tick % 20 == 0) n->voltage += (base_gain / 2);
+            }
+
+
+            TaskControlBlock *current_task = &task_list[p]; 
+            if (tick % (i + 5) == 0) {
+                n->voltage += base_gain;
             }
         }
     }
@@ -323,6 +345,26 @@ void kernel_main(void) {
             // ID can be unique across the whole system: (pixel_index * size + neuron_index)
             os_memory_map[p].neurons[i].id = (p * NEURONS_PER_PIXEL) + i;
         }
+    }
+
+    // --- Initialize the Task Control Blocks (TCB) ---
+    
+    // Task 0: High-Response I/O (Assigned to Pixel 0)
+    task_list[0].task_id = 0;
+    task_list[0].task_name = "IO  ";
+    task_list[0].base_integration = 30; // Fast response for user input
+    task_list[0].target_pixel = 0;
+
+    // Task 1: Background Computation (Assigned to Pixel 1)
+    task_list[1].task_id = 1;
+    task_list[1].task_name = "COMP";
+    task_list[1].base_integration = 15; // Slow, stable pulse for systems
+    task_list[1].target_pixel = 1;
+
+    // Optional: Initialize other TCB fields to zero for safety
+    for (int t = 0; t < 2; t++) {
+        task_list[t].priority = (t == 0) ? 1 : 0; // IO is higher priority
+        task_list[t].fire_threshold = THRESHOLD;
     }
 
     /* Setup the NeuroCore pulse */
