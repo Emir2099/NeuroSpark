@@ -26,6 +26,7 @@ typedef struct {
     int id;             /* Unique identifier */
     int synaptic_weight; /* Strength of connection to the next neuron */
     int refractory_timer;  /* Ticks remaining in recovery */
+    int dynamic_threshold; /* Per-neuron local threshold */    
 } Neuron;
 
 
@@ -51,6 +52,8 @@ typedef struct {
     // Stores the 'learned' weights and current potential for 5 neurons
     int saved_voltages[NEURONS_PER_PIXEL];
     int saved_weights[NEURONS_PER_PIXEL];
+
+    int saved_thresholds[NEURONS_PER_PIXEL]; // For Adaptive Thresholding
 
     int last_spike_count;    /* Spike count from the previous second */
     int spikes_per_second;   /* Calculated real-time throughput */
@@ -171,11 +174,18 @@ void timer_handler(void) {
             }
 
             // 3. Fire & Synaptic Propagation
-            if (n->voltage >= THRESHOLD) {
+            // Use n->dynamic_threshold instead of the THRESHOLD constant
+            if (n->voltage >= n->dynamic_threshold) {
                 n->voltage = 0;
                 n->spike_count++;
                 n->refractory_timer = REFRACTORY_TICKS; // Enter recovery
                 
+                // ADAPTATION: Increase threshold on every spike (Heavier to fire again)
+                if (n->dynamic_threshold < 5000) {
+                    n->dynamic_threshold += 200; 
+                }
+
+
                 // Propagate within the same pixel cluster
                 int next = (i + 1) % NEURONS_PER_PIXEL;
                 os_memory_map[p].neurons[next].voltage += n->synaptic_weight;
@@ -191,13 +201,17 @@ void timer_handler(void) {
 
                 video[screen_pos] = (color << 8) | '!';
             } else {
+                // --- HOMEOSTASIS ---
+                // Slowly lower the threshold back to base THRESHOLD over time
+                if (tick % 50 == 0 && n->dynamic_threshold > THRESHOLD) {
+                    n->dynamic_threshold -= 50;
+                }
+        
                 // Visualize potential levels
                 if (n->voltage > 700) video[screen_pos] = 0x1700 | '^';
                 else if (n->voltage > 300) video[screen_pos] = 0x1700 | '.';
                 else video[screen_pos] = 0x1F20;  // Clear 
-            }
-
-            
+            }            
         }
     }
 
@@ -333,6 +347,16 @@ void update_monitor() {
         // Clear old digits to prevent 100 becoming 1000 accidentally
         video[log_offset + 8] = 0x0700 | ' ';
         video[log_offset + 9] = 0x0700 | ' ';
+
+        // --- Display Adaptive Threshold (THR) on Line 11 ---
+        int thr_offset = (80 * 10) + (p * 40);
+        char thr_str[10];
+        // We show the threshold of the first neuron in the pixel cluster as a representative
+        itoa(os_memory_map[p].neurons[0].dynamic_threshold, thr_str);
+        const char *thr_label = "THR: ";
+        for (int i = 0; thr_label[i] != '\0'; i++) video[thr_offset + i] = 0x0700 | thr_label[i];
+        for (int i = 0; thr_str[i] != '\0'; i++) video[thr_offset + 5 + i] = 0x0B00 | thr_str[i]; // Cyan
+        video[thr_offset + 9] = 0x0700 | ' '; // Clear trailing digits
     }
 
     // --- Global UI Reporting ---
@@ -392,6 +416,8 @@ void switch_tasks() {
                 for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
                     task_list[t].saved_voltages[n] = os_memory_map[p].neurons[n].voltage;
                     task_list[t].saved_weights[n] = os_memory_map[p].neurons[n].synaptic_weight;
+                    // Save the current adaptation level
+                    task_list[t].saved_thresholds[n] = os_memory_map[p].neurons[n].dynamic_threshold;
                 }
                 break;
             }
@@ -417,6 +443,8 @@ void switch_tasks() {
                 for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
                     os_memory_map[p].neurons[n].voltage = task_list[t].saved_voltages[n];
                     os_memory_map[p].neurons[n].synaptic_weight = task_list[t].saved_weights[n];
+                    // Restore the adaptation level for the incoming task
+                    os_memory_map[p].neurons[n].dynamic_threshold = task_list[t].saved_thresholds[n];
                 }
                 break;
             }
@@ -528,11 +556,14 @@ void kernel_main(void) {
         // Set task metadata
         task_list[t].priority = (t == 0) ? 1 : 0; 
         task_list[t].fire_threshold = THRESHOLD;
-        
+        // Initialize state snapshots for Neural Persistence
         for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
-            // Ensure tasks start with 0 voltage and base synaptic weights
             task_list[t].saved_voltages[n] = 0;
             task_list[t].saved_weights[n] = 100; // Match starting memory map weights
+            // Ensure tasks start with the default baseline threshold
+            // This is critical for the Adaptive Thresholding logic
+            os_memory_map[t].neurons[n].dynamic_threshold = THRESHOLD;
+            task_list[t].saved_thresholds[n] = THRESHOLD;
         }
     }
 
