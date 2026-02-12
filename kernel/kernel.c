@@ -314,6 +314,25 @@ void update_monitor() {
     }
 }
 
+void switch_tasks() {
+    // 1. Swap the data in the task_list
+    TaskControlBlock temp = task_list[0];
+    task_list[0] = task_list[1];
+    task_list[1] = temp;
+
+    // 2. Reset the target pixels to match the new array positions
+    task_list[0].target_pixel = 0;
+    task_list[1].target_pixel = 1;
+
+    // 3. Clear voltages for a 'cold' context switch
+    // This prevents residual potential from the previous task from 'polluting' the new one.
+    for (int p = 0; p < PIXELS_COUNT; p++) {
+        for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
+            os_memory_map[p].neurons[n].voltage = 0;
+        }
+    }
+}
+
 void keyboard_handler(void) {
     // Read the scancode from the keyboard data port
     uint8_t scancode = 0;
@@ -328,7 +347,11 @@ void keyboard_handler(void) {
             for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
                 os_memory_map[0].neurons[n].spike_count += 5; 
             }
-        } else {
+        }
+        else if (scancode == 0x1F) { // 'S' key for Switch
+            switch_tasks();
+        } 
+        else {
             // Normal Operation: Stimulate the FIRST neuron of the FIRST pixel
             // This targets the specific cluster instead of a flat grid.
             os_memory_map[0].neurons[0].voltage += 500;
