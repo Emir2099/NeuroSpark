@@ -431,10 +431,17 @@ void kernel_main(void) {
     task_list[1].base_integration = 15; // Slow, stable pulse for systems
     task_list[1].target_pixel = 1;
 
-    // Optional: Initialize other TCB fields to zero for safety
+    // ---  Initialize TCB Saved States for Neural Persistence ---
     for (int t = 0; t < 2; t++) {
-        task_list[t].priority = (t == 0) ? 1 : 0; // IO is higher priority
+        // Set task metadata
+        task_list[t].priority = (t == 0) ? 1 : 0; 
         task_list[t].fire_threshold = THRESHOLD;
+        
+        for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
+            // Ensure tasks start with 0 voltage and base synaptic weights
+            task_list[t].saved_voltages[n] = 0;
+            task_list[t].saved_weights[n] = 100; // Match starting memory map weights
+        }
     }
 
     /* Setup the NeuroCore pulse */
