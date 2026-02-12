@@ -16,6 +16,8 @@ extern void keyboard_wrapper(void);
 #define NEURONS_PER_PIXEL 5
 #define TASK_IO 0
 #define TASK_COMPUTE 1
+#define GLOBAL_MAX_SPIKES 5000 // If total spikes exceed this, initiate decay
+#define SYSTEM_DECAY_RATE 10   // Amount of synaptic weight lost during global decay
 
 int recent_spikes = 0;
 uint8_t current_bg_color = 0x1F; // Default Blue
@@ -218,6 +220,31 @@ void timer_handler(void) {
     // Keep the master heartbeat blinking in the corner
     video[79] = (tick % 20 < 10) ? 0x1F2A : 0x1F20; 
     
+
+    // --- Global Neural Decay (Thermal Throttling) ---
+    // Calculate total spikes across all pixels for this check
+    int current_total = 0;
+    for (int p = 0; p < PIXELS_COUNT; p++) {
+        for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
+            current_total += os_memory_map[p].neurons[n].spike_count;
+        }
+    }
+
+    // If the system is "overheating" (too much activity), weaken ALL synapses
+    if (current_total > GLOBAL_MAX_SPIKES) {
+        for (int p = 0; p < PIXELS_COUNT; p++) {
+            for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
+                if (os_memory_map[p].neurons[n].synaptic_weight > 100) {
+                    os_memory_map[p].neurons[n].synaptic_weight -= SYSTEM_DECAY_RATE;
+                }
+            }
+        }
+        // Visual indicator: Flash the background or a corner character to show throttling
+        video[78] = 0x4C21; // Red '!' in the corner
+    } else {
+        video[78] = 0x1F20; // Clear indicator
+    }
+
     if (tick % 10 == 0) { // Update monitor every 10 ticks to save cycles
         update_monitor();
     }
