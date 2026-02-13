@@ -19,6 +19,9 @@ extern void keyboard_wrapper(void);
 #define GLOBAL_MAX_SPIKES 5000 // If total spikes exceed this, initiate decay
 #define SYSTEM_DECAY_RATE 10   // Amount of synaptic weight lost during global decay
 
+#define MAX_FILES 4
+#define FILENAME_LEN 8
+
 int recent_spikes = 0;
 uint8_t current_bg_color = 0x1F; // Default Blue
 
@@ -63,6 +66,19 @@ typedef struct {
 
 // For now, let's define two tasks
 TaskControlBlock task_list[2];
+
+
+
+typedef struct {
+    char name[FILENAME_LEN];
+    int is_used;
+    // Data payload: The saved state of 5 neurons
+    int voltages[NEURONS_PER_PIXEL];
+    int weights[NEURONS_PER_PIXEL];
+    int thresholds[NEURONS_PER_PIXEL];
+} VirtualFile;
+
+VirtualFile synapse_disk[MAX_FILES];
 
 /* 2. Low-level Hardware Helpers */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -494,6 +510,8 @@ void switch_tasks() {
 void keyboard_handler(void) {
     // Read the scancode from the keyboard data port
     uint8_t scancode = 0;
+    unsigned short *video = (unsigned short *)0xB8000;
+
     __asm__ volatile("inb $0x60, %0" : "=a"(scancode));
 
     // Scancodes below 0x80 are "key down" events
@@ -517,11 +535,21 @@ void keyboard_handler(void) {
         }
         
         else if (scancode == 0x2C) { // 'Z' key
-    // Manually fire the COMPUTE pixel (pixel 1)
-    for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
+        // Manually fire the COMPUTE pixel (pixel 1)
+        for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
         os_memory_map[1].neurons[n].voltage += 1000; // Force a spike
-    }
-}
+        }
+        }
+        else if (scancode == 0x11) { // 'W' key
+            // Save Task 0 (IO) to File Slot 0
+            sys_save_task(0, 0);
+            video[77] = 0x2F57; // Green 'W' in corner to show "Disk Activity"
+        }
+        else if (scancode == 0x26) { // 'L' key
+            // Load Task 0 from File Slot 0
+            sys_load_task(0, 0);
+            video[77] = 0x1F4C; // Blue 'L' in corner
+        }
         else {
             // Normal Operation: Stimulate the FIRST neuron of the FIRST pixel
             // This targets the specific cluster instead of a flat grid.
@@ -529,8 +557,41 @@ void keyboard_handler(void) {
         }
 
         // Visual feedback on the monitor line
-        unsigned short *video = (unsigned short *)0xB8000;
         video[80 * 5] = 0x0F00 | 'K'; // Show 'K' for Keyboard event
+    }
+}
+
+
+// SAVE: Copy a task's current persistence data into a "File"
+void sys_save_task(int task_id, int slot) {
+    if (slot >= MAX_FILES) return;
+    
+    VirtualFile *f = &synapse_disk[slot];
+    TaskControlBlock *t = &task_list[task_id];
+    
+    // Copy Metadata
+    for(int i = 0; i < FILENAME_LEN; i++) f->name[i] = t->task_name[i];
+    f->is_used = 1;
+
+    // Copy Neural State
+    for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
+        f->voltages[n] = t->saved_voltages[n];
+        f->weights[n] = t->saved_weights[n];
+        f->thresholds[n] = t->saved_thresholds[n];
+    }
+}
+
+// LOAD: Restore a task's persistence data from a "File"
+void sys_load_task(int task_id, int slot) {
+    if (slot >= MAX_FILES || !synapse_disk[slot].is_used) return;
+    
+    VirtualFile *f = &synapse_disk[slot];
+    TaskControlBlock *t = &task_list[task_id];
+
+    for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
+        t->saved_voltages[n] = f->voltages[n];
+        t->saved_weights[n] = f->weights[n];
+        t->saved_thresholds[n] = f->thresholds[n];
     }
 }
 
