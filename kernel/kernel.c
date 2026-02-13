@@ -24,6 +24,11 @@ extern void keyboard_wrapper(void);
 
 #define COMMAND_MAX_LEN 32
 
+#define SHELL_START_ROW 15
+#define SHELL_MIN_ROW 15  
+#define SHELL_MAX_ROW 24
+int current_shell_row = SHELL_START_ROW;
+
 int recent_spikes = 0;
 uint8_t current_bg_color = 0x1F; // Default Blue
 
@@ -526,79 +531,6 @@ char get_ascii(uint8_t scancode) {
     return map[scancode];
 }
 
-void keyboard_handler(void) {
-    // Read the scancode from the keyboard data port
-    uint8_t scancode = 0;
-    unsigned short *video = (unsigned short *)0xB8000;
-
-    __asm__ volatile("inb $0x60, %0" : "=a"(scancode));
-
-    if (scancode < 0x80) {
-        char c = get_ascii(scancode);
-
-        if (scancode == 0x1C) { // ENTER Key
-            input_buffer[buffer_idx] = '\0';
-            process_command(input_buffer); // We will write this next!
-            buffer_idx = 0;
-            // Clear the input line visually
-            for(int i = 0; i < 30; i++) video[(shell_line * 80) + i] = 0x0F20;
-        } 
-        else if (scancode == 0x0E && buffer_idx > 0) { // BACKSPACE
-            buffer_idx--;
-            video[(shell_line * 80) + buffer_idx] = 0x0F20;
-        }
-        else if (c && buffer_idx < COMMAND_MAX_LEN - 1) {
-            input_buffer[buffer_idx++] = c;
-            // Echo character to the shell line
-            video[(shell_line * 80) + buffer_idx - 1] = 0x0F00 | c;
-        }
-
-    // Scancodes below 0x80 are "key down" events
-    // if (scancode < 0x80) {
-        // --- Neural Probe (The 'T' key for testing) ---
-        if (scancode == 0x14) { // 0x14 is the scancode for 'T'
-            // Artificially stimulate ALL neurons in Pixel 0 to test Critical Phase
-            // This allows testing without "destroying" biological constants.
-            // for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
-            //     os_memory_map[0].neurons[n].spike_count += 5; 
-            // }
-
-            // Stimulate VOLTAGE instead of SPIKE_COUNT
-            // This allows the RIGID phase to naturally suppress the surge
-            for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
-                os_memory_map[0].neurons[n].voltage += 300; 
-            }
-        }
-        else if (scancode == 0x1F) { // 'S' key for Switch
-            switch_tasks();
-        }
-        
-        else if (scancode == 0x2C) { // 'Z' key
-        // Manually fire the COMPUTE pixel (pixel 1)
-        for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
-        os_memory_map[1].neurons[n].voltage += 1000; // Force a spike
-        }
-        }
-        else if (scancode == 0x11) { // 'W' key
-            // Save Task 0 (IO) to File Slot 0
-            sys_save_task(0, 0);
-            video[77] = 0x2F57; // Green 'W' in corner to show "Disk Activity"
-        }
-        else if (scancode == 0x26) { // 'L' key
-            // Load Task 0 from File Slot 0
-            sys_load_task(0, 0);
-            video[77] = 0x1F4C; // Blue 'L' in corner
-        }
-        else {
-            // Normal Operation: Stimulate the FIRST neuron of the FIRST pixel
-            // This targets the specific cluster instead of a flat grid.
-            os_memory_map[0].neurons[0].voltage += 500;
-        }
-
-        // Visual feedback on the monitor line
-        video[80 * 5] = 0x0F00 | 'K'; // Show 'K' for Keyboard event
-    }
-}
 
 
 // SAVE: Copy a task's current persistence data into a "File"
@@ -611,12 +543,13 @@ void sys_save_task(int task_id, int slot) {
     // Copy Metadata
     for(int i = 0; i < FILENAME_LEN; i++) f->name[i] = t->task_name[i];
     f->is_used = 1;
-
+    
     // Copy Neural State
     for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
         f->voltages[n] = t->saved_voltages[n];
         f->weights[n] = t->saved_weights[n];
         f->thresholds[n] = t->saved_thresholds[n];
+        // f->thresholds[n] = t->saved_thresholds[n];
     }
 }
 
@@ -626,7 +559,7 @@ void sys_load_task(int task_id, int slot) {
     
     VirtualFile *f = &synapse_disk[slot];
     TaskControlBlock *t = &task_list[task_id];
-
+    
     for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
         t->saved_voltages[n] = f->voltages[n];
         t->saved_weights[n] = f->weights[n];
@@ -635,15 +568,119 @@ void sys_load_task(int task_id, int slot) {
 }
 
 
+
+void scroll_shell() {
+    unsigned short *video = (unsigned short *)0xB8000;
+
+    // STEP A: Physical Memory Shift
+    // We only touch the Shell Zone (Lines 15 to 24)
+    for (int row = 15; row < 24; row++) {
+        for (int col = 0; col < 80; col++) {
+            // Copy line below into current line
+            video[(row * 80) + col] = video[((row + 1) * 80) + col];
+        }
+    }
+
+    // STEP B: Clear the absolute bottom line (Line 24)
+    for (int col = 0; col < 80; col++) {
+        video[(24 * 80) + col] = 0x0720; // Light grey on black
+    }
+
+    current_shell_row = 24; 
+}
+
+void keyboard_handler(void) {
+    // Read the scancode from the keyboard data port
+    uint8_t scancode = 0;
+    unsigned short *video = (unsigned short *)0xB8000;
+    __asm__ volatile("inb $0x60, %0" : "=a"(scancode));
+    
+    if (scancode < 0x80) {
+        char c = get_ascii(scancode);
+        
+        // --- 1. Control Keys (High Priority) ---
+        if (scancode == 0x1C) { // ENTER Key
+            input_buffer[buffer_idx] = '\0';
+            
+            // Advance row ONCE for the command output
+            if (current_shell_row >= SHELL_MAX_ROW) {
+                scroll_shell();
+            } else {
+                current_shell_row++;
+            }
+            
+            // Process the command (it will handle its own output positioning)
+            process_command(input_buffer);
+            buffer_idx = 0;
+            
+            // Return early so ENTER doesn't get typed as a character
+            video[80 * 5] = 0x0F00 | 'K'; 
+            return;
+        } 
+        else if (scancode == 0x0E && buffer_idx > 0) { // BACKSPACE
+            buffer_idx--;
+            video[(current_shell_row * 80) + buffer_idx] = 0x0F20;
+            video[80 * 5] = 0x0F00 | 'K';
+            return;
+        }
+        
+        // --- 2. Neural Probe & System Keys (Non-Blocking) ---
+        // Changed to independent 'if' so they don't block character typing
+        if (scancode == 0x14) { // 'T' key for testing
+            for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
+                os_memory_map[0].neurons[n].voltage += 300; 
+            }
+        }
+        if (scancode == 0x1F) { // 'S' key for Switch
+            switch_tasks();
+        }
+        if (scancode == 0x2C) { // 'Z' key
+            for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
+                os_memory_map[1].neurons[n].voltage += 1000; 
+            }
+        }
+        if (scancode == 0x11) { // 'W' key
+            sys_save_task(0, 0);
+            video[77] = 0x2F57; // Green 'W'
+        }
+        if (scancode == 0x26) { // 'L' key
+            sys_load_task(0, 0);
+            video[77] = 0x1F4C; // Blue 'L'
+        }
+        
+        // --- 3. Standard Character Input ---
+        // Every valid character (including 'l', 'w', 's') now reaches this check
+        if (c && buffer_idx < COMMAND_MAX_LEN - 1) {
+            input_buffer[buffer_idx++] = c;
+            // Bounds check: only write if within shell zone
+            if (current_shell_row >= SHELL_MIN_ROW && current_shell_row <= SHELL_MAX_ROW) {
+                video[(current_shell_row * 80) + buffer_idx - 1] = 0x0F00 | c;
+            }
+        }
+        // --- 4. Fallback (Default Action) ---
+        else if (!c) {
+            // Normal Operation: Stimulate the FIRST neuron of the FIRST pixel
+            os_memory_map[0].neurons[0].voltage += 500;
+        }
+        
+        // Visual feedback on the monitor line
+        video[80 * 5] = 0x0F00 | 'K'; // Show 'K' for Keyboard event
+    }
+}
+
 void process_command(char *cmd) {
     unsigned short *video = (unsigned short *)0xB8000;
-    int output_row = shell_line + 1;
-
-    // Clear previous output line
-    for(int i = 0; i < 80; i++) video[(output_row * 80) + i] = 0x0F20;
-
+    
+    // Output goes on the current row (where ENTER was just pressed)
+    int output_row = current_shell_row;
+    
+    // Clear the output line first
+    for(int i = 0; i < 80; i++) {
+        video[(output_row * 80) + i] = 0x0F20;
+    }
+    
     // Command: "ls"
-    if (cmd[0] == 'l' && cmd[1] == 's') {
+    if (cmd[0] == 'l' && cmd[1] == 's' && cmd[2] == '\0') {
         kprint("VFS: 0:IO_SNAPSHOT  1:COMP_SNAPSHOT", output_row, 0, 0x0A);
     } 
     // Command: "save X" (e.g., save 0 or save 1)
@@ -661,7 +698,6 @@ void process_command(char *cmd) {
     // Command: "load X"
     else if (cmd[0] == 'l' && cmd[1] == 'o' && cmd[2] == 'a' && cmd[3] == 'd') {
         int task_idx = cmd[5] - '0';
-
         if (task_idx >= 0 && task_idx < 2) {
             sys_load_task(task_idx, task_idx);
             kprint("SYSTEM: STATE RESTORED FROM VFS", output_row, 0, 0x0B);
@@ -669,19 +705,68 @@ void process_command(char *cmd) {
             kprint("ERR: INVALID TASK INDEX", output_row, 0, 0x0C);
         }
     }
+    // Command: "help"
     else if (cmd[0] == 'h' && cmd[1] == 'e' && cmd[2] == 'l' && cmd[3] == 'p') {
         kprint("CMDS: ls, save [id], load [id], help", output_row, 0, 0x07);
+    }
+    // Command: "stats"
+    else if (cmd[0] == 's' && cmd[1] == 't' && cmd[2] == 'a' && cmd[3] == 't' && cmd[4] == 's') {
+        char val_str[10];
+        
+        // 1. Report Total System Activity
+        kprint("SYS SPIKES: ", current_shell_row, 0, 0x0B);
+        itoa(recent_spikes, val_str); // Using itoa
+        kprint(val_str, current_shell_row, 12, 0x0E);
+        
+        // 2. Prepare for next line
+        if (current_shell_row >= SHELL_MAX_ROW) scroll_shell();
+        else current_shell_row++;
+
+        // 3. Report Pixel 0 (IO) Representative Neuron
+        kprint("P0 THR: ", current_shell_row, 0, 0x07);
+        itoa(os_memory_map[0].neurons[0].dynamic_threshold, val_str);
+        kprint(val_str, current_shell_row, 8, 0x03); // Cyan
+        
+        // 4. Report Pixel 1 (COMP) Representative Neuron
+        kprint(" | P1 THR: ", current_shell_row, 14, 0x07);
+        itoa(os_memory_map[1].neurons[0].dynamic_threshold, val_str);
+        kprint(val_str, current_shell_row, 25, 0x03);
+    }
+    // Command: "clear"
+    else if (cmd[0] == 'c' && cmd[1] == 'l' && cmd[2] == 'e' && cmd[3] == 'a' && cmd[4] == 'r') {
+        // Wipe shell zone (lines 15-24)
+        for(int row = SHELL_MIN_ROW; row <= SHELL_MAX_ROW; row++) {
+            for(int col = 0; col < 80; col++) {
+                video[(row * 80) + col] = 0x0F20;
+            }
+        }
+        current_shell_row = SHELL_MIN_ROW;
+        return; // Don't advance row after clear
     }
     else {
         kprint("ERR: UNKNOWN COMMAND", output_row, 0, 0x0C);
     }
+    
+    // Advance to next line for the prompt
+    if (current_shell_row >= SHELL_MAX_ROW) {
+        scroll_shell();
+    } else {
+        current_shell_row++;
+    }
 }
+
 
 
 void kprint(const char *str, int row, int col, unsigned char color) {
     unsigned short *video = (unsigned short *)0xB8000;
+    
+    // Bounds check: ensure we're writing within shell zone
+    if (row < SHELL_MIN_ROW || row > SHELL_MAX_ROW) {
+        return; // Silently fail if out of bounds
+    }
+    
     int offset = (row * 80) + col;
-    for (int i = 0; str[i] != '\0'; i++) {
+    for (int i = 0; str[i] != '\0' && (col + i) < 80; i++) {
         video[offset + i] = (color << 8) | str[i];
     }
 }
