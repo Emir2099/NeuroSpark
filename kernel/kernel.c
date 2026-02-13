@@ -22,6 +22,8 @@ extern void keyboard_wrapper(void);
 #define MAX_FILES 4
 #define FILENAME_LEN 8
 
+#define COMMAND_MAX_LEN 32
+
 int recent_spikes = 0;
 uint8_t current_bg_color = 0x1F; // Default Blue
 
@@ -79,6 +81,12 @@ typedef struct {
 } VirtualFile;
 
 VirtualFile synapse_disk[MAX_FILES];
+
+
+char input_buffer[COMMAND_MAX_LEN];
+int buffer_idx = 0;
+int shell_line = 15; // Start the shell on line 16 (80 * 15) to avoid the neural grid
+
 
 /* 2. Low-level Hardware Helpers */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -507,6 +515,17 @@ void switch_tasks() {
 
 }
 
+
+char get_ascii(uint8_t scancode) {
+    static char map[0x80] = {
+        0, 27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
+        '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
+        0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0,
+        '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' '
+    };
+    return map[scancode];
+}
+
 void keyboard_handler(void) {
     // Read the scancode from the keyboard data port
     uint8_t scancode = 0;
@@ -514,8 +533,28 @@ void keyboard_handler(void) {
 
     __asm__ volatile("inb $0x60, %0" : "=a"(scancode));
 
-    // Scancodes below 0x80 are "key down" events
     if (scancode < 0x80) {
+        char c = get_ascii(scancode);
+
+        if (scancode == 0x1C) { // ENTER Key
+            input_buffer[buffer_idx] = '\0';
+            process_command(input_buffer); // We will write this next!
+            buffer_idx = 0;
+            // Clear the input line visually
+            for(int i = 0; i < 30; i++) video[(shell_line * 80) + i] = 0x0F20;
+        } 
+        else if (scancode == 0x0E && buffer_idx > 0) { // BACKSPACE
+            buffer_idx--;
+            video[(shell_line * 80) + buffer_idx] = 0x0F20;
+        }
+        else if (c && buffer_idx < COMMAND_MAX_LEN - 1) {
+            input_buffer[buffer_idx++] = c;
+            // Echo character to the shell line
+            video[(shell_line * 80) + buffer_idx - 1] = 0x0F00 | c;
+        }
+
+    // Scancodes below 0x80 are "key down" events
+    // if (scancode < 0x80) {
         // --- Neural Probe (The 'T' key for testing) ---
         if (scancode == 0x14) { // 0x14 is the scancode for 'T'
             // Artificially stimulate ALL neurons in Pixel 0 to test Critical Phase
@@ -592,6 +631,29 @@ void sys_load_task(int task_id, int slot) {
         t->saved_voltages[n] = f->voltages[n];
         t->saved_weights[n] = f->weights[n];
         t->saved_thresholds[n] = f->thresholds[n];
+    }
+}
+
+
+void process_command(char *cmd) {
+    // Basic string comparison (we don't have strcmp yet)
+    if (cmd[0] == 'l' && cmd[1] == 's') {
+        kprint("FILES: 0:SYN_IO  1:EMPTY", shell_line + 1, 0, 0x0A);
+    } 
+    else if (cmd[0] == 's' && cmd[1] == 't') { // "stats"
+        kprint("CORE: ACTIVE  MEM: 2 PIXELS", shell_line + 1, 0, 0x0B);
+    }
+    else {
+        kprint("UNKNOWN COMMAND", shell_line + 1, 0, 0x0C);
+    }
+}
+
+
+void kprint(const char *str, int row, int col, unsigned char color) {
+    unsigned short *video = (unsigned short *)0xB8000;
+    int offset = (row * 80) + col;
+    for (int i = 0; str[i] != '\0'; i++) {
+        video[offset + i] = (color << 8) | str[i];
     }
 }
 
