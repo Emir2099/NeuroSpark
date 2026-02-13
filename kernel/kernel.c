@@ -636,15 +636,44 @@ void sys_load_task(int task_id, int slot) {
 
 
 void process_command(char *cmd) {
-    // Basic string comparison (we don't have strcmp yet)
+    unsigned short *video = (unsigned short *)0xB8000;
+    int output_row = shell_line + 1;
+
+    // Clear previous output line
+    for(int i = 0; i < 80; i++) video[(output_row * 80) + i] = 0x0F20;
+
+    // Command: "ls"
     if (cmd[0] == 'l' && cmd[1] == 's') {
-        kprint("FILES: 0:SYN_IO  1:EMPTY", shell_line + 1, 0, 0x0A);
+        kprint("VFS: 0:IO_SNAPSHOT  1:COMP_SNAPSHOT", output_row, 0, 0x0A);
     } 
-    else if (cmd[0] == 's' && cmd[1] == 't') { // "stats"
-        kprint("CORE: ACTIVE  MEM: 2 PIXELS", shell_line + 1, 0, 0x0B);
+    // Command: "save X" (e.g., save 0 or save 1)
+    else if (cmd[0] == 's' && cmd[1] == 'a' && cmd[2] == 'v' && cmd[3] == 'e') {
+        // The task index is at cmd[5] (assuming space at index 4)
+        int task_idx = cmd[5] - '0'; 
+        
+        if (task_idx >= 0 && task_idx < 2) {
+            sys_save_task(task_idx, task_idx); // Save Task X to Slot X
+            kprint("SYSTEM: TASK STATE COMMITTED TO VFS", output_row, 0, 0x0B);
+        } else {
+            kprint("ERR: INVALID TASK INDEX (USE 0 OR 1)", output_row, 0, 0x0C);
+        }
+    }
+    // Command: "load X"
+    else if (cmd[0] == 'l' && cmd[1] == 'o' && cmd[2] == 'a' && cmd[3] == 'd') {
+        int task_idx = cmd[5] - '0';
+
+        if (task_idx >= 0 && task_idx < 2) {
+            sys_load_task(task_idx, task_idx);
+            kprint("SYSTEM: STATE RESTORED FROM VFS", output_row, 0, 0x0B);
+        } else {
+            kprint("ERR: INVALID TASK INDEX", output_row, 0, 0x0C);
+        }
+    }
+    else if (cmd[0] == 'h' && cmd[1] == 'e' && cmd[2] == 'l' && cmd[3] == 'p') {
+        kprint("CMDS: ls, save [id], load [id], help", output_row, 0, 0x07);
     }
     else {
-        kprint("UNKNOWN COMMAND", shell_line + 1, 0, 0x0C);
+        kprint("ERR: UNKNOWN COMMAND", output_row, 0, 0x0C);
     }
 }
 
