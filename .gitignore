@@ -1,3 +1,4 @@
 *.bin
 *.o
 NeuroSpark.bin
+*.elf

@@ -27,10 +27,21 @@ extern void keyboard_wrapper(void);
 #define SHELL_START_ROW 15
 #define SHELL_MIN_ROW 15  
 #define SHELL_MAX_ROW 24
-int current_shell_row = SHELL_START_ROW;
+
+#include "disk.h"
+
+volatile int current_shell_row = SHELL_START_ROW;
 
 int recent_spikes = 0;
 uint8_t current_bg_color = 0x1F; // Default Blue
+
+// Forward declarations
+void update_monitor();
+void process_command(char *cmd);
+void kprint(const char *str, int row, int col, unsigned char color);
+void scroll_shell();
+void sys_save_task(int task_id, int slot);
+void sys_load_task(int task_id, int slot);
 
 typedef struct {
     int voltage;        /* Current membrane potential */
@@ -88,14 +99,31 @@ typedef struct {
 VirtualFile synapse_disk[MAX_FILES];
 
 
-char input_buffer[COMMAND_MAX_LEN];
-int buffer_idx = 0;
+volatile char input_buffer[COMMAND_MAX_LEN];
+volatile int buffer_idx = 0;
 int shell_line = 15; // Start the shell on line 16 (80 * 15) to avoid the neural grid
 
 
 /* 2. Low-level Hardware Helpers */
 static inline void outb(uint16_t port, uint8_t val) {
     __asm__ volatile ( "outb %0, %1" : : "a"(val), "Nd"(port) );
+}
+
+// Additional I/O functions for disk operations
+static inline uint8_t inb(uint16_t port) {
+    uint8_t ret;
+    __asm__ volatile ( "inb %1, %0" : "=a"(ret) : "Nd"(port) );
+    return ret;
+}
+
+static inline void outw(uint16_t port, uint16_t val) {
+    __asm__ volatile ( "outw %0, %1" : : "a"(val), "Nd"(port) );
+}
+
+static inline uint16_t inw(uint16_t port) {
+    uint16_t ret;
+    __asm__ volatile ( "inw %1, %0" : "=a"(ret) : "Nd"(port) );
+    return ret;
 }
 
 /* 3. The IDT Entry Structure */
@@ -532,6 +560,9 @@ char get_ascii(uint8_t scancode) {
 }
 
 
+// ============================================================================
+// NEURAL PERSISTENCE FUNCTIONS (Save/Load with Disk)
+// ============================================================================
 
 // SAVE: Copy a task's current persistence data into a "File"
 void sys_save_task(int task_id, int slot) {
@@ -549,22 +580,43 @@ void sys_save_task(int task_id, int slot) {
         f->voltages[n] = t->saved_voltages[n];
         f->weights[n] = t->saved_weights[n];
         f->thresholds[n] = t->saved_thresholds[n];
-        // f->thresholds[n] = t->saved_thresholds[n];
     }
+    
+    // ===== WRITE TO DISK (only if controller is present) =====
+    if (ata_disk_available) {
+        disk_write_sector(DISK_DATA_OFFSET + slot, (uint16_t*)f);
+    }
+    
+    // Visual feedback
+    unsigned short *video = (unsigned short *)0xB8000;
+    video[79] = ata_disk_available ? 0x2F44 : 0x2F4D; // 'D' for disk, 'M' for memory-only
 }
 
 // LOAD: Restore a task's persistence data from a "File"
 void sys_load_task(int task_id, int slot) {
-    if (slot >= MAX_FILES || !synapse_disk[slot].is_used) return;
+    if (slot >= MAX_FILES) return;
+    
+    // ===== READ FROM DISK (only if controller is present) =====
+    if (ata_disk_available) {
+        disk_read_sector(DISK_DATA_OFFSET + slot, (uint16_t*)&synapse_disk[slot]);
+    }
+    
+    // Check if the file exists
+    if (!synapse_disk[slot].is_used) return;
     
     VirtualFile *f = &synapse_disk[slot];
     TaskControlBlock *t = &task_list[task_id];
     
+    // Restore Neural State from disk to task
     for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
         t->saved_voltages[n] = f->voltages[n];
         t->saved_weights[n] = f->weights[n];
         t->saved_thresholds[n] = f->thresholds[n];
     }
+    
+    // Visual feedback
+    unsigned short *video = (unsigned short *)0xB8000;
+    video[79] = ata_disk_available ? 0x1F44 : 0x1F4D; // 'D' or 'M'
 }
 
 
@@ -602,16 +654,18 @@ void keyboard_handler(void) {
         if (scancode == 0x1C) { // ENTER Key
             input_buffer[buffer_idx] = '\0';
             
-            // Advance row ONCE for the command output
-            if (current_shell_row >= SHELL_MAX_ROW) {
-                scroll_shell();
-            } else {
-                current_shell_row++;
+            // Copy buffer to local stack to avoid any volatile issues
+            char cmd_copy[COMMAND_MAX_LEN];
+            for (int ci = 0; ci <= buffer_idx && ci < COMMAND_MAX_LEN; ci++) {
+                cmd_copy[ci] = input_buffer[ci];
             }
+            cmd_copy[COMMAND_MAX_LEN - 1] = '\0'; // safety null
             
-            // Process the command (it will handle its own output positioning)
-            process_command(input_buffer);
+            process_command(cmd_copy);
             buffer_idx = 0;
+            
+            // Dont clear the line where we typed, let it stay visible!
+            // The old text will scroll up naturally
             
             // Return early so ENTER doesn't get typed as a character
             video[80 * 5] = 0x0F00 | 'K'; 
@@ -624,28 +678,38 @@ void keyboard_handler(void) {
             return;
         }
         
-        // --- 2. Neural Probe & System Keys (Non-Blocking) ---
-        // Changed to independent 'if' so they don't block character typing
-        if (scancode == 0x14) { // 'T' key for testing
+        // --- 2. Neural Probe & System Keys (Function Keys) ---
+        // Use function keys to avoid conflicts with command typing
+        if (scancode == 0x3B) { // F1 key for testing (was T)
             for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
                 os_memory_map[0].neurons[n].voltage += 300; 
             }
+            video[80 * 5] = 0x0F00 | 'K';
+            return;
         }
-        if (scancode == 0x1F) { // 'S' key for Switch
+        if (scancode == 0x3C) { // F2 key for Switch (was S)
             switch_tasks();
+            video[80 * 5] = 0x0F00 | 'K';
+            return;
         }
-        if (scancode == 0x2C) { // 'Z' key
+        if (scancode == 0x3D) { // F3 key for zap (was Z)
             for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
                 os_memory_map[1].neurons[n].voltage += 1000; 
             }
+            video[80 * 5] = 0x0F00 | 'K';
+            return;
         }
-        if (scancode == 0x11) { // 'W' key
+        if (scancode == 0x3E) { // F4 key for quick save (was W)
             sys_save_task(0, 0);
             video[77] = 0x2F57; // Green 'W'
+            video[80 * 5] = 0x0F00 | 'K';
+            return;
         }
-        if (scancode == 0x26) { // 'L' key
+        if (scancode == 0x3F) { // F5 key for quick load (was L)
             sys_load_task(0, 0);
             video[77] = 0x1F4C; // Blue 'L'
+            video[80 * 5] = 0x0F00 | 'K';
+            return;
         }
         
         // --- 3. Standard Character Input ---
@@ -671,100 +735,158 @@ void keyboard_handler(void) {
 void process_command(char *cmd) {
     unsigned short *video = (unsigned short *)0xB8000;
     
-    // Output goes on the current row (where ENTER was just pressed)
-    int output_row = current_shell_row;
+    // ===== WRITE DIRECTLY TO LINE 3 =====
+    int line3 = 80 * 3;
     
-    // Clear the output line first
+    // Clear line 3 completely first
     for(int i = 0; i < 80; i++) {
-        video[(output_row * 80) + i] = 0x0F20;
+        video[line3 + i] = 0x4F20; // Red background, space
     }
     
-    // Command: "ls"
-    if (cmd[0] == 'l' && cmd[1] == 's' && cmd[2] == '\0') {
-        kprint("VFS: 0:IO_SNAPSHOT  1:COMP_SNAPSHOT", output_row, 0, 0x0A);
-    } 
-    // Command: "save X" (e.g., save 0 or save 1)
-    else if (cmd[0] == 's' && cmd[1] == 'a' && cmd[2] == 'v' && cmd[3] == 'e') {
-        // The task index is at cmd[5] (assuming space at index 4)
-        int task_idx = cmd[5] - '0'; 
+    // Write "CMD:" in bright white on red
+    video[line3 + 0] = 0x4F00 | 'C';
+    video[line3 + 1] = 0x4F00 | 'M';
+    video[line3 + 2] = 0x4F00 | 'D';
+    video[line3 + 3] = 0x4F00 | ':';
+    
+    // Show entire command
+    for(int i = 0; i < 10 && cmd[i] != '\0'; i++) {
+        video[line3 + 4 + i] = 0x4F00 | cmd[i];
+    }
+    
+    // ===== NOW DO ACTUAL COMMAND PROCESSING =====
+    
+    // Advance to next line
+    if (current_shell_row >= SHELL_MAX_ROW) {
+        scroll_shell();
+    } else {
+        current_shell_row++;
+    }
+    
+    int output_row = current_shell_row;
+    int output_offset = output_row * 80;
+    
+    // Command: "save X"
+    if (cmd[0] == 's' && cmd[1] == 'a' && cmd[2] == 'v' && cmd[3] == 'e' && cmd[4] == ' ') {
+        int task_idx = cmd[5] - '0';
+        
+        // Show on line 3 that we matched
+        video[line3 + 20] = 0x2F00 | 'S';
+        video[line3 + 21] = 0x2F00 | 'A';
+        video[line3 + 22] = 0x2F00 | 'V';
+        video[line3 + 23] = 0x2F00 | 'E';
         
         if (task_idx >= 0 && task_idx < 2) {
-            sys_save_task(task_idx, task_idx); // Save Task X to Slot X
-            kprint("SYSTEM: TASK STATE COMMITTED TO VFS", output_row, 0, 0x0B);
+            // Call save
+            sys_save_task(task_idx, task_idx);
+            
+            // Write "SAVED!" directly to shell
+            video[output_offset + 0] = 0x2F00 | 'S';
+            video[output_offset + 1] = 0x2F00 | 'A';
+            video[output_offset + 2] = 0x2F00 | 'V';
+            video[output_offset + 3] = 0x2F00 | 'E';
+            video[output_offset + 4] = 0x2F00 | 'D';
+            video[output_offset + 5] = 0x2F00 | '!';
+            
+            video[line3 + 25] = 0x2F00 | 'O';
+            video[line3 + 26] = 0x2F00 | 'K';
         } else {
-            kprint("ERR: INVALID TASK INDEX (USE 0 OR 1)", output_row, 0, 0x0C);
+            video[output_offset + 0] = 0x4F00 | 'E';
+            video[output_offset + 1] = 0x4F00 | 'R';
+            video[output_offset + 2] = 0x4F00 | 'R';
+            
+            video[line3 + 25] = 0x4F00 | 'E';
+            video[line3 + 26] = 0x4F00 | 'R';
         }
     }
     // Command: "load X"
-    else if (cmd[0] == 'l' && cmd[1] == 'o' && cmd[2] == 'a' && cmd[3] == 'd') {
+    else if (cmd[0] == 'l' && cmd[1] == 'o' && cmd[2] == 'a' && cmd[3] == 'd' && cmd[4] == ' ') {
         int task_idx = cmd[5] - '0';
+        
+        video[line3 + 20] = 0x1F00 | 'L';
+        video[line3 + 21] = 0x1F00 | 'O';
+        video[line3 + 22] = 0x1F00 | 'A';
+        video[line3 + 23] = 0x1F00 | 'D';
+        
         if (task_idx >= 0 && task_idx < 2) {
             sys_load_task(task_idx, task_idx);
-            kprint("SYSTEM: STATE RESTORED FROM VFS", output_row, 0, 0x0B);
-        } else {
-            kprint("ERR: INVALID TASK INDEX", output_row, 0, 0x0C);
+            
+            video[output_offset + 0] = 0x1F00 | 'L';
+            video[output_offset + 1] = 0x1F00 | 'O';
+            video[output_offset + 2] = 0x1F00 | 'A';
+            video[output_offset + 3] = 0x1F00 | 'D';
+            video[output_offset + 4] = 0x1F00 | 'E';
+            video[output_offset + 5] = 0x1F00 | 'D';
+            video[output_offset + 6] = 0x1F00 | '!';
+            
+            video[line3 + 25] = 0x1F00 | 'O';
+            video[line3 + 26] = 0x1F00 | 'K';
+        }
+    }
+    // Command: "ls"
+    else if (cmd[0] == 'l' && cmd[1] == 's' && cmd[2] == '\0') {
+        video[line3 + 20] = 0x0A00 | 'L';
+        video[line3 + 21] = 0x0A00 | 'S';
+        
+        const char *msg = "FILES: 0:IO 1:COMP";
+        for(int i = 0; msg[i] != '\0'; i++) {
+            video[output_offset + i] = 0x0A00 | msg[i];
         }
     }
     // Command: "help"
-    else if (cmd[0] == 'h' && cmd[1] == 'e' && cmd[2] == 'l' && cmd[3] == 'p') {
-        kprint("CMDS: ls, save [id], load [id], help", output_row, 0, 0x07);
-    }
-    // Command: "stats"
-    else if (cmd[0] == 's' && cmd[1] == 't' && cmd[2] == 'a' && cmd[3] == 't' && cmd[4] == 's') {
-        char val_str[10];
+    else if (cmd[0] == 'h' && cmd[1] == 'e' && cmd[2] == 'l' && cmd[3] == 'p' && cmd[4] == '\0') {
+        video[line3 + 20] = 0x0700 | 'H';
+        video[line3 + 21] = 0x0700 | 'E';
+        video[line3 + 22] = 0x0700 | 'L';
+        video[line3 + 23] = 0x0700 | 'P';
         
-        // 1. Report Total System Activity
-        kprint("SYS SPIKES: ", current_shell_row, 0, 0x0B);
-        itoa(recent_spikes, val_str); // Using itoa
-        kprint(val_str, current_shell_row, 12, 0x0E);
-        
-        // 2. Prepare for next line
-        if (current_shell_row >= SHELL_MAX_ROW) scroll_shell();
-        else current_shell_row++;
-
-        // 3. Report Pixel 0 (IO) Representative Neuron
-        kprint("P0 THR: ", current_shell_row, 0, 0x07);
-        itoa(os_memory_map[0].neurons[0].dynamic_threshold, val_str);
-        kprint(val_str, current_shell_row, 8, 0x03); // Cyan
-        
-        // 4. Report Pixel 1 (COMP) Representative Neuron
-        kprint(" | P1 THR: ", current_shell_row, 14, 0x07);
-        itoa(os_memory_map[1].neurons[0].dynamic_threshold, val_str);
-        kprint(val_str, current_shell_row, 25, 0x03);
+        const char *msg = "save 0, load 0, ls, help";
+        for(int i = 0; msg[i] != '\0'; i++) {
+            video[output_offset + i] = 0x0700 | msg[i];
+        }
     }
     // Command: "clear"
-    else if (cmd[0] == 'c' && cmd[1] == 'l' && cmd[2] == 'e' && cmd[3] == 'a' && cmd[4] == 'r') {
-        // Wipe shell zone (lines 15-24)
+    else if (cmd[0] == 'c' && cmd[1] == 'l' && cmd[2] == 'e' && cmd[3] == 'a' && cmd[4] == 'r' && cmd[5] == '\0') {
+        video[line3 + 20] = 0x0A00 | 'C';
+        video[line3 + 21] = 0x0A00 | 'L';
+        video[line3 + 22] = 0x0A00 | 'R';
+        
         for(int row = SHELL_MIN_ROW; row <= SHELL_MAX_ROW; row++) {
             for(int col = 0; col < 80; col++) {
                 video[(row * 80) + col] = 0x0F20;
             }
         }
         current_shell_row = SHELL_MIN_ROW;
-        return; // Don't advance row after clear
+        return;
     }
     else {
-        kprint("ERR: UNKNOWN COMMAND", output_row, 0, 0x0C);
+        video[line3 + 20] = 0x4F00 | 'N';
+        video[line3 + 21] = 0x4F00 | 'O';
+        video[line3 + 22] = 0x4F00 | 'N';
+        video[line3 + 23] = 0x4F00 | 'E';
+        
+        video[output_offset + 0] = 0x4F00 | '?';
+        video[output_offset + 1] = 0x4F00 | '?';
+        video[output_offset + 2] = 0x4F00 | '?';
     }
     
-    // Advance to next line for the prompt
+    // Advance to next line
     if (current_shell_row >= SHELL_MAX_ROW) {
         scroll_shell();
     } else {
         current_shell_row++;
     }
+    
+    // Write prompt
+    video[(current_shell_row * 80) + 0] = 0x0F00 | '>';
+    video[(current_shell_row * 80) + 1] = 0x0F00 | ' ';
 }
 
 
 
 void kprint(const char *str, int row, int col, unsigned char color) {
     unsigned short *video = (unsigned short *)0xB8000;
-    
-    // Bounds check: ensure we're writing within shell zone
-    if (row < SHELL_MIN_ROW || row > SHELL_MAX_ROW) {
-        return; // Silently fail if out of bounds
-    }
-    
+        
     int offset = (row * 80) + col;
     for (int i = 0; str[i] != '\0' && (col + i) < 80; i++) {
         video[offset + i] = (color << 8) | str[i];
@@ -785,6 +907,11 @@ void kernel_main(void) {
         "mov %%ax, %%ss\n"
         : : : "ax"
     );
+
+    // --- Explicit .bss initialization (not zeroed by bootloader) ---
+    buffer_idx = 0;
+    for (int i = 0; i < COMMAND_MAX_LEN; i++) input_buffer[i] = 0;
+    current_shell_row = SHELL_START_ROW;
 
     // --- Initialize the Pixelated Memory Map ---
     for (int p = 0; p < PIXELS_COUNT; p++) {
@@ -834,6 +961,9 @@ void kernel_main(void) {
     /* Setup the NeuroCore pulse */
     init_timer(100);  /* 100Hz frequency */
     init_idt();      /* Register timer_handler and start interrupts */
+
+    /* Detect ATA disk controller */
+    ata_disk_available = ata_detect_disk();
 
     /* Clear screen to blue */
     unsigned short *video_memory = (unsigned short *)0xB8000;
