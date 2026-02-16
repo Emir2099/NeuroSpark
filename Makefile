@@ -10,9 +10,11 @@ CFLAGS = -ffreestanding -m32 -O2 -Wall -Wextra \
 all: NeuroSpark.bin
 
 # Build the final OS image
+# Boot (1 sector) + Kernel (up to 16 sectors) + Data area (sectors 34+)
+# Total: 64KB = 128 sectors — gives room for 4 save slots starting at sector 34
 NeuroSpark.bin: boot/boot.bin kernel.bin
 	cat boot/boot.bin kernel.bin > $@
-	truncate -s 16384 $@
+	truncate -s 65536 $@
 
 # Assemble bootloader
 boot/boot.bin: boot/boot.asm

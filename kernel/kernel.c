@@ -41,7 +41,7 @@ void process_command(char *cmd);
 void kprint(const char *str, int row, int col, unsigned char color);
 void scroll_shell();
 void sys_save_task(int task_id, int slot);
-void sys_load_task(int task_id, int slot);
+int sys_load_task(int task_id, int slot);
 
 typedef struct {
     int voltage;        /* Current membrane potential */
@@ -96,7 +96,7 @@ typedef struct {
     int thresholds[NEURONS_PER_PIXEL];
 } VirtualFile;
 
-VirtualFile synapse_disk[MAX_FILES];
+volatile VirtualFile synapse_disk[MAX_FILES];
 
 
 volatile char input_buffer[COMMAND_MAX_LEN];
@@ -163,7 +163,14 @@ void init_idt() {
     outb(0x21, 0x20); outb(0xA1, 0x28);
     outb(0x21, 0x04); outb(0xA1, 0x02);
     outb(0x21, 0x01); outb(0xA1, 0x01);
-    outb(0x21, 0x0);  outb(0xA1, 0x0);
+    
+    /* Mask (disable) all IRQs except what we need:
+     * Master PIC (0x21): bit0=IRQ0(timer), bit1=IRQ1(keyboard)
+     *   0xFC = 11111100 → only IRQ 0 and IRQ 1 unmasked
+     * Slave PIC (0xA1): mask everything (0xFF)
+     *   Especially IRQ 14 (IDE) which has no handler and would triple-fault
+     */
+    outb(0x21, 0xFC);  outb(0xA1, 0xFF);
 
     /* Register our timer wrapper (IRQ0 -> Index 32) */
     set_idt_gate(32, (uint32_t)timer_wrapper);
@@ -564,51 +571,77 @@ char get_ascii(uint8_t scancode) {
 // NEURAL PERSISTENCE FUNCTIONS (Save/Load with Disk)
 // ============================================================================
 
-// SAVE: Copy a task's current persistence data into a "File"
+// SAVE: Copy a task's LIVE neural state into a "File"
 void sys_save_task(int task_id, int slot) {
     if (slot >= MAX_FILES) return;
     
-    VirtualFile *f = &synapse_disk[slot];
+    volatile VirtualFile *f = &synapse_disk[slot];
     TaskControlBlock *t = &task_list[task_id];
     
     // Copy Metadata
     for(int i = 0; i < FILENAME_LEN; i++) f->name[i] = t->task_name[i];
     f->is_used = 1;
     
-    // Copy Neural State
+    // Copy LIVE Neural State from the pixel this task is assigned to
+    int px = t->target_pixel;
     for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
-        f->voltages[n] = t->saved_voltages[n];
-        f->weights[n] = t->saved_weights[n];
-        f->thresholds[n] = t->saved_thresholds[n];
+        f->voltages[n] = os_memory_map[px].neurons[n].voltage;
+        f->weights[n] = os_memory_map[px].neurons[n].synaptic_weight;
+        f->thresholds[n] = os_memory_map[px].neurons[n].dynamic_threshold;
     }
+    
+    // Force memory write before any further operations
+    __asm__ volatile("" ::: "memory");
     
     // ===== WRITE TO DISK (only if controller is present) =====
     if (ata_disk_available) {
         disk_write_sector(DISK_DATA_OFFSET + slot, (uint16_t*)f);
     }
     
-    // Visual feedback
+    // Visual feedback — show is_used value on screen for debug
     unsigned short *video = (unsigned short *)0xB8000;
     video[79] = ata_disk_available ? 0x2F44 : 0x2F4D; // 'D' for disk, 'M' for memory-only
+    // Debug: show slot + is_used on line 12
+    video[80*11 + 0] = 0x0E00 | 'S'; // Save
+    video[80*11 + 1] = 0x0E00 | ('0' + slot);
+    video[80*11 + 2] = 0x0E00 | ':';
+    video[80*11 + 3] = 0x0E00 | ('0' + f->is_used);
 }
 
 // LOAD: Restore a task's persistence data from a "File"
-void sys_load_task(int task_id, int slot) {
-    if (slot >= MAX_FILES) return;
+// Returns 1 on success, 0 if slot is empty
+int sys_load_task(int task_id, int slot) {
+    if (slot >= MAX_FILES) return 0;
     
     // ===== READ FROM DISK (only if controller is present) =====
     if (ata_disk_available) {
         disk_read_sector(DISK_DATA_OFFSET + slot, (uint16_t*)&synapse_disk[slot]);
     }
     
-    // Check if the file exists
-    if (!synapse_disk[slot].is_used) return;
+    // Force memory read
+    __asm__ volatile("" ::: "memory");
     
-    VirtualFile *f = &synapse_disk[slot];
+    // Debug: show is_used value on line 12
+    unsigned short *video_dbg = (unsigned short *)0xB8000;
+    int used_val = synapse_disk[slot].is_used;
+    video_dbg[80*11 + 5] = 0x0C00 | 'L'; // Load
+    video_dbg[80*11 + 6] = 0x0C00 | ('0' + slot);
+    video_dbg[80*11 + 7] = 0x0C00 | ':';
+    video_dbg[80*11 + 8] = 0x0C00 | ('0' + used_val);
+    
+    // Check if the file exists
+    if (!used_val) return 0;
+    
+    volatile VirtualFile *f = &synapse_disk[slot];
     TaskControlBlock *t = &task_list[task_id];
     
-    // Restore Neural State from disk to task
+    // Restore Neural State to LIVE pixel neurons
+    int px = t->target_pixel;
     for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
+        os_memory_map[px].neurons[n].voltage = f->voltages[n];
+        os_memory_map[px].neurons[n].synaptic_weight = f->weights[n];
+        os_memory_map[px].neurons[n].dynamic_threshold = f->thresholds[n];
+        // Also update the TCB snapshot for consistency
         t->saved_voltages[n] = f->voltages[n];
         t->saved_weights[n] = f->weights[n];
         t->saved_thresholds[n] = f->thresholds[n];
@@ -617,6 +650,7 @@ void sys_load_task(int task_id, int slot) {
     // Visual feedback
     unsigned short *video = (unsigned short *)0xB8000;
     video[79] = ata_disk_available ? 0x1F44 : 0x1F4D; // 'D' or 'M'
+    return 1;
 }
 
 
@@ -809,18 +843,31 @@ void process_command(char *cmd) {
         video[line3 + 23] = 0x1F00 | 'D';
         
         if (task_idx >= 0 && task_idx < 2) {
-            sys_load_task(task_idx, task_idx);
+            int ok = sys_load_task(task_idx, task_idx);
             
-            video[output_offset + 0] = 0x1F00 | 'L';
-            video[output_offset + 1] = 0x1F00 | 'O';
-            video[output_offset + 2] = 0x1F00 | 'A';
-            video[output_offset + 3] = 0x1F00 | 'D';
-            video[output_offset + 4] = 0x1F00 | 'E';
-            video[output_offset + 5] = 0x1F00 | 'D';
-            video[output_offset + 6] = 0x1F00 | '!';
+            if (ok) {
+                video[output_offset + 0] = 0x2F00 | 'L';
+                video[output_offset + 1] = 0x2F00 | 'O';
+                video[output_offset + 2] = 0x2F00 | 'A';
+                video[output_offset + 3] = 0x2F00 | 'D';
+                video[output_offset + 4] = 0x2F00 | 'E';
+                video[output_offset + 5] = 0x2F00 | 'D';
+                video[output_offset + 6] = 0x2F00 | '!';
+            } else {
+                video[output_offset + 0] = 0x4F00 | 'S';
+                video[output_offset + 1] = 0x4F00 | 'L';
+                video[output_offset + 2] = 0x4F00 | 'O';
+                video[output_offset + 3] = 0x4F00 | 'T';
+                video[output_offset + 4] = 0x4F00 | ' ';
+                video[output_offset + 5] = 0x4F00 | 'E';
+                video[output_offset + 6] = 0x4F00 | 'M';
+                video[output_offset + 7] = 0x4F00 | 'P';
+                video[output_offset + 8] = 0x4F00 | 'T';
+                video[output_offset + 9] = 0x4F00 | 'Y';
+            }
             
-            video[line3 + 25] = 0x1F00 | 'O';
-            video[line3 + 26] = 0x1F00 | 'K';
+            video[line3 + 25] = ok ? (0x2F00 | 'O') : (0x4F00 | 'E');
+            video[line3 + 26] = ok ? (0x2F00 | 'K') : (0x4F00 | 'R');
         }
     }
     // Command: "ls"
@@ -912,6 +959,15 @@ void kernel_main(void) {
     buffer_idx = 0;
     for (int i = 0; i < COMMAND_MAX_LEN; i++) input_buffer[i] = 0;
     current_shell_row = SHELL_START_ROW;
+    for (int i = 0; i < MAX_FILES; i++) {
+        synapse_disk[i].is_used = 0;
+        for (int j = 0; j < FILENAME_LEN; j++) synapse_disk[i].name[j] = 0;
+        for (int j = 0; j < NEURONS_PER_PIXEL; j++) {
+            synapse_disk[i].voltages[j] = 0;
+            synapse_disk[i].weights[j] = 0;
+            synapse_disk[i].thresholds[j] = 0;
+        }
+    }
 
     // --- Initialize the Pixelated Memory Map ---
     for (int p = 0; p < PIXELS_COUNT; p++) {
