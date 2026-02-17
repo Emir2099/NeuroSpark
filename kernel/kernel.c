@@ -1039,6 +1039,14 @@ void process_command(char *cmd) {
             kprint("ERR: INVALID OR PROTECTED ADDR", current_shell_row, 0, 0x0C); // Red
         }
     }
+    else if (cmd[0] == 'm' && cmd[1] == 'a' && cmd[2] == 'p') {
+        kprint("--- MEMORY MAP ---", current_shell_row, 0, 0x0B);
+        current_shell_row++;
+        if (current_shell_row >= SHELL_MAX_ROW) scroll_shell();
+        pmm_print_map();
+        // pmm_print_map uses 3 rows and advances current_shell_row itself
+        if (current_shell_row >= SHELL_MAX_ROW) scroll_shell();
+    }
     else {
         video[line3 + 20] = 0x4F00 | 'N';
         video[line3 + 21] = 0x4F00 | 'O';
