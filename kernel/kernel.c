@@ -7,6 +7,10 @@ typedef unsigned int uint32_t;
 extern void timer_wrapper(void);
 extern void keyboard_wrapper(void);
 
+// External PMM functions
+extern void init_pmm();
+extern void* pmm_alloc_page();
+
 #define THRESHOLD 1000  // Membrane potential required to spike
 #define DECAY 5         // Voltage lost per clock tick (leaky behavior)
 #define GRID_SIZE 10    // Number of neurons in our initial grid
@@ -616,16 +620,16 @@ int sys_load_task(int task_id, int slot) {
     // Force memory read
     __asm__ volatile("" ::: "memory");
     
+    // Check if the file exists
+    int used_val = synapse_disk[slot].is_used;
+    
     // Debug: show is_used value on line 12
     unsigned short *video_dbg = (unsigned short *)0xB8000;
-    int used_val = synapse_disk[slot].is_used;
     video_dbg[80*11 + 5] = 0x0C00 | 'L'; // Load
     video_dbg[80*11 + 6] = 0x0C00 | ('0' + slot);
     video_dbg[80*11 + 7] = 0x0C00 | ':';
     video_dbg[80*11 + 8] = 0x0C00 | ('0' + used_val);
     
-    // Check if the file exists
-    int used_val = synapse_disk[slot].is_used;
     if (!used_val) return 0;
     
     volatile VirtualFile *f = &synapse_disk[slot];
@@ -760,6 +764,17 @@ void keyboard_handler(void) {
         // Visual feedback on the monitor line
         video[80 * 5] = 0x0F00 | 'K'; // Show 'K' for Keyboard event
     }
+}
+
+// Helper: Convert hex address to string for display
+void hex_to_str(uint32_t n, char *str) {
+    char *hex = "0123456789ABCDEF";
+    str[0] = '0'; str[1] = 'x';
+    for(int i = 7; i >= 0; i--) {
+        str[i + 2] = hex[n & 0xF];
+        n >>= 4;
+    }
+    str[10] = '\0';
 }
 
 void process_command(char *cmd) {
@@ -982,6 +997,17 @@ void process_command(char *cmd) {
             kprint("ERR: INVALID TASK ID", current_shell_row, 0, 0x0C);
         }
     }
+    else if (cmd[0] == 'm' && cmd[1] == 'a' && cmd[2] == 'l' && cmd[3] == 'l') {
+        void* new_page = pmm_alloc_page();
+        if(new_page) {
+            char addr_str[11];
+            hex_to_str((uint32_t)new_page, addr_str);
+            kprint("ALLOCATED 4KB NEURAL PAGE AT: ", current_shell_row, 0, 0x0A);
+            kprint(addr_str, current_shell_row, 30, 0x0F); // White address after label
+        } else {
+            kprint("ERR: OUT OF PHYSICAL MEMORY", current_shell_row, 0, 0x0C);
+        }
+    }
     else {
         video[line3 + 20] = 0x4F00 | 'N';
         video[line3 + 21] = 0x4F00 | 'O';
@@ -1108,7 +1134,7 @@ void kernel_main(void) {
     for (int i = 0; message[i] != '\0'; i++) {
         video_memory[i] = 0x1F00 | message[i];
     }
-
+    init_pmm();
     while (1) {
         __asm__ volatile ("hlt");
     }

@@ -67,9 +67,9 @@ load_kernel:
     jc disk_error
     
     ; Read kernel sectors using CHS
-    ; We'll read 16 sectors to be safe (8KB)
+    ; We'll read 32 sectors (16KB) to allow for kernel growth
     mov ah, 0x02          ; Read function
-    mov al, 16            ; Number of sectors to read
+    mov al, 32            ; Number of sectors to read
     mov ch, 0             ; Cylinder 0
     mov cl, 2             ; Start from sector 2 (sector 1 is bootloader)
     mov dh, 0             ; Head 0
@@ -84,7 +84,7 @@ load_kernel:
     jc disk_error
     
     ; Check if we read the right number of sectors
-    cmp al, 16
+    cmp al, 32
     jne disk_error
     
     ret

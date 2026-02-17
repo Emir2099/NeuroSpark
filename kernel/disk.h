@@ -6,7 +6,7 @@ typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
 
 // ===== DISK DRIVER CONFIGURATION =====
-#define DISK_DATA_OFFSET 34   // Start saving neural data at LBA 34 (after 32-sector kernel + 1 boot sector + 1 gap)
+#define DISK_DATA_OFFSET 66   // Start saving neural data at LBA 66 (after 1 boot + 32 kernel sectors + gap)
 
 // ATA I/O Port Addresses
 #define PORT_DATA      0x1F0
