@@ -598,14 +598,9 @@ void sys_save_task(int task_id, int slot) {
         disk_write_sector(DISK_DATA_OFFSET + slot, (uint16_t*)f);
     }
     
-    // Visual feedback — show is_used value on screen for debug
+    // Visual feedback
     unsigned short *video = (unsigned short *)0xB8000;
     video[79] = ata_disk_available ? 0x2F44 : 0x2F4D; // 'D' for disk, 'M' for memory-only
-    // Debug: show slot + is_used on line 12
-    video[80*11 + 0] = 0x0E00 | 'S'; // Save
-    video[80*11 + 1] = 0x0E00 | ('0' + slot);
-    video[80*11 + 2] = 0x0E00 | ':';
-    video[80*11 + 3] = 0x0E00 | ('0' + f->is_used);
 }
 
 // LOAD: Restore a task's persistence data from a "File"
@@ -630,6 +625,7 @@ int sys_load_task(int task_id, int slot) {
     video_dbg[80*11 + 8] = 0x0C00 | ('0' + used_val);
     
     // Check if the file exists
+    int used_val = synapse_disk[slot].is_used;
     if (!used_val) return 0;
     
     volatile VirtualFile *f = &synapse_disk[slot];
@@ -905,6 +901,86 @@ void process_command(char *cmd) {
         }
         current_shell_row = SHELL_MIN_ROW;
         return;
+    }
+    // Command: "eval"
+    else if (cmd[0] == 'e' && cmd[1] == 'v' && cmd[2] == 'a' && cmd[3] == 'l') {
+        int active_task = 0; // Evaluate Task 0 (IO)
+        TaskControlBlock *t = &task_list[active_task];
+        int px = t->target_pixel; // Point at the LIVE pixel neurons
+    
+        int total_potential = 0;
+        int total_resistance = 0;
+
+        // Perform a LIVE "Neural Calculation" — reads directly from os_memory_map
+        for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
+            // Potential = current voltage + synaptic weight (activity + learned strength)
+            total_potential += os_memory_map[px].neurons[n].voltage;
+            total_potential += os_memory_map[px].neurons[n].synaptic_weight;
+            // Higher thresholds = higher resistance to spiking (Fluid/Rigid phase)
+            total_resistance += os_memory_map[px].neurons[n].dynamic_threshold;
+        }
+
+        kprint("NEURAL EVALUATION:", current_shell_row, 0, 0x0B);
+        if (current_shell_row >= SHELL_MAX_ROW) scroll_shell();
+        else current_shell_row++;
+
+        // Logic: If potential > resistance, the brain is "Active/Fluid"
+        if (total_potential > total_resistance) {
+            kprint(">> FLUID/ACTIVE <<", current_shell_row, 0, 0x2F);  // Bright white on green
+        } else {
+            kprint(">> RIGID/STABLE <<", current_shell_row, 0, 0x4E);  // Yellow on red
+        }
+    }
+    // Command: "stim [id] [amount]" (e.g., stim 0 800)
+    else if (cmd[0] == 's' && cmd[1] == 't' && cmd[2] == 'i' && cmd[3] == 'm') {
+        int task_idx = cmd[5] - '0';
+    
+        // Simple manual parser for the stimulus amount
+        // If the command is too short, we use a default of 500
+        int amount = 500; 
+        if (cmd[7] != '\0') {
+            // Simple conversion: assumes 3-digit number (e.g., 500, 999)
+            amount = (cmd[7] - '0') * 100 + (cmd[8] - '0') * 10 + (cmd[9] - '0');
+        }
+
+        if (task_idx >= 0 && task_idx < 2) {
+            // 1. Target the correct Task
+            TaskControlBlock *t = &task_list[task_idx];
+            int px = t->target_pixel; // Point at LIVE neurons
+
+            // 2. Spread stimulus across the entire pixel cluster (5 neurons)
+            // This triggers a collective reaction in the metamaterial phase logic
+            for(int n = 0; n < NEURONS_PER_PIXEL; n++) {
+                // Inject voltage into LIVE neurons
+                os_memory_map[px].neurons[n].voltage += (amount / NEURONS_PER_PIXEL);
+                
+                // Permanent Synaptic Strengthening (+300 per stim)
+                // Every stimulus makes the connection significantly "smarter"
+                // We allow stim to push weight beyond the normal Hebbian cap of 800
+                os_memory_map[px].neurons[n].synaptic_weight += 300;
+                
+                // Training Effect: Lower the firing threshold (priming, -800 per stim)
+                // Makes neurons easier to fire — simulates neural plasticity
+                // Must overpower the +200/spike adaptation in timer_handler
+                // Floor at 200 to prevent negative/zero thresholds
+                int new_thr = os_memory_map[px].neurons[n].dynamic_threshold - 800;
+                if (new_thr < 200) new_thr = 200;
+                os_memory_map[px].neurons[n].dynamic_threshold = new_thr;
+                
+                // Keep TCB snapshots in sync
+                t->saved_voltages[n] = os_memory_map[px].neurons[n].voltage;
+                t->saved_weights[n] = os_memory_map[px].neurons[n].synaptic_weight;
+                t->saved_thresholds[n] = os_memory_map[px].neurons[n].dynamic_threshold;
+            }
+        
+            // 3. UI Feedback
+            kprint("STIMULUS INJECTED: ", current_shell_row, 0, 0x0E); // Yellow
+            char val_str[10];
+            itoa(amount, val_str);
+            kprint(val_str, current_shell_row, 19, 0x0F);
+        } else {
+            kprint("ERR: INVALID TASK ID", current_shell_row, 0, 0x0C);
+        }
     }
     else {
         video[line3 + 20] = 0x4F00 | 'N';
