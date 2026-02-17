@@ -16,6 +16,9 @@ void pmm_set_page(uint32_t page_addr) {
 // Logic to mark a page as free
 void pmm_free_page(uint32_t page_addr) {
     uint32_t page = page_addr / PAGE_SIZE;
+    // Safety check: Don't allow freeing the first 1MB (Kernel Space)
+    if (page_addr < 0x100000) return; 
+    
     memory_bitmap[page / 8] &= ~(1 << (page % 8));
 }
 

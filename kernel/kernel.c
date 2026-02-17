@@ -10,6 +10,7 @@ extern void keyboard_wrapper(void);
 // External PMM functions
 extern void init_pmm();
 extern void* pmm_alloc_page();
+extern void pmm_free_page(uint32_t page_addr);
 
 #define THRESHOLD 1000  // Membrane potential required to spike
 #define DECAY 5         // Voltage lost per clock tick (leaky behavior)
@@ -777,6 +778,24 @@ void hex_to_str(uint32_t n, char *str) {
     str[10] = '\0';
 }
 
+uint32_t str_to_hex(char *str) {
+    uint32_t val = 0;
+    // Skip "0x" if present
+    int i = (str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) ? 2 : 0;
+    
+    while (str[i] != '\0' && str[i] != ' ') {
+        uint32_t byte = str[i];
+        if (byte >= '0' && byte <= '9') byte = byte - '0';
+        else if (byte >= 'a' && byte <= 'f') byte = byte - 'a' + 10;
+        else if (byte >= 'A' && byte <= 'F') byte = byte - 'A' + 10;
+        else break;
+
+        val = (val << 4) | (byte & 0xF);
+        i++;
+    }
+    return val;
+}
+
 void process_command(char *cmd) {
     unsigned short *video = (unsigned short *)0xB8000;
     
@@ -1006,6 +1025,18 @@ void process_command(char *cmd) {
             kprint(addr_str, current_shell_row, 30, 0x0F); // White address after label
         } else {
             kprint("ERR: OUT OF PHYSICAL MEMORY", current_shell_row, 0, 0x0C);
+        }
+    }
+    else if (cmd[0] == 'f' && cmd[1] == 'r' && cmd[2] == 'e' && cmd[3] == 'e') {
+    // Extract the address starting at index 5: "free 0x100000"
+        uint32_t addr_to_free = str_to_hex(&cmd[5]);
+    
+        if (addr_to_free >= 0x100000) {
+            pmm_free_page(addr_to_free);
+            kprint("PAGE RELEASED AT: ", current_shell_row, 0, 0x0E); // Yellow
+            kprint(&cmd[5], current_shell_row, 18, 0x0F);
+        } else {
+            kprint("ERR: INVALID OR PROTECTED ADDR", current_shell_row, 0, 0x0C); // Red
         }
     }
     else {
