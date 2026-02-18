@@ -1095,6 +1095,25 @@ void process_command(char *cmd) {
     
         kprint("LOAD COMPLETE.", current_shell_row++, 0, 0x0A);
     }
+    else if (cmd[0] == 'w' && cmd[1] == 'i' && cmd[2] == 'p' && cmd[3] == 'e') {
+        kprint("WIPING NEURAL STATE AT LBA 200...", current_shell_row++, 0, 0x0E); // Yellow
+
+        // Create a local zeroed-out buffer (256 uint16_t = 512 bytes)
+        uint16_t zero_buffer[256];
+        for (int i = 0; i < 256; i++) {
+            zero_buffer[i] = 0;
+        }
+
+        // Overwrite the specific sector on the disk
+        disk_write_sector(200, zero_buffer);
+
+        // Also reset the live potentials in RAM so the simulation restarts immediately
+        for (int i = 0; i < NEURON_COUNT; i++) {
+            potentials[i] = 0;
+        }
+
+        kprint("DISK & RAM RESET TO ZERO-POTENTIAL STATE.", current_shell_row++, 0, 0x0A); // Green
+    }
     else {
         video[line3 + 20] = 0x4F00 | 'N';
         video[line3 + 21] = 0x4F00 | 'O';
