@@ -21,6 +21,11 @@ extern uint32_t page_directory[1024];
 extern void create_task(int index, void (*func_ptr)(), uint32_t page_dir);
 void pulse_neurons(); // Forward declaration
 
+/* External reference to ATA Disk Driver */
+extern void disk_write_sectors(uint32_t lba, uint8_t count, uint32_t* buffer);
+/* External reference for loading */
+extern void disk_read_sector(uint32_t lba, uint16_t *buffer);
+
 #define THRESHOLD 1000  // Membrane potential required to spike
 #define DECAY 5         // Voltage lost per clock tick (leaky behavior)
 #define GRID_SIZE 10    // Number of neurons in our initial grid
@@ -1074,6 +1079,21 @@ void process_command(char *cmd) {
         pmm_print_map();
         // pmm_print_map uses 3 rows and advances current_shell_row itself
         if (current_shell_row >= SHELL_MAX_ROW) scroll_shell();
+    }
+    else if (cmd[0] == 's' && cmd[1] == 'a' && cmd[2] == 'v' && cmd[3] == 'e') {
+        kprint("PERSISTING NEURAL STATE TO LBA 200...", current_shell_row++, 0, 0x0E); // Yellow
+    
+        /* We cast 'potentials' to uint16_t* to satisfy the driver's signature */
+        disk_write_sector(200, (uint16_t*)potentials);
+    
+        kprint("BRAIN SAVED SUCCESSFULLY.", current_shell_row++, 0, 0x0A); // Green
+    }
+    else if (cmd[0] == 'l' && cmd[1] == 'o' && cmd[2] == 'a' && cmd[3] == 'd') {
+        kprint("READING NEURAL STATE FROM LBA 200...", current_shell_row++, 0, 0x0E);
+    
+        disk_read_sector(200, (uint16_t*)potentials);
+    
+        kprint("LOAD COMPLETE.", current_shell_row++, 0, 0x0A);
     }
     else {
         video[line3 + 20] = 0x4F00 | 'N';
