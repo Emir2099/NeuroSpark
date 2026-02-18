@@ -130,3 +130,13 @@ void disk_read_sector(uint32_t lba, uint16_t *buffer) {
         buffer[i] = inw(PORT_DATA);
     }
 }
+
+/* TFS: Find first empty slot in root directory */
+int find_free_slot(FileEntry *dir) {
+    for (int i = 0; i < TFS_MAX_FILES; i++) {
+        if (dir[i].flags == 0) {
+            return i;
+        }
+    }
+    return -1; // Directory is full
+}

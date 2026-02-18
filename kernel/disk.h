@@ -29,10 +29,23 @@ typedef unsigned int uint32_t;
 // Global flag: is ATA disk controller present?
 extern volatile int ata_disk_available;
 
+// ===== TINY FILE SYSTEM (TFS) =====
+#define TFS_DIR_LBA    150   // Root directory stored at LBA 150
+#define TFS_DATA_START 200   // Neural snapshots start at LBA 200+
+#define TFS_MAX_FILES  25    // One 512-byte sector holds 25 entries (20 bytes each)
+
+typedef struct {
+    char name[12];     // Name of the neural snapshot
+    uint32_t lba;      // The physical sector on disk
+    uint32_t size;     // Size in bytes
+    uint32_t flags;    // 1 = Active, 0 = Empty
+} FileEntry;
+
 // Disk driver functions
 int  ata_detect_disk(void);
 void ata_wait_ready(void);
 void disk_write_sector(uint32_t lba, uint16_t *buffer);
 void disk_read_sector(uint32_t lba, uint16_t *buffer);
+int  find_free_slot(FileEntry *dir);
 
 #endif

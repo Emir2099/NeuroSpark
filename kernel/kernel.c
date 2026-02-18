@@ -17,6 +17,58 @@ extern void init_paging();
 extern void enablePaging();
 extern uint32_t page_directory[1024];
 
+// ============================================================================
+// KERNEL-SPACE GDT
+// The bootloader's GDT lives at 0x7C00+ which gets overwritten by the kernel's
+// BSS (first_page_table is placed at 0x7000 by the linker). We must define our
+// own GDT in kernel memory and reload GDTR before init_paging() corrupts it.
+// ============================================================================
+struct gdt_entry_struct {
+    uint16_t limit_lo;
+    uint16_t base_lo;
+    uint8_t  base_mid;
+    uint8_t  access;
+    uint8_t  flags_limit_hi;
+    uint8_t  base_hi;
+} __attribute__((packed));
+
+struct gdt_ptr_struct {
+    uint16_t limit;
+    uint32_t base;
+} __attribute__((packed));
+
+// 3 entries: null, code, data (same as bootloader GDT)
+struct gdt_entry_struct kernel_gdt[3] = {
+    // Null descriptor
+    {0, 0, 0, 0, 0, 0},
+    // Code segment: base=0, limit=0xFFFFF, present, ring 0, exec, readable, 32-bit, 4K granularity
+    {0xFFFF, 0x0000, 0x00, 0x9A, 0xCF, 0x00},
+    // Data segment: base=0, limit=0xFFFFF, present, ring 0, writable, 32-bit, 4K granularity
+    {0xFFFF, 0x0000, 0x00, 0x92, 0xCF, 0x00},
+};
+
+struct gdt_ptr_struct kernel_gdtp = {
+    sizeof(kernel_gdt) - 1,
+    0  // Will be set at runtime
+};
+
+void load_kernel_gdt() {
+    kernel_gdtp.base = (uint32_t)&kernel_gdt;
+    __asm__ volatile (
+        "lgdt (%0)\n"
+        // Reload all segment registers with the new GDT's selectors
+        "ljmp $0x08, $1f\n"
+        "1:\n"
+        "mov $0x10, %%ax\n"
+        "mov %%ax, %%ds\n"
+        "mov %%ax, %%es\n"
+        "mov %%ax, %%fs\n"
+        "mov %%ax, %%gs\n"
+        "mov %%ax, %%ss\n"
+        : : "r"(&kernel_gdtp) : "ax"
+    );
+}
+
 // External Tasking
 extern void create_task(int index, void (*func_ptr)(), uint32_t page_dir);
 void pulse_neurons(); // Forward declaration
@@ -125,6 +177,10 @@ typedef struct {
 
 volatile VirtualFile synapse_disk[MAX_FILES];
 
+/* Tiny File System: Root directory (loaded from LBA 150) */
+FileEntry root_directory[TFS_MAX_FILES];
+
+void list_files();
 
 volatile char input_buffer[COMMAND_MAX_LEN];
 volatile int buffer_idx = 0;
@@ -829,6 +885,46 @@ void neuro_task_entry() {
     }
 }
 
+/* TFS: List all active files from the root directory */
+void list_files() {
+    // Read the Root Directory from disk (LBA 150)
+    if (ata_disk_available) {
+        disk_read_sector(TFS_DIR_LBA, (uint16_t*)root_directory);
+    }
+
+    kprint("NAME         LBA    SIZE", current_shell_row, 0, 0x0B);
+    if (current_shell_row >= SHELL_MAX_ROW) scroll_shell();
+    else current_shell_row++;
+    kprint("------------------------", current_shell_row, 0, 0x07);
+    if (current_shell_row >= SHELL_MAX_ROW) scroll_shell();
+    else current_shell_row++;
+
+    int found = 0;
+    for (int i = 0; i < TFS_MAX_FILES; i++) {
+        if (root_directory[i].flags == 1) {
+            kprint(root_directory[i].name, current_shell_row, 0, 0x0F);
+
+            // Print LBA number
+            char lba_str[10];
+            itoa((int)root_directory[i].lba, lba_str);
+            kprint(lba_str, current_shell_row, 13, 0x0E);
+
+            // Print size
+            char size_str[10];
+            itoa((int)root_directory[i].size, size_str);
+            kprint(size_str, current_shell_row, 20, 0x08);
+
+            if (current_shell_row >= SHELL_MAX_ROW) scroll_shell();
+            else current_shell_row++;
+            found = 1;
+        }
+    }
+
+    if (!found) {
+        kprint("NO FILES FOUND.", current_shell_row, 0, 0x0C);
+    }
+}
+
 void process_command(char *cmd) {
     unsigned short *video = (unsigned short *)0xB8000;
     
@@ -933,15 +1029,11 @@ void process_command(char *cmd) {
             video[line3 + 26] = ok ? (0x2F00 | 'K') : (0x4F00 | 'R');
         }
     }
-    // Command: "ls"
-    else if (cmd[0] == 'l' && cmd[1] == 's' && cmd[2] == '\0') {
+    // Command: "ls" - List TFS files
+    else if (cmd[0] == 'l' && cmd[1] == 's' && (cmd[2] == '\0' || cmd[2] == ' ')) {
         video[line3 + 20] = 0x0A00 | 'L';
         video[line3 + 21] = 0x0A00 | 'S';
-        
-        const char *msg = "FILES: 0:IO 1:COMP";
-        for(int i = 0; msg[i] != '\0'; i++) {
-            video[output_offset + i] = 0x0A00 | msg[i];
-        }
+        list_files();
     }
     // Command: "help"
     else if (cmd[0] == 'h' && cmd[1] == 'e' && cmd[2] == 'l' && cmd[3] == 'p' && cmd[4] == '\0') {
@@ -950,10 +1042,13 @@ void process_command(char *cmd) {
         video[line3 + 22] = 0x0700 | 'L';
         video[line3 + 23] = 0x0700 | 'P';
         
-        const char *msg = "save 0, load 0, ls, help";
-        for(int i = 0; msg[i] != '\0'; i++) {
-            video[output_offset + i] = 0x0700 | msg[i];
-        }
+        kprint("save 0, load 0, stim, eval", current_shell_row, 0, 0x07);
+        if (current_shell_row >= SHELL_MAX_ROW) scroll_shell();
+        else current_shell_row++;
+        kprint("tsave [name], tload [name], ls", current_shell_row, 0, 0x07);
+        if (current_shell_row >= SHELL_MAX_ROW) scroll_shell();
+        else current_shell_row++;
+        kprint("mall, free, map, wipe, clear", current_shell_row, 0, 0x07);
     }
     // Command: "clear"
     else if (cmd[0] == 'c' && cmd[1] == 'l' && cmd[2] == 'e' && cmd[3] == 'a' && cmd[4] == 'r' && cmd[5] == '\0') {
@@ -1080,23 +1175,91 @@ void process_command(char *cmd) {
         // pmm_print_map uses 3 rows and advances current_shell_row itself
         if (current_shell_row >= SHELL_MAX_ROW) scroll_shell();
     }
-    else if (cmd[0] == 's' && cmd[1] == 'a' && cmd[2] == 'v' && cmd[3] == 'e') {
-        kprint("PERSISTING NEURAL STATE TO LBA 200...", current_shell_row++, 0, 0x0E); // Yellow
-    
-        /* We cast 'potentials' to uint16_t* to satisfy the driver's signature */
-        disk_write_sector(200, (uint16_t*)potentials);
-    
-        kprint("BRAIN SAVED SUCCESSFULLY.", current_shell_row++, 0, 0x0A); // Green
+    // Command: "tsave" - TFS named save of neural potentials
+    else if (cmd[0] == 't' && cmd[1] == 's' && cmd[2] == 'a' && cmd[3] == 'v' && cmd[4] == 'e') {
+        // Load the existing directory from disk
+        if (ata_disk_available) {
+            disk_read_sector(TFS_DIR_LBA, (uint16_t*)root_directory);
+        }
+        int slot = find_free_slot(root_directory);
+        if (slot != -1) {
+            kprint("SAVING SNAPSHOT...", current_shell_row, 0, 0x0E);
+            if (current_shell_row >= SHELL_MAX_ROW) scroll_shell();
+            else current_shell_row++;
+
+            // Setup metadata
+            root_directory[slot].lba = TFS_DATA_START + slot;
+            root_directory[slot].flags = 1;
+            root_directory[slot].size = sizeof(potentials);
+
+            // Name: "brain0", "brain1", etc. or use user-supplied name
+            // Check if user gave a name: "tsave myname"
+            if (cmd[5] == ' ' && cmd[6] != '\0') {
+                for (int i = 0; i < 11 && cmd[6 + i] != '\0'; i++)
+                    root_directory[slot].name[i] = cmd[6 + i];
+                root_directory[slot].name[11] = '\0';
+            } else {
+                root_directory[slot].name[0] = 'b'; root_directory[slot].name[1] = 'r';
+                root_directory[slot].name[2] = 'a'; root_directory[slot].name[3] = 'i';
+                root_directory[slot].name[4] = 'n'; root_directory[slot].name[5] = (char)('0' + slot);
+                root_directory[slot].name[6] = '\0';
+            }
+
+            // Write neural data to the assigned LBA
+            if (ata_disk_available) {
+                disk_write_sector(root_directory[slot].lba, (uint16_t*)potentials);
+                // Write updated directory back to LBA 150
+                disk_write_sector(TFS_DIR_LBA, (uint16_t*)root_directory);
+            }
+
+            kprint("SAVED AS: ", current_shell_row, 0, 0x0A);
+            kprint(root_directory[slot].name, current_shell_row, 10, 0x0F);
+        } else {
+            kprint("ERR: DISK DIRECTORY FULL", current_shell_row, 0, 0x0C);
+        }
     }
-    else if (cmd[0] == 'l' && cmd[1] == 'o' && cmd[2] == 'a' && cmd[3] == 'd') {
-        kprint("READING NEURAL STATE FROM LBA 200...", current_shell_row++, 0, 0x0E);
-    
-        disk_read_sector(200, (uint16_t*)potentials);
-    
-        kprint("LOAD COMPLETE.", current_shell_row++, 0, 0x0A);
+    // Command: "tload <name>" - TFS named load
+    else if (cmd[0] == 't' && cmd[1] == 'l' && cmd[2] == 'o' && cmd[3] == 'a' && cmd[4] == 'd') {
+        // Require a name argument: "tload name"
+        if (cmd[5] != ' ' || cmd[6] == '\0') {
+            kprint("USAGE: tload <name>", current_shell_row, 0, 0x0C);
+        } else {
+            if (ata_disk_available) {
+                disk_read_sector(TFS_DIR_LBA, (uint16_t*)root_directory);
+            }
+            // Find the file by name (case-insensitive, starts at cmd[6])
+            int found = -1;
+            for (int i = 0; i < TFS_MAX_FILES; i++) {
+                if (root_directory[i].flags != 1) continue;
+                int match = 1;
+                for (int j = 0; j < 11; j++) {
+                    char a = root_directory[i].name[j];
+                    char b = cmd[6 + j];
+                    // Normalize both to lowercase for comparison
+                    if (a >= 'A' && a <= 'Z') a += 32;
+                    if (b >= 'A' && b <= 'Z') b += 32;
+                    if (b == '\0') {
+                        // End of user input — match only if file name also ends here
+                        if (a != '\0') match = 0;
+                        break;
+                    }
+                    if (a != b) { match = 0; break; }
+                }
+                if (match) { found = i; break; }
+            }
+            if (found >= 0 && ata_disk_available) {
+                disk_read_sector(root_directory[found].lba, (uint16_t*)potentials);
+                kprint("LOADED: ", current_shell_row, 0, 0x0A);
+                kprint(root_directory[found].name, current_shell_row, 8, 0x0F);
+            } else {
+                kprint("ERR: FILE NOT FOUND", current_shell_row, 0, 0x0C);
+            }
+        }
     }
     else if (cmd[0] == 'w' && cmd[1] == 'i' && cmd[2] == 'p' && cmd[3] == 'e') {
-        kprint("WIPING NEURAL STATE AT LBA 200...", current_shell_row++, 0, 0x0E); // Yellow
+        kprint("WIPING ALL NEURAL DATA...", current_shell_row, 0, 0x0E);
+        if (current_shell_row >= SHELL_MAX_ROW) scroll_shell();
+        else current_shell_row++;
 
         // Create a local zeroed-out buffer (256 uint16_t = 512 bytes)
         uint16_t zero_buffer[256];
@@ -1104,15 +1267,27 @@ void process_command(char *cmd) {
             zero_buffer[i] = 0;
         }
 
-        // Overwrite the specific sector on the disk
-        disk_write_sector(200, zero_buffer);
+        // 1. Clear the TFS root directory (LBA 150)
+        disk_write_sector(TFS_DIR_LBA, zero_buffer);
+        // Also clear the in-RAM directory
+        for (int i = 0; i < TFS_MAX_FILES; i++) {
+            root_directory[i].flags = 0;
+            root_directory[i].name[0] = '\0';
+            root_directory[i].lba = 0;
+            root_directory[i].size = 0;
+        }
 
-        // Also reset the live potentials in RAM so the simulation restarts immediately
+        // 2. Clear data sectors (LBA 200 through 200+TFS_MAX_FILES)
+        for (int s = 0; s < TFS_MAX_FILES; s++) {
+            disk_write_sector(TFS_DATA_START + s, zero_buffer);
+        }
+
+        // 3. Also reset the live potentials in RAM
         for (int i = 0; i < NEURON_COUNT; i++) {
             potentials[i] = 0;
         }
 
-        kprint("DISK & RAM RESET TO ZERO-POTENTIAL STATE.", current_shell_row++, 0, 0x0A); // Green
+        kprint("DIR + DATA + RAM WIPED.", current_shell_row, 0, 0x0A);
     }
     else {
         video[line3 + 20] = 0x4F00 | 'N';
@@ -1162,6 +1337,10 @@ void kernel_main(void) {
         "mov %%ax, %%ss\n"
         : : : "ax"
     );
+
+    // Load kernel-space GDT immediately so we don't depend on the bootloader's
+    // GDT at 0x7C00 (which gets overwritten by BSS/page tables during init_paging)
+    load_kernel_gdt();
 
     // --- Explicit .bss initialization (not zeroed by bootloader) ---
     buffer_idx = 0;
