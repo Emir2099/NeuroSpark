@@ -11,6 +11,10 @@ extern void keyboard_wrapper(void);
 extern void init_pmm();
 extern void* pmm_alloc_page();
 extern void pmm_free_page(uint32_t page_addr);
+extern void pmm_print_map();
+extern void init_paging();
+
+extern void enablePaging();
 
 #define THRESHOLD 1000  // Membrane potential required to spike
 #define DECAY 5         // Voltage lost per clock tick (leaky behavior)
@@ -1174,6 +1178,7 @@ void kernel_main(void) {
         video_memory[i] = 0x1F00 | message[i];
     }
     init_pmm();
+    init_paging(); // The "Nervous System" is now active
     while (1) {
         __asm__ volatile ("hlt");
     }

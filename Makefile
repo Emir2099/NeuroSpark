@@ -25,16 +25,18 @@ boot/boot.bin: boot/boot.asm
 # 	$(CC) $(CFLAGS) -c kernel/kernel.c -o kernel.o
 # 	$(LD) -o $@ -T linker.ld kernel.o --oformat binary
 
-kernel.bin: kernel/kernel.c kernel/disk.c kernel/disk.h kernel/pmm.c kernel/interrupt.asm linker.ld
+kernel.bin: kernel/kernel.c kernel/disk.c kernel/disk.h kernel/pmm.c kernel/paging.c kernel/paging.asm kernel/interrupt.asm linker.ld
 	nasm -f elf32 kernel/interrupt.asm -o interrupt.o
+	nasm -f elf32 kernel/paging.asm -o paging_asm.o
 	$(CC) $(CFLAGS) -c kernel/disk.c -o disk.o
 	$(CC) $(CFLAGS) -c kernel/pmm.c -o pmm.o
+	$(CC) $(CFLAGS) -c kernel/paging.c -o paging.o
 	$(CC) $(CFLAGS) -c kernel/kernel.c -o kernel.o
-	$(LD) -o $@ -T linker.ld kernel.o disk.o pmm.o interrupt.o --oformat binary
+	$(LD) -o $@ -T linker.ld kernel.o disk.o pmm.o paging.o paging_asm.o interrupt.o --oformat binary
 
 # Clean build artifacts
 clean:
-	rm -f NeuroSpark.bin kernel.bin kernel.o disk.o pmm.o interrupt.o boot/boot.bin
+	rm -f NeuroSpark.bin kernel.bin kernel.o disk.o pmm.o paging.o paging_asm.o interrupt.o boot/boot.bin
 
 # Run in QEMU
 run: NeuroSpark.bin
