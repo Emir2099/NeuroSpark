@@ -28,3 +28,16 @@ keyboard_wrapper:
     
     popa
     iretd
+
+extern schedule ; Defined in task.c
+
+irq0_handler:
+    pushad          ; Save all registers
+    
+    call schedule   ; The OS decides who runs next
+    
+    mov al, 0x20    ; Send EOI (End of Interrupt) to PIC
+    out 0x20, al
+    
+    popad           ; Restore registers for the NEW task
+    iretd           ; Jump back into the task's code

@@ -15,6 +15,11 @@ extern void pmm_print_map();
 extern void init_paging();
 
 extern void enablePaging();
+extern uint32_t page_directory[1024];
+
+// External Tasking
+extern void create_task(int index, void (*func_ptr)(), uint32_t page_dir);
+void pulse_neurons(); // Forward declaration
 
 #define THRESHOLD 1000  // Membrane potential required to spike
 #define DECAY 5         // Voltage lost per clock tick (leaky behavior)
@@ -37,6 +42,11 @@ extern void enablePaging();
 #define SHELL_MIN_ROW 15  
 #define SHELL_MAX_ROW 24
 
+/* Neuromorphic Globals */
+#define NEURON_COUNT 16
+#define THRESHOLD 1000
+#define LEAK_RATE 2
+
 #include "disk.h"
 
 volatile int current_shell_row = SHELL_START_ROW;
@@ -51,6 +61,8 @@ void kprint(const char *str, int row, int col, unsigned char color);
 void scroll_shell();
 void sys_save_task(int task_id, int slot);
 int sys_load_task(int task_id, int slot);
+
+int potentials[NEURON_COUNT] = {0}; // Current charge of each neuron
 
 typedef struct {
     int voltage;        /* Current membrane potential */
@@ -89,6 +101,7 @@ typedef struct {
 
     int last_spike_count;    /* Spike count from the previous second */
     int spikes_per_second;   /* Calculated real-time throughput */
+    int state;               /* Task lifecycle state (0=Active) */
 } TaskControlBlock;
 
 // For now, let's define two tasks
@@ -800,6 +813,17 @@ uint32_t str_to_hex(char *str) {
     return val;
 }
 
+/* This is the background process for Neuromorphic logic */
+void neuro_task_entry() {
+    while(1) {
+        // 1. Run spiking neural network pulse
+        pulse_neurons(); 
+        
+        // Brief manual delay to make the spiking visible in the UI
+        for(volatile int d = 0; d < 100000; d++);
+    }
+}
+
 void process_command(char *cmd) {
     unsigned short *video = (unsigned short *)0xB8000;
     
@@ -1179,7 +1203,41 @@ void kernel_main(void) {
     }
     init_pmm();
     init_paging(); // The "Nervous System" is now active
+
+    // 2. Prepare Task 0: The Shell
+    // Task 0 is 'born' already running because it's the current thread
+    task_list[0].state = 0; // Running
+    task_list[0].task_id = 0;
+
+    // 3. Prepare Task 1: The NeuroCore
+    // We pass the function pointer we just created
+    create_task(1, neuro_task_entry, (uint32_t)page_directory); 
+
+    kprint("MULTITASKING KERNEL ACTIVE", 0, 0, 0x0E); // Yellow text
+
     while (1) {
         __asm__ volatile ("hlt");
+    }
+}
+
+void pulse_neurons() {
+    for (int i = 0; i < NEURON_COUNT; i++) {
+        // 1. Leak: Natural decay of the membrane potential
+        if (potentials[i] > 0) {
+            potentials[i] -= LEAK_RATE;
+        }
+
+        // 2. Integration: Add a small charge to simulate background activity
+        // In a real simulation, this would come from an input source
+        potentials[i] += 5; 
+
+        // 3. Fire: If potential hits the threshold, the neuron 'spikes'
+        if (potentials[i] >= THRESHOLD) {
+            potentials[i] = 0; // Reset after firing
+            
+            // Visual feedback: Print a small indicator at the top right of the screen
+            // 0x0A is Green, 0x0F is White
+            kprint("*", 0, 75 + (i % 4), 0x0A); 
+        }
     }
 }
