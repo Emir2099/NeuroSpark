@@ -41,3 +41,16 @@ irq0_handler:
     
     popad           ; Restore registers for the NEW task
     iretd           ; Jump back into the task's code
+
+    extern syscall_handler
+
+global syscall_wrapper
+syscall_wrapper:
+    pushad          ; Save all registers
+    
+    push esp        ; Pass the stack pointer (containing the registers) to C
+    call syscall_handler
+    add esp, 4      ; Clean up stack
+    
+    popad           ; Restore registers (potentially with a return value in EAX)
+    iretd

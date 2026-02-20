@@ -227,11 +227,11 @@ struct idt_entry idt[256];
 struct idt_ptr idtp;
 
 /* 4. Interrupt Logic */
-void set_idt_gate(int n, uint32_t handler) {
+void set_idt_gate(int n, uint32_t handler, uint16_t sel, uint8_t flags) {
     idt[n].base_lo = handler & 0xFFFF;
-    idt[n].sel = 0x08;     /* Code segment from your GDT */
+    idt[n].sel = sel;      /* Code segment */
     idt[n].always0 = 0;
-    idt[n].flags = 0x8E;   /* 32-bit Interrupt Gate, Present, Ring 0 */
+    idt[n].flags = flags;  /* Type and Attributes */
     idt[n].base_hi = (handler >> 16) & 0xFFFF;
 }
 
@@ -256,9 +256,9 @@ void init_idt() {
     outb(0x21, 0xFC);  outb(0xA1, 0xFF);
 
     /* Register our timer wrapper (IRQ0 -> Index 32) */
-    set_idt_gate(32, (uint32_t)timer_wrapper);
+    set_idt_gate(32, (uint32_t)timer_wrapper, 0x08, 0x8E);
 
-    set_idt_gate(33, (uint32_t)keyboard_wrapper); // Keyboard
+    set_idt_gate(33, (uint32_t)keyboard_wrapper, 0x08, 0x8E); // Keyboard
 
     /* Load the IDT into the CPU and enable interrupts */
     __asm__ volatile("lidt (%0)" : : "r" (&idtp));
@@ -874,14 +874,17 @@ uint32_t str_to_hex(char *str) {
     return val;
 }
 
-/* This is the background process for Neuromorphic logic */
 void neuro_task_entry() {
+    char *pulse_msg = "NEURO-PULSE ACTIVE";
+    
     while(1) {
-        // 1. Run spiking neural network pulse
-        pulse_neurons(); 
-        
-        // Brief manual delay to make the spiking visible in the UI
-        for(volatile int d = 0; d < 100000; d++);
+        pulse_neurons();
+
+        // Trigger the System Call
+        // EAX = 1 (Print), EBX = address of message
+        asm volatile ("mov $1, %%eax; mov %0, %%ebx; int $0x80" : : "r"(pulse_msg) : "eax", "ebx");
+
+        for(volatile int d = 0; d < 1000000; d++); 
     }
 }
 
@@ -1421,6 +1424,9 @@ void kernel_main(void) {
     }
     init_pmm();
     init_paging(); // The "Nervous System" is now active
+
+    void init_syscalls(); 
+    init_syscalls(); // Plug in 'int 0x80'
 
     // 2. Prepare Task 0: The Shell
     // Task 0 is 'born' already running because it's the current thread
