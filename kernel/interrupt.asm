@@ -54,3 +54,13 @@ syscall_wrapper:
     
     popad           ; Restore registers (potentially with a return value in EAX)
     iretd
+
+global exception_wrapper
+extern exception_handler
+
+exception_wrapper:
+    cli
+    call exception_handler
+.halt:
+    hlt
+    jmp .halt

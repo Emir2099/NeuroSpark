@@ -1,4 +1,34 @@
-*.bin
+# Build artifacts
 *.o
-NeuroSpark.bin
+*.bin
 *.elf
+*.iso
+NeuroSpark.bin
+kernel.bin
+boot/boot.bin
+
+# Disassembly dumps
+*.dump
+
+# Logs & debug output
+*.log
+error.txt
+make.out
+make_output.txt
+
+# Makefile backups
+Makefile.save
+Makefile.save.*
+
+# QEMU disk images
+*.img
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db

@@ -1,0 +1,123 @@
+#include "pci.h"
+
+#define PCI_CONFIG_ADDRESS 0xCF8
+#define PCI_CONFIG_DATA 0xCFC
+
+/* ============================================================
+ * Port I/O (32-bit)
+ * ============================================================ */
+static inline void outl(uint16_t port, uint32_t val) {
+  __asm__ volatile("outl %0, %1" : : "a"(val), "Nd"(port));
+}
+static inline uint32_t inl(uint16_t port) {
+  uint32_t ret;
+  __asm__ volatile("inl %1, %0" : "=a"(ret) : "Nd"(port));
+  return ret;
+}
+
+/* ============================================================
+ * Shared PCI device list (filled during scan, NEVER printed at scan time)
+ * Printing happens post-boot via pci_print_results() called from shell/task.
+ * ============================================================ */
+PciDevice pci_found[PCI_MAX_DEVICES];
+int pci_found_count = 0;
+
+/* ============================================================
+ * PCI config read
+ * ============================================================ */
+uint32_t pci_read_config(uint8_t bus, uint8_t slot, uint8_t func,
+                         uint8_t offset) {
+  uint32_t address =
+      (uint32_t)(((uint32_t)bus << 16) | ((uint32_t)slot << 11) |
+                 ((uint32_t)func << 8) | (offset & 0xFC) | 0x80000000);
+  outl(PCI_CONFIG_ADDRESS, address);
+  return inl(PCI_CONFIG_DATA);
+}
+
+/* ============================================================
+ * pci_check_function – SILENT: store only, no gprint here.
+ *
+ * Reason: pci_scan_all() is called early in kernel_main BEFORE
+ * init_idt() sets up exception handlers. Any exception during a
+ * gprint call (stack issue, bad pointer) has no handler and causes
+ * an immediate triple fault + reboot loop. All output is deferred
+ * to pci_print_results(), called after the IDT and graphics are up.
+ * ============================================================ */
+void pci_check_function(uint8_t bus, uint8_t device, uint8_t function) {
+  uint32_t vendor_device = pci_read_config(bus, device, function, 0x00);
+  uint16_t vendor_id = (uint16_t)(vendor_device & 0xFFFF);
+
+  if (vendor_id == 0xFFFF)
+    return; /* No device */
+
+  uint16_t device_id = (uint16_t)(vendor_device >> 16);
+  uint32_t class_reg = pci_read_config(bus, device, function, 0x08);
+  uint8_t class_code = (uint8_t)((class_reg >> 24) & 0xFF);
+  uint8_t subclass = (uint8_t)((class_reg >> 16) & 0xFF);
+
+  if (pci_found_count < PCI_MAX_DEVICES) {
+    pci_found[pci_found_count].vendor = vendor_id;
+    pci_found[pci_found_count].device_id = device_id;
+    pci_found[pci_found_count].class_code = class_code;
+    pci_found[pci_found_count].subclass = subclass;
+    pci_found[pci_found_count].bus = bus;
+    pci_found[pci_found_count].slot = device;
+    pci_found_count++;
+  }
+  /* NO gprint here – deferred to pci_print_results() */
+}
+
+/* ============================================================
+ * pci_scan_all – just fills pci_found[], never touches gprint
+ * ============================================================ */
+void pci_scan_all() {
+  pci_found_count = 0;
+  for (uint16_t bus = 0; bus < 256; bus++) {
+    for (uint8_t slot = 0; slot < 32; slot++) {
+      pci_check_function((uint8_t)bus, slot, 0);
+    }
+  }
+}
+
+/* ============================================================
+ * pci_print_results – call this AFTER init_idt() and init_graphics()
+ * Prints all found devices via gprint safely.
+ * ============================================================ */
+extern void gprint(char *str, unsigned int color);
+extern void gprint_hex(unsigned int val, int digits, unsigned int color);
+
+void pci_print_results() {
+  gprint("--- PCI DEVICES ---\n", 0x00FFFF);
+  for (int i = 0; i < pci_found_count; i++) {
+    gprint("B:", 0x00FFFF);
+    gprint_hex(pci_found[i].bus, 2, 0xFFFFFF);
+    gprint(" D:", 0x00FFFF);
+    gprint_hex(pci_found[i].slot, 2, 0xFFFFFF);
+    gprint(" VEN:", 0x00FFFF);
+    gprint_hex(pci_found[i].vendor, 4, 0xFFFF00);
+    gprint(" DEV:", 0x00FFFF);
+    gprint_hex(pci_found[i].device_id, 4, 0xFFFF00);
+    gprint(" CLS:", 0x00FFFF);
+    gprint_hex(pci_found[i].class_code, 2, 0xFF8800);
+    gprint("/", 0x888888);
+    gprint_hex(pci_found[i].subclass, 2, 0xFF8800);
+
+    if (pci_found[i].class_code == 0x01 && pci_found[i].subclass == 0x08) {
+      gprint(" <NVMe>", 0x00FF88);
+    } else if (pci_found[i].class_code == 0x01 &&
+               pci_found[i].subclass == 0x06) {
+      gprint(" <AHCI>", 0x00FF88);
+    } else if (pci_found[i].class_code == 0x02) {
+      gprint(" <NET>", 0x88FFFF);
+    } else if (pci_found[i].class_code == 0x03) {
+      gprint(" <VGA>", 0x8888FF);
+    } else if (pci_found[i].class_code == 0x0C &&
+               pci_found[i].subclass == 0x03) {
+      gprint(" <USB>", 0xFF88FF);
+    }
+    gprint("\n", 0);
+  }
+  if (pci_found_count == 0) {
+    gprint("No PCI devices found.\n", 0xFF4444);
+  }
+}

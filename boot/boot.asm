@@ -21,14 +21,31 @@ start:
     mov ah, 0x0e
     mov al, 'A'
     int 0x10
-    
-    ; Load kernel from disk
-    call load_kernel
-    
-    ; Print 'L' - kernel loaded!
-    mov ah, 0x0e
-    mov al, 'L'
+
+    ; --- VESA GATEWAY TO GRAPHICS START ---
+    ; 1. Get VBE Mode Information
+    mov ax, 0x4F01          ; VBE Get Mode Info function
+    mov cx, 0x115           ; Mode 0x115: 800x600, 32-bit color
+    mov di, 0x8000          ; Use 0x8000 as a temporary buffer for info
+    int 0x10                ; BIOS Video Interrupt
+
+    cmp ax, 0x004F          ; Check for VBE success
+    jne vesa_error          ; Handle error if VESA isn't supported
+
+    ; 2. Save Physical Framebuffer Address (Offset 40 in ModeInfoBlock)
+    mov eax, [0x8000 + 40]
+    mov [vbe_framebuffer], eax
+    ; Also store at well-known address 0x9000 so kernel can read it
+    mov [0x9000], eax
+
+    ; 3. Set the VBE Mode
+    mov ax, 0x4F02          ; VBE Set Mode function
+    mov bx, 0x4115          ; 0x115 | 0x4000 (Set LFB bit for Linear Framebuffer)
     int 0x10
+    ; --- VESA GATEWAY TO GRAPHICS END ---
+
+    ; Load kernel from disk using LBA
+    call load_kernel
     
     ; Enter protected mode
     cli
@@ -52,7 +69,8 @@ protected_mode:
     mov ss, ax
     
     ; Setup stack
-    mov ebp, 0x90000
+    ; Setup stack well above BSS (backbuffer ends at ~0x200000)
+    mov ebp, 0x400000
     mov esp, ebp
     
     ; Jump to kernel
@@ -60,33 +78,80 @@ protected_mode:
 
 [bits 16]
 load_kernel:
-    ; Reset disk system
+    ;-------------------------------------------------------------------
+    ; Use INT 13h AH=42h (Extended Read / LBA) to load the kernel.
+    ; This avoids CHS geometry issues with hard-disk images in QEMU.
+    ; We load 40 sectors (20 KB) starting at LBA 1 into 0x0000:0x1000.
+    ;-------------------------------------------------------------------
+
+    ; First, test if LBA extensions are available
+    mov ah, 0x41
+    mov bx, 0x55AA
+    mov dl, [BOOT_DRIVE]
+    int 0x13
+    jc .try_chs              ; No LBA support, fallback to CHS
+
+    ; --- LBA path (preferred) ---
+    mov si, dap              ; DS:SI -> Disk Address Packet
+    mov ah, 0x42             ; Extended Read
+    mov dl, [BOOT_DRIVE]
+    int 0x13
+    jc disk_error
+    ret
+
+.try_chs:
+    ;-------------------------------------------------------------------
+    ; CHS fallback for older BIOS / floppy
+    ;-------------------------------------------------------------------
     mov ah, 0x00
     mov dl, [BOOT_DRIVE]
     int 0x13
     jc disk_error
-    
-    ; Read kernel sectors using CHS
-    ; We'll read 32 sectors (16KB) to allow for kernel growth
-    mov ah, 0x02          ; Read function
-    mov al, 32            ; Number of sectors to read
-    mov ch, 0             ; Cylinder 0
-    mov cl, 2             ; Start from sector 2 (sector 1 is bootloader)
-    mov dh, 0             ; Head 0
-    mov dl, [BOOT_DRIVE]  ; Drive number
-    
-    ; Destination: 0x0000:0x1000
-    xor bx, bx
-    mov es, bx
+
+    xor ax, ax
+    mov es, ax
     mov bx, KERNEL_OFFSET
-    
+    mov ch, 0               ; Cylinder 0
+    mov dh, 0               ; Head 0
+    mov cl, 2               ; Start from sector 2
+    mov di, 40              ; 40 sectors to read
+
+.read_loop:
+    push cx
+    push dx
+    push di
+    push bx
+    push es
+
+    mov ah, 0x02
+    mov al, 1
+    mov dl, [BOOT_DRIVE]
     int 0x13
     jc disk_error
+
+    pop es
+    pop bx
+    pop di
+    pop dx
+    pop cx
+
+    add bx, 512
+
+    inc cl
+    cmp cl, 19
+    jl .no_geo_advance
     
-    ; Check if we read the right number of sectors
-    cmp al, 32
-    jne disk_error
+    mov cl, 1
+    inc dh
+    cmp dh, 2
+    jl .no_geo_advance
     
+    mov dh, 0
+    inc ch
+
+.no_geo_advance:
+    dec di
+    jnz .read_loop
     ret
 
 disk_error:
@@ -99,6 +164,14 @@ disk_error:
     call print_hex
     
     ; Hang
+    cli
+    hlt
+    jmp $
+
+vesa_error:
+    mov ah, 0x0e
+    mov al, 'V'             ; Print 'V' for VESA Error
+    int 0x10
     cli
     hlt
     jmp $
@@ -122,6 +195,18 @@ print_hex_digit:
     mov ah, 0x0e
     int 0x10
     ret
+
+; ----- DATA -----
+
+; Disk Address Packet for INT 13h AH=42h
+ALIGN 4
+dap:
+    db 0x10                  ; Size of DAP (16 bytes)
+    db 0                     ; Reserved
+    dw 40                    ; Number of sectors to read
+    dw KERNEL_OFFSET         ; Offset of destination buffer
+    dw 0x0000                ; Segment of destination buffer
+    dq 1                     ; Start LBA (sector 1 = first sector after bootsector)
 
 ; GDT Definition
 gdt_start:
@@ -153,6 +238,7 @@ gdt_descriptor:
     dd gdt_start                 ; Offset
 
 BOOT_DRIVE: db 0
+vbe_framebuffer: dd 0       ; Variable to store LFB address for Kernel access
 
 ; Pad to 510 bytes and add boot signature
 times 510-($-$$) db 0
