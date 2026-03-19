@@ -16,14 +16,6 @@ extern void* pmm_alloc_page();
 TCB os_tasks[2]; 
 int os_current_task = 0;
 
-void schedule() {
-    int old_task = os_current_task;
-    os_current_task = (os_current_task + 1) % 2; // Simple Round-Robin
-    
-    // Perform the actual CPU context switch
-    switch_task(&os_tasks[old_task], &os_tasks[os_current_task]);
-}
-
 /* Function to initialize a task's stack and state */
 void create_task(int index, void (*func_ptr)(), uint32_t page_dir) {
     // 1. Allocate 4 contiguous physical pages (16KB) for the task's stack.

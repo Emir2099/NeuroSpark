@@ -25,7 +25,7 @@ boot/boot.bin: boot/boot.asm
 # 	$(CC) $(CFLAGS) -c kernel/kernel.c -o kernel.o
 # 	$(LD) -o $@ -T linker.ld kernel.o --oformat binary
 
-kernel.bin: kernel/kernel.c kernel/disk.c kernel/disk.h kernel/pmm.c kernel/paging.c kernel/paging.asm kernel/interrupt.asm kernel/idt.c kernel/syscall.c kernel/graphics.c kernel/pci.c kernel/multiboot.asm kernel/font.h linker.ld
+kernel.bin: kernel/kernel.c kernel/disk.c kernel/disk.h kernel/pmm.c kernel/paging.c kernel/paging.asm kernel/interrupt.asm kernel/idt.c kernel/syscall.c kernel/graphics.c kernel/pci.c kernel/scheduler.c kernel/shell.c kernel/input.c kernel/dashboard.c kernel/storage_manager.c kernel/klog.c kernel/multiboot.asm kernel/font.h linker.ld
 	nasm -f elf32 kernel/multiboot.asm -o multiboot.o
 	nasm -f elf32 kernel/interrupt.asm -o interrupt.o
 	nasm -f elf32 kernel/paging.asm -o paging_asm.o
@@ -38,12 +38,18 @@ kernel.bin: kernel/kernel.c kernel/disk.c kernel/disk.h kernel/pmm.c kernel/pagi
 	$(CC) $(CFLAGS) -c kernel/syscall.c -o syscall.o
 	$(CC) $(CFLAGS) -c kernel/graphics.c -o graphics.o
 	$(CC) $(CFLAGS) -c kernel/pci.c -o pci.o
+	$(CC) $(CFLAGS) -c kernel/scheduler.c -o scheduler.o
+	$(CC) $(CFLAGS) -c kernel/shell.c -o shell.o
+	$(CC) $(CFLAGS) -c kernel/input.c -o input.o
+	$(CC) $(CFLAGS) -c kernel/dashboard.c -o dashboard.o
+	$(CC) $(CFLAGS) -c kernel/storage_manager.c -o storage_manager.o
+	$(CC) $(CFLAGS) -c kernel/klog.c -o klog.o
 	$(CC) $(CFLAGS) -c kernel/kernel.c -o kernel.o
-	$(LD) -o $@ -T linker.ld multiboot.o kernel.o disk.o pmm.o paging.o paging_asm.o interrupt.o switch.o task.o idt.o syscall.o graphics.o pci.o --oformat binary
+	$(LD) -o $@ -T linker.ld multiboot.o kernel.o disk.o pmm.o paging.o paging_asm.o interrupt.o switch.o task.o scheduler.o idt.o syscall.o graphics.o pci.o shell.o input.o dashboard.o storage_manager.o klog.o --oformat binary
 
 # Clean build artifacts
 clean:
-	rm -f NeuroSpark.bin kernel.bin kernel.o disk.o pmm.o paging.o paging_asm.o interrupt.o switch.o task.o idt.o syscall.o graphics.o boot/boot.bin
+	rm -f NeuroSpark.bin kernel.bin kernel.o disk.o pmm.o paging.o paging_asm.o interrupt.o switch.o task.o scheduler.o idt.o syscall.o graphics.o pci.o shell.o input.o dashboard.o storage_manager.o klog.o boot/boot.bin
 
 # Run in QEMU
 run: NeuroSpark.bin

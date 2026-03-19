@@ -148,6 +148,12 @@ extern void draw_cursor(uint32_t tick);
 
 #include "disk.h"
 #include "pci.h" /* PciDevice, pci_found[], pci_found_count */
+#include "scheduler.h"
+#include "shell.h"
+#include "input.h"
+#include "dashboard.h"
+#include "storage_manager.h"
+#include "klog.h"
 
 volatile int current_shell_row = SHELL_START_ROW;
 
@@ -158,16 +164,9 @@ uint8_t current_bg_color = 0x1F; // Default Blue
 int zoom_level = 1;  /* 1 = full view (16 neurons), 2 = 8, 3 = ~5, 4 = 4 */
 int zoom_offset = 0; /* first neuron index visible when zoomed in           */
 
-/* Phase transition tracking for auto-save */
-static uint8_t prev_phase[PIXELS_COUNT] = {0, 0}; /* 0 = FLUID initially */
-
 // Forward declarations
 void update_monitor();
-void process_command(char *cmd);
 void kprint(const char *str, int row, int col, unsigned char color);
-void scroll_shell();
-void sys_save_task(int task_id, int slot);
-int sys_load_task(int task_id, int slot);
 
 int potentials[NEURON_COUNT] = {0}; // Current charge of each neuron
 
@@ -226,8 +225,6 @@ volatile VirtualFile synapse_disk[MAX_FILES];
 
 /* Tiny File System: Root directory (loaded from LBA 150) */
 FileEntry root_directory[TFS_MAX_FILES];
-
-void list_files();
 
 volatile char input_buffer[COMMAND_MAX_LEN];
 volatile int buffer_idx = 0;
@@ -678,66 +675,7 @@ void update_monitor() {
   }
 }
 
-void switch_tasks() {
-  // 1. SAVE current state - find which task owns which pixel first
-  for (int p = 0; p < PIXELS_COUNT; p++) {
-    // Find the task assigned to this pixel
-    for (int t = 0; t < 2; t++) {
-      if (task_list[t].target_pixel == p) {
-        // Save this pixel's state to the correct task
-        for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
-          task_list[t].saved_voltages[n] = os_memory_map[p].neurons[n].voltage;
-          task_list[t].saved_weights[n] =
-              os_memory_map[p].neurons[n].synaptic_weight;
-          // Save the current adaptation level
-          task_list[t].saved_thresholds[n] =
-              os_memory_map[p].neurons[n].dynamic_threshold;
-        }
-        break;
-      }
-    }
-  }
 
-  // 2. SWAP the Task Control Blocks in the list
-  TaskControlBlock temp = task_list[0];
-  task_list[0] = task_list[1];
-  task_list[1] = temp;
-
-  // 3. Reset the target pixels to match the new array positions
-  task_list[0].target_pixel = 0;
-  task_list[1].target_pixel = 1;
-
-  // 4. LOAD the new state into the Pixels (Neural Persistence)
-  // Instead of clearing to 0, we restore the saved state of the incoming task.
-  for (int p = 0; p < PIXELS_COUNT; p++) {
-    // Find which task is now assigned to this pixel (after the swap)
-    for (int t = 0; t < 2; t++) {
-      if (task_list[t].target_pixel == p) {
-        // Restore this task's saved state to the pixel
-        for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
-          os_memory_map[p].neurons[n].voltage = task_list[t].saved_voltages[n];
-          os_memory_map[p].neurons[n].synaptic_weight =
-              task_list[t].saved_weights[n];
-          // Restore the adaptation level for the incoming task
-          os_memory_map[p].neurons[n].dynamic_threshold =
-              task_list[t].saved_thresholds[n];
-        }
-        break;
-      }
-    }
-  }
-
-  // Clear voltages for a 'cold' context switch
-  // This prevents residual potential from the previous task from 'polluting'
-  // the new one. Commented out to enable Neural Persistence (State Saving).
-  /*
-  for (int p = 0; p < PIXELS_COUNT; p++) {
-      for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
-          os_memory_map[p].neurons[n].voltage = 0;
-      }
-  }
-  */
-}
 
 char get_ascii(uint8_t scancode) {
   static char map[0x80] = {
@@ -752,6 +690,8 @@ char get_ascii(uint8_t scancode) {
 // ============================================================================
 // NEURAL PERSISTENCE FUNCTIONS (Save/Load with Disk)
 // ============================================================================
+
+#if 0
 
 // SAVE: Copy a task's LIVE neural state into a "File"
 void sys_save_task(int task_id, int slot) {
@@ -1780,6 +1720,8 @@ void process_command(char *cmd) {
   video[(current_shell_row * 80) + 1] = 0x0F00 | ' ';
 }
 
+#endif
+
 void kprint(const char *str, int row, int col, unsigned char color) {
   unsigned short *video = (unsigned short *)0xB8000;
 
@@ -1978,46 +1920,3 @@ void pulse_neurons() {
 uint32_t vbe_framebuffer = 0xFD000000;
 int screen_width = 800;
 int screen_height = 600;
-
-// External graphics functions
-extern void gprint(char *str, uint32_t color);
-extern void put_pixel(int x, int y, uint32_t color);
-extern void flip_buffer();
-extern void clear_screen(uint32_t color);
-
-/* The foundation of UI */
-/* put_pixel is in graphics.c */
-
-/* Clear screen with a solid color */
-/* clear_screen is now in graphics.c */
-
-// Implement list_files_gfx using gprint
-void list_files_gfx() {
-  // Refresh directory info from disk
-  if (ata_disk_available) {
-    disk_read_sector(TFS_DIR_LBA, (uint16_t *)root_directory);
-  }
-  gprint("--- NEURO-FILESYSTEM ---\n", 0x00FFFF);
-  int found = 0;
-  for (int i = 0; i < TFS_MAX_FILES; i++) {
-    if (root_directory[i].flags == 1) {
-      gprint(root_directory[i].name, 0x00FF00); // Green
-      gprint("\n", 0);
-      found = 1;
-    }
-  }
-  if (!found) {
-    gprint("NO FILES FOUND.\n", 0xFF0000); // Red
-  }
-}
-
-/* Visualize the NeuroCore */
-void draw_neural_spike(int neuron_id, uint32_t intensity) {
-  int start_x = 100 + (neuron_id * 40);
-  // Draw a rectangle representing the neuron's potential
-  for (int i = 0; i < 30; i++) {
-    for (int j = 0; j < intensity / 10; j++) {
-      put_pixel(start_x + i, 500 - j, 0x00FF00); // Neon Green
-    }
-  }
-}
