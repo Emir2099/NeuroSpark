@@ -30,7 +30,15 @@ extern volatile int kb_head;
 extern volatile int kb_tail;
 
 /* Task yield */
-extern void schedule(void);
+extern void task_yield(void);
+extern void irq_lock_acquire(void *lock, unsigned int *flags_out);
+extern void irq_lock_release(void *lock, unsigned int flags);
+
+typedef struct {
+  volatile int locked;
+} irq_lock_t;
+
+static irq_lock_t kb_lock = {0};
 
 /* ============================================================
  * Flip mutex (defined in kernel.c)
@@ -59,13 +67,18 @@ void syscall_handler(uint32_t *regs) {
 
   /* ---- SYS_READ_KB (5): non-blocking keyboard buffer read ---- */
   case SYS_READ_KB: {
+    unsigned int flags;
+    irq_lock_acquire(&kb_lock, &flags);
+
     if (kb_head == kb_tail) {
+      irq_lock_release(&kb_lock, flags);
       /* Buffer empty – cooperatively yield, caller must retry */
-      schedule();
+      task_yield();
       regs[7] = 0; /* Return 0 = no key available */
     } else {
       char c = kb_buf[kb_tail];
       kb_tail = (kb_tail + 1) % KB_BUF_SIZE;
+      irq_lock_release(&kb_lock, flags);
       regs[7] = (uint32_t)(unsigned char)c; /* Return ASCII code */
     }
     break;

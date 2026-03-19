@@ -470,6 +470,9 @@ void timer_handler(void) {
   if (tick % 10 == 0) { // Update monitor every 10 ticks to save cycles
     update_monitor();
   }
+
+  /* Scheduler quantum accounting and preemption point (IRQ0 driven). */
+  scheduler_timer_tick();
 }
 
 void init_graphics() {

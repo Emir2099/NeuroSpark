@@ -3,15 +3,6 @@
 typedef unsigned int uint32_t;
 
 typedef struct {
-  uint32_t esp;
-  uint32_t ebp;
-  uint32_t eip;
-  uint32_t page_dir;
-  uint32_t state;
-  int task_id;
-} TCB;
-
-typedef struct {
   int voltage;
   int spike_count;
   int id;
@@ -42,15 +33,279 @@ typedef struct {
 } TaskControlBlock;
 
 extern void switch_task(TCB *old, TCB *new);
-extern TCB os_tasks[2];
-extern int os_current_task;
 extern TaskControlBlock task_list[2];
 extern NeuralPixel os_memory_map[2];
 
-void schedule(void) {
-  int old_task = os_current_task;
-  os_current_task = (os_current_task + 1) % 2;
-  switch_task(&os_tasks[old_task], &os_tasks[os_current_task]);
+static irq_lock_t scheduler_lock = {0};
+static volatile uint32_t scheduler_ticks = 0;
+
+unsigned int irq_save(void) {
+  unsigned int flags;
+  __asm__ volatile("pushf; pop %0; cli" : "=r"(flags) : : "memory");
+  return flags;
+}
+
+void irq_restore(unsigned int flags) {
+  __asm__ volatile("push %0; popf" : : "r"(flags) : "memory", "cc");
+}
+
+void irq_lock_acquire(irq_lock_t *lock, unsigned int *flags_out) {
+  unsigned int flags = irq_save();
+  while (lock->locked) {
+  }
+  lock->locked = 1;
+  __asm__ volatile("" ::: "memory");
+  if (flags_out != 0) {
+    *flags_out = flags;
+  }
+}
+
+void irq_lock_release(irq_lock_t *lock, unsigned int flags) {
+  __asm__ volatile("" ::: "memory");
+  lock->locked = 0;
+  irq_restore(flags);
+}
+
+static void scheduler_wake_sleepers_locked(void) {
+  for (int i = 0; i < os_task_count; i++) {
+    if (os_tasks[i].state == TASK_STATE_SLEEPING &&
+        os_tasks[i].wake_tick <= scheduler_ticks) {
+      os_tasks[i].state = TASK_STATE_READY;
+      os_tasks[i].wake_tick = 0;
+    }
+  }
+}
+
+static int scheduler_pick_next_locked(int old_task) {
+  for (int step = 1; step <= os_task_count; step++) {
+    int idx = (old_task + step) % os_task_count;
+    if (os_tasks[idx].state == TASK_STATE_READY) {
+      return idx;
+    }
+  }
+
+  if (os_tasks[old_task].state == TASK_STATE_RUNNING ||
+      os_tasks[old_task].state == TASK_STATE_READY) {
+    return old_task;
+  }
+
+  for (int i = 0; i < os_task_count; i++) {
+    if (os_tasks[i].state != TASK_STATE_BLOCKED &&
+        os_tasks[i].state != TASK_STATE_SLEEPING &&
+        os_tasks[i].state != TASK_STATE_TERMINATED) {
+      return i;
+    }
+  }
+
+  return old_task;
+}
+
+static void scheduler_select_and_switch(int force_current_ready) {
+  int old_task;
+  int new_task;
+  unsigned int flags;
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+
+  old_task = os_current_task;
+  if (force_current_ready && os_tasks[old_task].state == TASK_STATE_RUNNING) {
+    os_tasks[old_task].state = TASK_STATE_READY;
+  }
+
+  scheduler_wake_sleepers_locked();
+  new_task = scheduler_pick_next_locked(old_task);
+
+  os_current_task = new_task;
+  os_tasks[new_task].state = TASK_STATE_RUNNING;
+  os_tasks[new_task].time_slice = SCHED_TIME_SLICE_TICKS;
+
+  irq_lock_release(&scheduler_lock, flags);
+
+  if (new_task != old_task) {
+    switch_task(&os_tasks[old_task], &os_tasks[new_task]);
+  }
+}
+
+void schedule(void) { scheduler_select_and_switch(1); }
+
+void task_yield(void) { schedule(); }
+
+void task_sleep(unsigned int ticks) {
+  unsigned int flags;
+  int current;
+
+  if (ticks == 0) {
+    task_yield();
+    return;
+  }
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+  current = os_current_task;
+  os_tasks[current].state = TASK_STATE_SLEEPING;
+  os_tasks[current].wake_tick = scheduler_ticks + ticks;
+  irq_lock_release(&scheduler_lock, flags);
+
+  scheduler_select_and_switch(0);
+}
+
+void task_terminate_current(void) {
+  unsigned int flags;
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+  os_tasks[os_current_task].state = TASK_STATE_TERMINATED;
+  irq_lock_release(&scheduler_lock, flags);
+
+  scheduler_select_and_switch(0);
+  while (1) {
+    __asm__ volatile("hlt");
+  }
+}
+
+void scheduler_timer_tick(void) {
+  int should_preempt = 0;
+  unsigned int flags;
+  int current;
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+  scheduler_ticks++;
+  scheduler_wake_sleepers_locked();
+
+  current = os_current_task;
+  if (os_tasks[current].state == TASK_STATE_RUNNING) {
+    if (os_tasks[current].time_slice > 0) {
+      os_tasks[current].time_slice--;
+    }
+    if (os_tasks[current].time_slice == 0) {
+      should_preempt = 1;
+    }
+  }
+
+  irq_lock_release(&scheduler_lock, flags);
+
+  if (should_preempt) {
+    schedule();
+  }
+}
+
+void wait_queue_init(wait_queue_t *queue) {
+  if (queue == 0) {
+    return;
+  }
+  queue->head = 0;
+  queue->tail = 0;
+  queue->count = 0;
+  for (int i = 0; i < MAX_TASKS; i++) {
+    queue->task_ids[i] = -1;
+  }
+}
+
+void wait_queue_wait(wait_queue_t *queue) {
+  unsigned int flags;
+  int current;
+
+  if (queue == 0) {
+    return;
+  }
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+  current = os_current_task;
+  if (queue->count < MAX_TASKS) {
+    queue->task_ids[queue->tail] = current;
+    queue->tail = (queue->tail + 1) % MAX_TASKS;
+    queue->count++;
+    os_tasks[current].state = TASK_STATE_BLOCKED;
+  }
+  irq_lock_release(&scheduler_lock, flags);
+
+  scheduler_select_and_switch(0);
+}
+
+int wait_queue_wake_one(wait_queue_t *queue) {
+  unsigned int flags;
+  int woken = 0;
+
+  if (queue == 0) {
+    return 0;
+  }
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+  while (queue->count > 0) {
+    int task_id = queue->task_ids[queue->head];
+    queue->task_ids[queue->head] = -1;
+    queue->head = (queue->head + 1) % MAX_TASKS;
+    queue->count--;
+
+    if (task_id >= 0 && task_id < os_task_count &&
+        os_tasks[task_id].state == TASK_STATE_BLOCKED) {
+      os_tasks[task_id].state = TASK_STATE_READY;
+      woken = 1;
+      break;
+    }
+  }
+  irq_lock_release(&scheduler_lock, flags);
+
+  return woken;
+}
+
+int wait_queue_wake_all(wait_queue_t *queue) {
+  int total = 0;
+  while (wait_queue_wake_one(queue)) {
+    total++;
+  }
+  return total;
+}
+
+void sched_event_init(sched_event_t *event) {
+  if (event == 0) {
+    return;
+  }
+  event->signaled = 0;
+  wait_queue_init(&event->waiters);
+}
+
+void sched_event_wait(sched_event_t *event) {
+  unsigned int flags;
+
+  if (event == 0) {
+    return;
+  }
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+  if (event->signaled) {
+    event->signaled = 0;
+    irq_lock_release(&scheduler_lock, flags);
+    return;
+  }
+  irq_lock_release(&scheduler_lock, flags);
+
+  wait_queue_wait(&event->waiters);
+}
+
+void sched_event_signal(sched_event_t *event) {
+  if (event == 0) {
+    return;
+  }
+
+  if (!wait_queue_wake_one(&event->waiters)) {
+    unsigned int flags;
+    irq_lock_acquire(&scheduler_lock, &flags);
+    event->signaled = 1;
+    irq_lock_release(&scheduler_lock, flags);
+  }
+}
+
+void sched_event_broadcast(sched_event_t *event) {
+  unsigned int flags;
+
+  if (event == 0) {
+    return;
+  }
+
+  wait_queue_wake_all(&event->waiters);
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+  event->signaled = 1;
+  irq_lock_release(&scheduler_lock, flags);
 }
 
 void switch_tasks(void) {
@@ -59,8 +314,10 @@ void switch_tasks(void) {
       if (task_list[t].target_pixel == p) {
         for (int n = 0; n < 5; n++) {
           task_list[t].saved_voltages[n] = os_memory_map[p].neurons[n].voltage;
-          task_list[t].saved_weights[n] = os_memory_map[p].neurons[n].synaptic_weight;
-          task_list[t].saved_thresholds[n] = os_memory_map[p].neurons[n].dynamic_threshold;
+          task_list[t].saved_weights[n] =
+              os_memory_map[p].neurons[n].synaptic_weight;
+          task_list[t].saved_thresholds[n] =
+              os_memory_map[p].neurons[n].dynamic_threshold;
         }
         break;
       }
@@ -78,8 +335,10 @@ void switch_tasks(void) {
       if (task_list[t].target_pixel == p) {
         for (int n = 0; n < 5; n++) {
           os_memory_map[p].neurons[n].voltage = task_list[t].saved_voltages[n];
-          os_memory_map[p].neurons[n].synaptic_weight = task_list[t].saved_weights[n];
-          os_memory_map[p].neurons[n].dynamic_threshold = task_list[t].saved_thresholds[n];
+          os_memory_map[p].neurons[n].synaptic_weight =
+              task_list[t].saved_weights[n];
+          os_memory_map[p].neurons[n].dynamic_threshold =
+              task_list[t].saved_thresholds[n];
         }
         break;
       }
