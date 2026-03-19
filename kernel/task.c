@@ -26,10 +26,14 @@ void schedule() {
 
 /* Function to initialize a task's stack and state */
 void create_task(int index, void (*func_ptr)(), uint32_t page_dir) {
-    // 1. Allocate a 4KB physical page for the task's stack
-    // Note: pmm_alloc_page is extern from pmm.c
-    uint32_t stack_phys = (uint32_t)pmm_alloc_page(); 
-    uint32_t *stack = (uint32_t *)(stack_phys + 4096); // Stack grows downwards
+    // 1. Allocate 4 contiguous physical pages (16KB) for the task's stack.
+    //    The dashboard rendering (draw_status_bar, draw_waveform, gprint, etc.)
+    //    plus timer ISR frames easily consume >4KB.
+    uint32_t stack_phys = (uint32_t)pmm_alloc_page();
+    pmm_alloc_page(); // page 2
+    pmm_alloc_page(); // page 3
+    pmm_alloc_page(); // page 4
+    uint32_t *stack = (uint32_t *)(stack_phys + 16384); // Stack grows downwards, 16KB
 
     // 2. Mock a CPU Stack Frame
     // We push values in reverse order of how 'switch_task' pops them

@@ -63,10 +63,8 @@ void init_paging() {
   enablePaging();
 
   // 5. Map the Framebuffer
-  //    Use the global vbe_framebuffer (saved by kernel_main before BSS was
-  //    touched).  We CANNOT read from 0x9000 here because first_page_table
-  //    now occupies that address and has overwritten the bootloader's value.
-  //    Map 2MB for 800x600x4
+  //    Use the global vbe_framebuffer (saved by kernel_main from 0x500
+  //    before BSS was touched).  Map 2MB for 800x600x4.
   uint32_t fb_addr = vbe_framebuffer;
   if (fb_addr == 0)
     fb_addr = 0xFD000000; // fallback
@@ -79,6 +77,21 @@ void init_paging() {
 void map_vbe_buffer(uint32_t physical_addr) {
   for (uint32_t i = 0; i < 512; i++) {
     uint32_t addr = physical_addr + (i * 4096);
+    map_page(addr, addr);
+  }
+}
+
+/* ============================================================
+ * map_mmio_region – identity-map an arbitrary MMIO region
+ * @phys:  physical base address (must be page-aligned)
+ * @size:  region size in bytes (rounded up to 4KB pages)
+ * ============================================================ */
+void map_mmio_region(uint32_t phys, uint32_t size) {
+  uint32_t pages = (size + 4095) / 4096;
+  if (pages > 1024)
+    pages = 1024; /* safety cap: 4MB max */
+  for (uint32_t i = 0; i < pages; i++) {
+    uint32_t addr = (phys & 0xFFFFF000) + (i * 4096);
     map_page(addr, addr);
   }
 }

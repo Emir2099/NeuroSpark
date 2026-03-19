@@ -178,3 +178,31 @@ void gprint_dec(int val, uint32_t color) {
     }
     gprint(buf, color);
 }
+
+/* ============================================================
+ * SHELL INPUT CURSOR (independent of gprint cursor)
+ * ============================================================ */
+int shell_cursor_x = 0;
+int shell_cursor_y = 312;
+
+/* ============================================================
+ * BLINKING CURSOR – renders a coloured block at (cursor_x, cursor_y)
+ * Called once per frame from neuro_task_entry.
+ * 'tick' drives the blink cadence (30 frames on / 30 frames off).
+ * ============================================================ */
+void draw_cursor(uint32_t tick) {
+    int cx = shell_cursor_x;
+    int cy = shell_cursor_y;
+    if (cx < 0 || cx >= SCREEN_WIDTH - 8) return;
+    if (cy < 0 || cy >= SCREEN_HEIGHT - 8) return;
+
+    if ((tick / 30) % 2 == 0) {
+        /* Visible half – bright green block */
+        for (int dy = 0; dy < 8; dy++) {
+            for (int dx = 0; dx < 8; dx++) {
+                put_pixel(cx + dx, cy + dy, 0x00FF88);
+            }
+        }
+    }
+    /* Invisible half: area was already cleared by clear_region */
+}

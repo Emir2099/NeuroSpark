@@ -36,12 +36,6 @@ uint32_t pci_read_config(uint8_t bus, uint8_t slot, uint8_t func,
 
 /* ============================================================
  * pci_check_function – SILENT: store only, no gprint here.
- *
- * Reason: pci_scan_all() is called early in kernel_main BEFORE
- * init_idt() sets up exception handlers. Any exception during a
- * gprint call (stack issue, bad pointer) has no handler and causes
- * an immediate triple fault + reboot loop. All output is deferred
- * to pci_print_results(), called after the IDT and graphics are up.
  * ============================================================ */
 void pci_check_function(uint8_t bus, uint8_t device, uint8_t function) {
   uint32_t vendor_device = pci_read_config(bus, device, function, 0x00);
@@ -62,9 +56,9 @@ void pci_check_function(uint8_t bus, uint8_t device, uint8_t function) {
     pci_found[pci_found_count].subclass = subclass;
     pci_found[pci_found_count].bus = bus;
     pci_found[pci_found_count].slot = device;
+    pci_found[pci_found_count].function = function;
     pci_found_count++;
   }
-  /* NO gprint here – deferred to pci_print_results() */
 }
 
 /* ============================================================
@@ -77,6 +71,34 @@ void pci_scan_all() {
       pci_check_function((uint8_t)bus, slot, 0);
     }
   }
+}
+
+/* ============================================================
+ * pci_read_bar5 – Read BAR5 (AHCI ABAR) for a discovered device.
+ * BAR5 is at PCI config offset 0x24.
+ * Returns the 32-bit base address (memory-mapped).
+ * ============================================================ */
+uint32_t pci_read_bar5(int device_index) {
+  if (device_index < 0 || device_index >= pci_found_count)
+    return 0;
+  PciDevice *d = &pci_found[device_index];
+  uint32_t bar5 = pci_read_config(d->bus, d->slot, d->function, 0x24);
+  /* Mask out the lower 4 bits (type/prefetchable flags) for MMIO BARs */
+  return bar5 & 0xFFFFFFF0;
+}
+
+/* ============================================================
+ * pci_find_storage_controller – locate AHCI (01/06) or NVMe (01/08)
+ * Returns the index into pci_found[], or -1 if none.
+ * ============================================================ */
+int pci_find_storage_controller(void) {
+  for (int i = 0; i < pci_found_count; i++) {
+    if (pci_found[i].class_code == 0x01 &&
+        (pci_found[i].subclass == 0x06 || pci_found[i].subclass == 0x08)) {
+      return i;
+    }
+  }
+  return -1;
 }
 
 /* ============================================================
@@ -104,9 +126,13 @@ void pci_print_results() {
 
     if (pci_found[i].class_code == 0x01 && pci_found[i].subclass == 0x08) {
       gprint(" <NVMe>", 0x00FF88);
+      gprint(" BAR5:", 0xAAAAAA);
+      gprint_hex(pci_read_bar5(i), 8, 0x00FF88);
     } else if (pci_found[i].class_code == 0x01 &&
                pci_found[i].subclass == 0x06) {
       gprint(" <AHCI>", 0x00FF88);
+      gprint(" BAR5:", 0xAAAAAA);
+      gprint_hex(pci_read_bar5(i), 8, 0x00FF88);
     } else if (pci_found[i].class_code == 0x02) {
       gprint(" <NET>", 0x88FFFF);
     } else if (pci_found[i].class_code == 0x03) {

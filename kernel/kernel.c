@@ -122,6 +122,10 @@ volatile int kb_tail = 0; /* read  index – advanced by SYS_READ_KB      */
  * two operations never race on the backbuffer. */
 volatile int flip_mutex = 0;
 
+/* shell_dirty: set to 1 by keyboard_handler when a key is pressed.
+ * Cleared by shell_render() after redrawing the input line.     */
+volatile int shell_dirty = 0;
+
 /* VESA Graphics Globals */
 // This should be set by bootloader ideally, or hardcoded for now
 extern uint32_t vbe_framebuffer;
@@ -131,6 +135,11 @@ extern int screen_height;
 // External graphics functions
 extern void gprint(char *str, uint32_t color);
 void list_files_gfx(); // Forward declaration
+
+/* Shell input cursor (defined in graphics.c) */
+extern int shell_cursor_x;
+extern int shell_cursor_y;
+extern void draw_cursor(uint32_t tick);
 
 /* Neuromorphic Globals */
 #define NEURON_COUNT 16
@@ -144,6 +153,13 @@ volatile int current_shell_row = SHELL_START_ROW;
 
 int recent_spikes = 0;
 uint8_t current_bg_color = 0x1F; // Default Blue
+
+/* Waveform zoom state */
+int zoom_level = 1;  /* 1 = full view (16 neurons), 2 = 8, 3 = ~5, 4 = 4 */
+int zoom_offset = 0; /* first neuron index visible when zoomed in           */
+
+/* Phase transition tracking for auto-save */
+static uint8_t prev_phase[PIXELS_COUNT] = {0, 0}; /* 0 = FLUID initially */
 
 // Forward declarations
 void update_monitor();
@@ -712,8 +728,8 @@ void switch_tasks() {
   }
 
   // Clear voltages for a 'cold' context switch
-    // This prevents residual potential from the previous task from 'polluting' the new one.
-    // Commented out to enable Neural Persistence (State Saving).
+  // This prevents residual potential from the previous task from 'polluting'
+  // the new one. Commented out to enable Neural Persistence (State Saving).
   /*
   for (int p = 0; p < PIXELS_COUNT; p++) {
       for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
@@ -841,101 +857,75 @@ void scroll_shell() {
 }
 
 void keyboard_handler(void) {
-  // Read the scancode from the keyboard data port
+  /* ================================================================
+   * ATOMICITY: This ISR only updates data structures (input_buffer,
+   * kb_buf, neural state).  It NEVER calls gprint / flip_buffer /
+   * writes to VGA text memory.  All rendering is driven by
+   * neuro_task_entry → shell_render → draw_cursor → flip.
+   * ================================================================ */
   uint8_t scancode = 0;
-  unsigned short *video = (unsigned short *)0xB8000;
   __asm__ volatile("inb $0x60, %0" : "=a"(scancode));
 
   if (scancode < 0x80) {
     char c = get_ascii(scancode);
 
-    // --- 1. Control Keys (High Priority) ---
-    if (scancode == 0x1C) { // ENTER Key
+    /* --- 1. Control Keys (High Priority) --- */
+    if (scancode == 0x1C) { /* ENTER */
       input_buffer[buffer_idx] = '\0';
-
-      // Copy buffer to local stack to avoid any volatile issues
       char cmd_copy[COMMAND_MAX_LEN];
-      for (int ci = 0; ci <= buffer_idx && ci < COMMAND_MAX_LEN; ci++) {
+      for (int ci = 0; ci <= buffer_idx && ci < COMMAND_MAX_LEN; ci++)
         cmd_copy[ci] = input_buffer[ci];
-      }
-      cmd_copy[COMMAND_MAX_LEN - 1] = '\0'; // safety null
-
+      cmd_copy[COMMAND_MAX_LEN - 1] = '\0';
       process_command(cmd_copy);
       buffer_idx = 0;
-
-      // Dont clear the line where we typed, let it stay visible!
-      // The old text will scroll up naturally
-
-      // Return early so ENTER doesn't get typed as a character
-      video[80 * 5] = 0x0F00 | 'K';
+      shell_dirty = 1;
       return;
-    } else if (scancode == 0x0E && buffer_idx > 0) { // BACKSPACE
+    }
+    if (scancode == 0x0E && buffer_idx > 0) { /* BACKSPACE */
       buffer_idx--;
-      video[(current_shell_row * 80) + buffer_idx] = 0x0F20;
-      video[80 * 5] = 0x0F00 | 'K';
+      shell_dirty = 1;
       return;
     }
 
-    // --- 2. Neural Probe & System Keys (Function Keys) ---
-    // Use function keys to avoid conflicts with command typing
-    if (scancode == 0x3B) { // F1 key for testing (was T)
-      for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
+    /* --- 2. Neural Probe & System Keys (Function Keys) --- */
+    if (scancode == 0x3B) { /* F1 – stim pixel 0 */
+      for (int n = 0; n < NEURONS_PER_PIXEL; n++)
         os_memory_map[0].neurons[n].voltage += 300;
-      }
-      video[80 * 5] = 0x0F00 | 'K';
       return;
     }
-    if (scancode == 0x3C) { // F2 key for Switch (was S)
+    if (scancode == 0x3C) { /* F2 – switch tasks */
       switch_tasks();
-      video[80 * 5] = 0x0F00 | 'K';
       return;
     }
-    if (scancode == 0x3D) { // F3 key for zap (was Z)
-      for (int n = 0; n < NEURONS_PER_PIXEL; n++) {
+    if (scancode == 0x3D) { /* F3 – zap pixel 1 */
+      for (int n = 0; n < NEURONS_PER_PIXEL; n++)
         os_memory_map[1].neurons[n].voltage += 1000;
-      }
-      video[80 * 5] = 0x0F00 | 'K';
       return;
     }
-    if (scancode == 0x3E) { // F4 key for quick save (was W)
+    if (scancode == 0x3E) { /* F4 – quick save */
       sys_save_task(0, 0);
-      video[77] = 0x2F57; // Green 'W'
-      video[80 * 5] = 0x0F00 | 'K';
       return;
     }
-    if (scancode == 0x3F) { // F5 key for quick load (was L)
+    if (scancode == 0x3F) { /* F5 – quick load */
       sys_load_task(0, 0);
-      video[77] = 0x1F4C; // Blue 'L'
-      video[80 * 5] = 0x0F00 | 'K';
       return;
     }
 
-    // --- 3. Standard Character Input ---
-    // Every valid character now reaches this check.
-    // Characters are ALSO pushed to the keyboard circular buffer (kb_buf)
-    // so that SYS_READ_KB (syscall 5) can deliver them to tasks.
+    /* --- 3. Standard Character Input --- */
     if (c && buffer_idx < COMMAND_MAX_LEN - 1) {
       input_buffer[buffer_idx++] = c;
-      // Push to circular buffer (if not full)
+      /* Push to circular buffer for SYS_READ_KB */
       int next_head = (kb_head + 1) % KB_BUF_SIZE;
       if (next_head != kb_tail) {
         kb_buf[kb_head] = c;
         kb_head = next_head;
       }
-      // Text-mode shell echo
-      if (current_shell_row >= SHELL_MIN_ROW &&
-          current_shell_row <= SHELL_MAX_ROW) {
-        video[(current_shell_row * 80) + buffer_idx - 1] = 0x0F00 | c;
-      }
+      shell_dirty = 1;
     }
-    // --- 4. Fallback (Default Action) ---
+    /* --- 4. Fallback (unmapped scancode) --- */
     else if (!c) {
-      // Normal Operation: Stimulate the FIRST neuron of the FIRST pixel
       os_memory_map[0].neurons[0].voltage += 500;
     }
-
-    // Visual feedback on the monitor line
-    video[80 * 5] = 0x0F00 | 'K'; // Show 'K' for Keyboard event
   }
 }
 
@@ -1040,6 +1030,63 @@ void draw_status_bar() {
   gprint_dec(task_list[0].spikes_per_second, 0xFF5500);
   gprint("  SPS[1]: ", 0xAAAAAA);
   gprint_dec(task_list[1].spikes_per_second, 0xFF5500);
+
+  /* Line 4: zoom indicator */
+  cursor_x = 4;
+  cursor_y = 50;
+  gprint("ZOOM: ", 0xAAAAAA);
+  gprint_dec(zoom_level, 0x00FFFF);
+  gprint("x  ", 0xAAAAAA);
+  if (zoom_level > 1) {
+    gprint("N[", 0xAAAAAA);
+    gprint_dec(zoom_offset, 0x00FFFF);
+    gprint("-", 0xAAAAAA);
+    gprint_dec(zoom_offset + (NEURON_COUNT / zoom_level) - 1, 0x00FFFF);
+    gprint("]  ", 0xAAAAAA);
+  }
+
+  /* Line 5: Phase status per pixel */
+  cursor_x = 4;
+  cursor_y = 64;
+  for (int p = 0; p < PIXELS_COUNT; p++) {
+    const char *ph_str =
+        (os_memory_map[p].current_phase == 1) ? "RIGID" : "FLUID";
+    uint32_t ph_clr =
+        (os_memory_map[p].current_phase == 1) ? 0xFF4444 : 0x44FF44;
+    gprint(task_list[p].task_name, 0xFFFF00);
+    gprint(": ", 0x446666);
+    gprint((char *)ph_str, ph_clr);
+    gprint("  ", 0);
+  }
+
+  /* ---- Phase Transition Auto-Save ---- */
+  for (int p = 0; p < PIXELS_COUNT; p++) {
+    if (prev_phase[p] == 0 && os_memory_map[p].current_phase == 1) {
+      /* FLUID -> RIGID transition detected — auto-save potentials[] */
+      if (ata_disk_available) {
+        disk_read_sector(TFS_DIR_LBA, (uint16_t *)root_directory);
+        int slot = find_free_slot(root_directory);
+        if (slot != -1) {
+          root_directory[slot].lba = TFS_DATA_START + slot;
+          root_directory[slot].flags = 1;
+          root_directory[slot].size = sizeof(potentials);
+          /* Name: "auto_N" where N = pixel index */
+          root_directory[slot].name[0] = 'a';
+          root_directory[slot].name[1] = 'u';
+          root_directory[slot].name[2] = 't';
+          root_directory[slot].name[3] = 'o';
+          root_directory[slot].name[4] = '_';
+          root_directory[slot].name[5] = (char)('0' + p);
+          root_directory[slot].name[6] = '\0';
+          disk_write_sector(root_directory[slot].lba, (uint16_t *)potentials);
+          disk_write_sector(TFS_DIR_LBA, (uint16_t *)root_directory);
+          /* Visual flash: show auto-save indicator on status bar */
+          gprint(" [AUTO-SAVED]", 0x00FF00);
+        }
+      }
+    }
+    prev_phase[p] = os_memory_map[p].current_phase;
+  }
 }
 
 /* ============================================================
@@ -1050,7 +1097,9 @@ void draw_waveform() {
   const int WIN_Y1 = 300;                 /* bottom of waveform window   */
   const int WIN_H = WIN_Y1 - WIN_Y0;      /* 190 pixels        */
   const int BASE_Y = WIN_Y0 + WIN_H - 10; /* baseline        */
-  const int BAR_W = 4;                    /* pixel bar width             */
+  int BAR_W = 4 * zoom_level;             /* wider bars when zoomed in   */
+  if (BAR_W > 20)
+    BAR_W = 20; /* cap for sanity              */
 
   /* Label + border */
   draw_hline(WIN_Y0 - 1, 0, 800, 0x334455);
@@ -1061,12 +1110,23 @@ void draw_waveform() {
   cursor_y = WIN_Y0;
   gprint("NEURAL WAVEFORM [SRNEM]", 0x3366AA);
 
-  /* X spacing: spread 16 neurons evenly across 800px */
-  int spacing = 800 / (NEURON_COUNT + 1);
+  /* Zoom: show a subset of neurons when zoomed in */
+  int neurons_visible = NEURON_COUNT / zoom_level;
+  if (neurons_visible < 1)
+    neurons_visible = 1;
+  int start_n = zoom_offset;
+  if (start_n + neurons_visible > NEURON_COUNT)
+    start_n = NEURON_COUNT - neurons_visible;
+  if (start_n < 0)
+    start_n = 0;
+
+  /* X spacing: spread visible neurons evenly across 800px */
+  int spacing = 800 / (neurons_visible + 1);
 
   int prev_px = -1, prev_py = -1;
 
-  for (int i = 0; i < NEURON_COUNT; i++) {
+  for (int idx = 0; idx < neurons_visible; idx++) {
+    int i = start_n + idx;
     int potential = potentials[i];
     if (potential < 0)
       potential = 0;
@@ -1076,7 +1136,7 @@ void draw_waveform() {
     /* Map potential to a bar height (0 – WIN_H-20 pixels) */
     int bar_h = (potential * (WIN_H - 20)) / THRESHOLD;
 
-    int px = spacing + i * spacing;
+    int px = spacing + idx * spacing;
     int py = BASE_Y - bar_h;
 
     /* Choose colour: green->yellow->red by intensity */
@@ -1122,6 +1182,42 @@ void draw_waveform() {
 }
 
 /* ============================================================
+ * shell_render – redraw the command-line input area
+ *
+ * Called from neuro_task_entry every frame so the graphical shell
+ * stays in sync with keyboard input without the ISR touching the
+ * backbuffer.
+ * ============================================================ */
+void shell_render() {
+  /* Wipe the shell input line (one 8px-tall row at shell_cursor_y) */
+  extern int shell_cursor_x;
+  extern int shell_cursor_y;
+  clear_region(0, shell_cursor_y, 800, shell_cursor_y + 10, 0x000033);
+
+  /* Draw prompt "> " */
+  int saved_cx = cursor_x;
+  int saved_cy = cursor_y;
+  cursor_x = 0;
+  cursor_y = shell_cursor_y;
+  gprint("> ", 0x00FFFF);
+
+  /* Echo the current input_buffer contents */
+  for (int i = 0; i < buffer_idx && i < COMMAND_MAX_LEN; i++) {
+    char ch[2] = {input_buffer[i], '\0'};
+    gprint(ch, 0xFFFFFF);
+  }
+
+  /* Update shell cursor X for the blinking cursor position */
+  shell_cursor_x = 16 + (buffer_idx * 8); /* 16 = "> " width */
+
+  /* Restore gprint cursor */
+  cursor_x = saved_cx;
+  cursor_y = saved_cy;
+
+  shell_dirty = 0;
+}
+
+/* ============================================================
  * neuro_task_entry - safe dashboard + flip
  *
  * CRITICAL: This runs as a separate task with only a 4KB stack.
@@ -1139,6 +1235,10 @@ void neuro_task_entry() {
     draw_status_bar();
     draw_waveform();
 
+    /* Render the shell input line + blinking cursor */
+    shell_render();
+    draw_cursor(tick);
+
     /* Restore gprint cursor below the dashboard */
     cursor_x = 0;
     cursor_y = 312;
@@ -1148,7 +1248,7 @@ void neuro_task_entry() {
 
     for (volatile int d = 0; d < 400000; d++)
       ;
-      
+
     /* Yield to the main shell task */
     extern void schedule();
     schedule();
@@ -1325,12 +1425,12 @@ void process_command(char *cmd) {
       scroll_shell();
     else
       current_shell_row++;
-    kprint("tsave [name], tload [name], ls", current_shell_row, 0, 0x07);
+    kprint("tsave, tload, ls, pci, pci bar", current_shell_row, 0, 0x07);
     if (current_shell_row >= SHELL_MAX_ROW)
       scroll_shell();
     else
       current_shell_row++;
-    kprint("mall, free, map, wipe, clear", current_shell_row, 0, 0x07);
+    kprint("zoom+ zoom- zpan+ zpan- clear", current_shell_row, 0, 0x07);
   }
   // Command: "clear"
   else if (cmd[0] == 'c' && cmd[1] == 'l' && cmd[2] == 'e' && cmd[3] == 'a' &&
@@ -1562,9 +1662,67 @@ void process_command(char *cmd) {
       }
     }
   } else if (cmd[0] == 'p' && cmd[1] == 'c' && cmd[2] == 'i') {
-    /* "pci" command: print stored PCI results */
-    extern void pci_print_results(void);
-    pci_print_results();
+    if (cmd[3] == ' ' && cmd[4] == 'b' && cmd[5] == 'a' && cmd[6] == 'r') {
+      /* "pci bar" – find storage controller, read BAR5, map MMIO */
+      extern int pci_find_storage_controller(void);
+      extern uint32_t pci_read_bar5(int device_index);
+      extern void map_mmio_region(uint32_t phys, uint32_t size);
+      int idx = pci_find_storage_controller();
+      if (idx >= 0) {
+        uint32_t bar5 = pci_read_bar5(idx);
+        gprint("STORAGE CTRL FOUND  BAR5: ", 0x00FFCC);
+        gprint_hex(bar5, 8, 0x00FF88);
+        gprint("\n", 0);
+        if (bar5 != 0) {
+          map_mmio_region(bar5, 0x2000); /* Map 8KB AHCI HBA memory */
+          gprint("MMIO MAPPED OK\n", 0x44FF44);
+        } else {
+          gprint("BAR5 IS ZERO (NOT CONFIGURED)\n", 0xFF8800);
+        }
+      } else {
+        gprint("NO STORAGE CTRL (AHCI/NVMe) FOUND\n", 0xFF4444);
+      }
+    } else {
+      /* plain "pci" command */
+      extern void pci_print_results(void);
+      pci_print_results();
+    }
+  }
+  /* --- Waveform Zoom Commands --- */
+  else if (cmd[0] == 'z' && cmd[1] == 'o' && cmd[2] == 'o' && cmd[3] == 'm') {
+    if (cmd[4] == '+') {
+      if (zoom_level < 4)
+        zoom_level++;
+      gprint("ZOOM: ", 0x00FFFF);
+      gprint_dec(zoom_level, 0xFFFFFF);
+      gprint("x\n", 0x00FFFF);
+    } else if (cmd[4] == '-') {
+      if (zoom_level > 1) {
+        zoom_level--;
+        zoom_offset = 0;
+      }
+      gprint("ZOOM: ", 0x00FFFF);
+      gprint_dec(zoom_level, 0xFFFFFF);
+      gprint("x\n", 0x00FFFF);
+    } else {
+      gprint("USE: zoom+ zoom-\n", 0xFFFF00);
+    }
+  } else if (cmd[0] == 'z' && cmd[1] == 'p' && cmd[2] == 'a' && cmd[3] == 'n') {
+    int step = NEURON_COUNT / zoom_level;
+    if (step < 1)
+      step = 1;
+    if (cmd[4] == '+') {
+      zoom_offset += step;
+      if (zoom_offset > NEURON_COUNT - step)
+        zoom_offset = NEURON_COUNT - step;
+    } else if (cmd[4] == '-') {
+      zoom_offset -= step;
+      if (zoom_offset < 0)
+        zoom_offset = 0;
+    }
+    gprint("PAN OFFSET: ", 0x00FFFF);
+    gprint_dec(zoom_offset, 0xFFFFFF);
+    gprint("\n", 0);
   } else if (cmd[0] == 'w' && cmd[1] == 'i' && cmd[2] == 'p' && cmd[3] == 'e') {
     kprint("WIPING ALL NEURAL DATA...", current_shell_row, 0, 0x0E);
     if (current_shell_row >= SHELL_MAX_ROW)
@@ -1639,8 +1797,6 @@ extern void put_pixel(int x, int y, uint32_t color);
 
 __attribute__((section(".text.entry"))) void kernel_main(void) {
 
-
-
   /* Set segments - already established as safe */
   __asm__ volatile("mov $0x10, %%ax\n"
                    "mov %%ax, %%ds\n"
@@ -1652,11 +1808,11 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
                    :
                    : "ax");
 
-  // Read the VBE framebuffer address that the bootloader stored at 0x9000
-  vbe_framebuffer = *((uint32_t *)0x9000);
-
-  // DIAGNOSTIC: Write a bright pixel directly to the framebuffer
-  ((uint32_t *)vbe_framebuffer)[0] = 0xFF00FF; // Magenta pixel at (0,0)
+  // Read the VBE framebuffer address from 0x500 (set by bootloader, safe
+  // from the kernel disk-load which spans 0x1000-0x9000 and would clobber
+  // anything at 0x9000).
+  vbe_framebuffer = *((uint32_t *)0x500);
+  if (vbe_framebuffer == 0) vbe_framebuffer = 0xFD000000; // Fallback
 
   // Load kernel-space GDT immediately so we don't depend on the bootloader's
   // GDT at 0x7C00 (which gets overwritten by BSS/page tables during
@@ -1740,7 +1896,7 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
   /* Hardware graphics init */
   init_graphics();
   clear_screen(0x000044); // NeuroSpark dark blue
-  
+
   /* Reset cursor position for early boot logo */
   extern int cursor_x;
   extern int cursor_y;
@@ -1785,7 +1941,8 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
      post-paging init is visible before the task loop starts.       */
   flip_buffer();
 
-  /* Note: The shell task stays in this infinite loop, but yields CPU execution */
+  /* Note: The shell task stays in this infinite loop, but yields CPU execution
+   */
   /* to allow the background graphics task to render the UI each cycle. */
   extern void schedule();
   while (1) {

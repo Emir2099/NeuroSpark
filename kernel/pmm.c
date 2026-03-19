@@ -47,11 +47,19 @@ void *pmm_alloc_page() {
   return (void *)0;
 }
 
-// Initializer to clear RAM and reserve the first 1MB for the kernel
+// Linker-provided symbol marking the end of the kernel BSS (page-aligned).
+// PMM must not allocate anything below this address.
+extern char _kernel_end;
+
+// Initializer to clear RAM and reserve everything up to kernel BSS end
 void init_pmm() {
   for (int i = 0; i < BITMAP_SIZE; i++)
     memory_bitmap[i] = 0;
-  for (uint32_t addr = 0; addr < 0x100000; addr += PAGE_SIZE) {
+
+  // Reserve all pages from 0 up to and including the kernel image + BSS.
+  // _kernel_end is page-aligned by the linker script.
+  uint32_t kernel_top = (uint32_t)&_kernel_end;
+  for (uint32_t addr = 0; addr < kernel_top; addr += PAGE_SIZE) {
     pmm_set_page(addr);
   }
 }

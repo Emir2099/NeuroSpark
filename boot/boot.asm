@@ -35,8 +35,8 @@ start:
     ; 2. Save Physical Framebuffer Address (Offset 40 in ModeInfoBlock)
     mov eax, [0x8000 + 40]
     mov [vbe_framebuffer], eax
-    ; Also store at well-known address 0x9000 so kernel can read it
-    mov [0x9000], eax
+    ; Store at 0x500 (BDA free area, safe from kernel load at 0x1000+)
+    mov [0x500], eax
 
     ; 3. Set the VBE Mode
     mov ax, 0x4F02          ; VBE Set Mode function
@@ -81,7 +81,9 @@ load_kernel:
     ;-------------------------------------------------------------------
     ; Use INT 13h AH=42h (Extended Read / LBA) to load the kernel.
     ; This avoids CHS geometry issues with hard-disk images in QEMU.
-    ; We load 40 sectors (20 KB) starting at LBA 1 into 0x0000:0x1000.
+    ; We load 48 sectors (24 KB) starting at LBA 1 into 0x0000:0x1000.
+    ; MAX is 54 sectors (ends at 0x7C00) — beyond that it overwrites
+    ; the bootloader code itself! 48 leaves safe margin.
     ;-------------------------------------------------------------------
 
     ; First, test if LBA extensions are available
@@ -114,7 +116,7 @@ load_kernel:
     mov ch, 0               ; Cylinder 0
     mov dh, 0               ; Head 0
     mov cl, 2               ; Start from sector 2
-    mov di, 40              ; 40 sectors to read
+    mov di, 48              ; 48 sectors to read (must not overwrite bootloader at 0x7C00)
 
 .read_loop:
     push cx
@@ -203,7 +205,7 @@ ALIGN 4
 dap:
     db 0x10                  ; Size of DAP (16 bytes)
     db 0                     ; Reserved
-    dw 40                    ; Number of sectors to read
+    dw 48                    ; Number of sectors to read (max 54, must not reach 0x7C00)
     dw KERNEL_OFFSET         ; Offset of destination buffer
     dw 0x0000                ; Segment of destination buffer
     dq 1                     ; Start LBA (sector 1 = first sector after bootsector)
