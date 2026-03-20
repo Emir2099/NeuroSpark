@@ -183,7 +183,15 @@ void scheduler_timer_tick(void) {
   irq_lock_release(&scheduler_lock, flags);
 
   if (should_preempt) {
-    schedule();
+    /* Do not context-switch from IRQ context here.
+     * Switching from timer interrupt leaves IF cleared in the resumed task,
+     * which stalls subsequent timer ticks and makes UI appear frozen.
+     * Keep round-robin accounting and let normal task yield points switch. */
+    irq_lock_acquire(&scheduler_lock, &flags);
+    if (os_tasks[current].state == TASK_STATE_RUNNING) {
+      os_tasks[current].time_slice = SCHED_TIME_SLICE_TICKS;
+    }
+    irq_lock_release(&scheduler_lock, flags);
   }
 }
 

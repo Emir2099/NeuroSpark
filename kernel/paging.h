@@ -12,5 +12,6 @@ void map_page_flags(uint32_t phys_addr, uint32_t virt_addr, uint32_t flags);
 uint32_t create_user_page_directory(void);
 int map_user_page(uint32_t pd_phys, uint32_t phys_addr, uint32_t virt_addr);
 int is_user_range(const void *ptr, uint32_t size);
+uint32_t resolve_user_phys(uint32_t pd_phys, uint32_t virt_addr);
 
 #endif

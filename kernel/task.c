@@ -4,7 +4,9 @@
 extern void *pmm_alloc_page(void);
 
 TCB os_tasks[MAX_TASKS] = {
-        {0, 0, 0, 0, TASK_STATE_RUNNING, 0, SCHED_TIME_SLICE_TICKS, 0, 0},
+    {0, 0, 0, 0, TASK_STATE_RUNNING, 0, SCHED_TIME_SLICE_TICKS, 0, 0},
+    {0, 0, 0, 0, TASK_STATE_TERMINATED, 0, SCHED_TIME_SLICE_TICKS, 0, 1},
+    {0, 0, 0, 0, TASK_STATE_TERMINATED, 0, SCHED_TIME_SLICE_TICKS, 0, 2},
 };
 int os_current_task = 0;
 int os_task_count = 1;

@@ -116,6 +116,33 @@ int is_user_range(const void *ptr, uint32_t size) {
   return 1;
 }
 
+uint32_t resolve_user_phys(uint32_t pd_phys, uint32_t virt_addr) {
+  uint32_t *pd = (uint32_t *)(pd_phys & PAGE_MASK);
+  uint32_t pd_index;
+  uint32_t pt_index;
+  uint32_t *pt;
+  uint32_t pte;
+
+  if (pd == (uint32_t *)0) {
+    return 0;
+  }
+
+  pd_index = virt_addr >> 22;
+  pt_index = (virt_addr >> 12) & 0x03FF;
+
+  if ((pd[pd_index] & PAGE_PRESENT) == 0) {
+    return 0;
+  }
+
+  pt = (uint32_t *)(pd[pd_index] & PAGE_MASK);
+  pte = pt[pt_index];
+  if ((pte & PAGE_PRESENT) == 0) {
+    return 0;
+  }
+
+  return (pte & PAGE_MASK) | (virt_addr & 0xFFF);
+}
+
 void init_paging() {
   // 1. Clear Page Directory
   for (int i = 0; i < 1024; i++) {
@@ -147,11 +174,11 @@ void init_paging() {
   //    Use the global vbe_framebuffer (saved by kernel_main from 0x500
   //    before BSS was touched).  Map 2MB for 800x600x4.
   uint32_t fb_addr = vbe_framebuffer;
-  if (fb_addr == 0)
-    fb_addr = 0xFD000000; // fallback
-  for (uint32_t i = 0; i < 512; i++) {
-    uint32_t phys_addr = fb_addr + (i * 4096);
-    map_page(phys_addr, phys_addr);
+  if (fb_addr != 0) {
+    for (uint32_t i = 0; i < 512; i++) {
+      uint32_t phys_addr = fb_addr + (i * 4096);
+      map_page(phys_addr, phys_addr);
+    }
   }
 }
 

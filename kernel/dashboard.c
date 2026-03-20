@@ -207,6 +207,9 @@ void draw_waveform(void) {
 }
 
 void shell_render(void) {
+  extern char cmd_output[256];
+  extern int cmd_output_valid;
+
   clear_region(0, shell_cursor_y, 800, shell_cursor_y + 10, 0x000033);
 
   int saved_cx = cursor_x;
@@ -221,6 +224,15 @@ void shell_render(void) {
   }
 
   shell_cursor_x = 16 + (buffer_idx * 8);
+
+  /* Persistent command output line below prompt */
+  clear_region(0, 330, 800, 345, 0x000033);
+  if (cmd_output_valid) {
+    cursor_x = 0;
+    cursor_y = 330;
+    gprint(cmd_output, 0x44FF88);
+  }
+
   cursor_x = saved_cx;
   cursor_y = saved_cy;
   shell_dirty = 0;

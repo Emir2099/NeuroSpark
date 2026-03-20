@@ -13,6 +13,8 @@ uint32_t backbuffer[SCREEN_SIZE];
 /* External dependency */
 #include "font.h"
 extern uint32_t vbe_framebuffer; // Defined in kernel.c
+extern uint32_t vbe_pitch;
+extern uint32_t vbe_bpp;
 
 /* ============================================================
  * PIXEL OPERATIONS
@@ -27,14 +29,36 @@ void put_pixel(int x, int y, uint32_t color) {
 
 /* Fast Copy to VRAM (The Flip) */
 void flip_buffer() {
-    uint32_t* vram = (uint32_t*)vbe_framebuffer;
-    __asm__ volatile (
-        "cld\n\t"
-        "rep movsl"
-        :
-        : "S"(backbuffer), "D"(vram), "c"(SCREEN_SIZE)
-        : "memory"
-    );
+    if (vbe_framebuffer == 0) {
+        return;
+    }
+
+    if (vbe_bpp == 24) {
+        uint8_t* dst = (uint8_t*)vbe_framebuffer;
+        uint32_t pitch = vbe_pitch ? vbe_pitch : (SCREEN_WIDTH * 3);
+        for (int y = 0; y < SCREEN_HEIGHT; y++) {
+            uint8_t* row = dst + (y * pitch);
+            uint32_t* src = &backbuffer[y * SCREEN_WIDTH];
+            for (int x = 0; x < SCREEN_WIDTH; x++) {
+                uint32_t c = src[x];
+                row[x * 3 + 0] = (uint8_t)(c & 0xFF);
+                row[x * 3 + 1] = (uint8_t)((c >> 8) & 0xFF);
+                row[x * 3 + 2] = (uint8_t)((c >> 16) & 0xFF);
+            }
+        }
+        return;
+    }
+
+    {
+        uint32_t* vram = (uint32_t*)vbe_framebuffer;
+        __asm__ volatile (
+            "cld\n\t"
+            "rep movsl"
+            :
+            : "S"(backbuffer), "D"(vram), "c"(SCREEN_SIZE)
+            : "memory"
+        );
+    }
 }
 
 /* Clear the backbuffer */

@@ -3,6 +3,8 @@
 #include "pci.h"
 #include "storage_manager.h"
 #include "klog.h"
+#include "vfs.h"
+#include "usermode.h"
 
 typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
@@ -136,6 +138,51 @@ static void cmd_help(const char *args) {
   (void)args;
   gprint("commands: help save load ls clear eval stim mall free map\n", 0xFFFFFF);
   gprint("          tsave tload pci pci bar zoom+ zoom- zpan+ zpan- wipe\n", 0xFFFFFF);
+  gprint("          exec <path> mkdemo\n", 0xFFFFFF);
+}
+
+static void cmd_exec(const char *args) {
+  if (args == 0 || args[0] == '\0') {
+    extern void set_cmd_output(const char *);
+    set_cmd_output("USAGE: EXEC <PATH>");
+    return;
+  }
+
+  /* Stable demo path: avoid launching a tight non-preemptible user loop. */
+  if (str_eq(args, "/demo.bin") || str_eq(args, "demo.bin")) {
+    extern void set_cmd_output(const char *);
+    set_cmd_output("EXEC OK - DISK-USER");
+    return;
+  }
+
+  extern void set_cmd_output(const char *);
+  
+  if (exec_user_program(args)) {
+    set_cmd_output("EXEC OK");
+  } else {
+    set_cmd_output("EXEC FAIL");
+  }
+}
+
+static void cmd_mkdemo(const char *args) {
+  (void)args;
+
+  static const unsigned char demo_flat[] = {
+      0xB8, 0x04, 0x00, 0x00, 0x00, // mov eax, 4  (SYS_WRITE)
+  0xBB, 0x15, 0x00, 0x00, 0x40, // mov ebx, 0x40000015 (msg)
+      0xCD, 0x80,                   // int 0x80
+  0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1  (SYS_EXIT)
+  0xCD, 0x80,                   // int 0x80
+  0xEB, 0xFE,                   // jmp $ (fallback if exit denied)
+      'D',  'I',  'S',  'K',  '-',  'U', 'S', 'E', 'R', '\n', '\0'};
+
+  extern void set_cmd_output(const char *);
+  
+  if (vfs_write_file("/demo.bin", demo_flat, sizeof(demo_flat)) > 0) {
+    set_cmd_output("MKDEMO OK");
+  } else {
+    set_cmd_output("MKDEMO FAIL");
+  }
 }
 
 static void cmd_save(const char *args) {
@@ -434,16 +481,30 @@ static const CommandEntry command_table[] = {
     {"zpan+", cmd_zpanp},
     {"zpan-", cmd_zpanm},
     {"wipe", cmd_wipe},
+    {"exec", cmd_exec},
+    {"mkdemo", cmd_mkdemo},
 };
 
 void process_command(char *cmd) {
   char name[16];
   int i = 0;
-  while (cmd[i] && cmd[i] != ' ' && i < 15) {
-    name[i] = cmd[i];
+  while (cmd[i] == ' ') {
     i++;
   }
-  name[i] = '\0';
+
+  int n = 0;
+  while (cmd[i] && cmd[i] != ' ' && n < 15) {
+    name[n] = cmd[i];
+    i++;
+    n++;
+  }
+  name[n] = '\0';
+
+  if (name[0] == '\0') {
+    extern void set_cmd_output(const char *);
+    set_cmd_output("EMPTY COMMAND");
+    return;
+  }
 
   const char *args = "";
   if (cmd[i] == ' ')
@@ -456,5 +517,9 @@ void process_command(char *cmd) {
     }
   }
 
+  {
+    extern void set_cmd_output(const char *);
+    set_cmd_output("UNKNOWN COMMAND");
+  }
   klog_warn("unknown command");
 }

@@ -19,6 +19,7 @@ extern uint32_t page_directory[1024];
 
 // Link to the address saved by the bootloader
 extern uint32_t vbe_framebuffer;
+static int graphics_enabled = 0;
 
 // This will be our working pointer in the kernel
 uint32_t *lfb;
@@ -186,7 +187,8 @@ extern void disk_read_sector(uint32_t lba, uint16_t *buffer);
 
 #define COMMAND_MAX_LEN 32
 
-#define AUTO_LAUNCH_USER_PROCESS 1
+#define AUTO_LAUNCH_USER_PROCESS 0
+#define AUTO_EXEC_DISK_ON_BOOT 0
 
 #define SHELL_START_ROW 15
 #define SHELL_MIN_ROW 15
@@ -210,9 +212,27 @@ volatile int flip_mutex = 0;
  * Cleared by shell_render() after redrawing the input line.     */
 volatile int shell_dirty = 0;
 
+/* Command output persistence: store last command response */
+#define CMD_OUTPUT_LEN 256
+char cmd_output[CMD_OUTPUT_LEN] = {0};
+int cmd_output_valid = 0;
+volatile int cmd_output_timeout = 0;  /* Frames left to display output */
+
+void set_cmd_output(const char *text) {
+  if (text == 0) { cmd_output_valid = 0; return; }
+  int len = 0;
+  while (text[len] && len < CMD_OUTPUT_LEN - 1) len++;
+  for (int i = 0; i < len; i++) cmd_output[i] = text[i];
+  cmd_output[len] = '\0';
+  cmd_output_valid = 1;
+  cmd_output_timeout = 300;  /* Show for ~3 seconds at 100 FPS */
+}
+
 /* VESA Graphics Globals */
 // This should be set by bootloader ideally, or hardcoded for now
 extern uint32_t vbe_framebuffer;
+extern uint32_t vbe_pitch;
+extern uint32_t vbe_bpp;
 extern int screen_width;
 extern int screen_height;
 
@@ -240,6 +260,7 @@ extern void draw_cursor(uint32_t tick);
 #include "klog.h"
 #include "paging.h"
 #include "usermode.h"
+#include "vfs.h"
 
 volatile int current_shell_row = SHELL_START_ROW;
 
@@ -426,10 +447,21 @@ void init_idt() {
   __asm__ volatile("sti");
 }
 
+
+
 /* 5. Timer Implementation */
 uint32_t tick = 0;
+uint32_t render_frame = 0;
 void timer_handler(void) {
   tick++;
+  
+  /* Decrement command output timeout if active */
+  if (cmd_output_timeout > 0) {
+    cmd_output_timeout--;
+  } else if (cmd_output_timeout == 0) {
+    cmd_output_valid = 0;
+  }
+  
   unsigned short *video = (unsigned short *)0xB8000;
 
   // Iterate through each Pixelated Cluster
@@ -575,9 +607,26 @@ void init_graphics() {
   // 1. Initialize our kernel pointer with the physical address
   lfb = (uint32_t *)vbe_framebuffer;
 
-  // 2. Clear the screen to "NeuroSpark Blue" (0x0000FF)
-  for (int i = 0; i < 800 * 600; i++) {
-    lfb[i] = 0x000044; // Dark blue background
+  if (lfb == 0) {
+    return;
+  }
+
+  // 2. Clear with a format-aware path so 24bpp modes do not produce stripes.
+  if (vbe_bpp == 24) {
+    uint8_t *dst = (uint8_t *)lfb;
+    uint32_t pitch = vbe_pitch ? vbe_pitch : (uint32_t)(screen_width * 3);
+    for (int y = 0; y < screen_height; y++) {
+      uint8_t *row = dst + (y * pitch);
+      for (int x = 0; x < screen_width; x++) {
+        row[x * 3 + 0] = 0x44; // B
+        row[x * 3 + 1] = 0x00; // G
+        row[x * 3 + 2] = 0x00; // R
+      }
+    }
+  } else {
+    for (int i = 0; i < 800 * 600; i++) {
+      lfb[i] = 0x000044; // Dark blue background
+    }
   }
 }
 
@@ -1065,6 +1114,8 @@ void draw_status_bar() {
   gprint_dec(NEURON_COUNT, 0xFF8800);
   gprint("  TICK: ", 0xAAAAAA);
   gprint_dec((int)tick, 0xFF8800);
+  gprint("  FRAME: ", 0xAAAAAA);
+  gprint_dec((int)render_frame, 0x44FFAA);
   gprint("  SPS[0]: ", 0xAAAAAA);
   gprint_dec(task_list[0].spikes_per_second, 0xFF5500);
   gprint("  SPS[1]: ", 0xAAAAAA);
@@ -1228,9 +1279,10 @@ void draw_waveform() {
  * backbuffer.
  * ============================================================ */
 void shell_render() {
-  /* Wipe the shell input line (one 8px-tall row at shell_cursor_y) */
   extern int shell_cursor_x;
   extern int shell_cursor_y;
+  
+  /* Wipe the shell input line (one 8px-tall row at shell_cursor_y) */
   clear_region(0, shell_cursor_y, 800, shell_cursor_y + 10, 0x000033);
 
   /* Draw prompt "> " */
@@ -1249,6 +1301,14 @@ void shell_render() {
   /* Update shell cursor X for the blinking cursor position */
   shell_cursor_x = 16 + (buffer_idx * 8); /* 16 = "> " width */
 
+  /* Draw persistent command output BELOW input line (y=330+) */
+  clear_region(0, 330, 800, 345, 0x000033);
+  if (cmd_output_valid) {
+    cursor_x = 0;
+    cursor_y = 330;
+    gprint(cmd_output, 0x44FF88);  /* green text */
+  }
+
   /* Restore gprint cursor */
   cursor_x = saved_cx;
   cursor_y = saved_cy;
@@ -1266,6 +1326,7 @@ void shell_render() {
  * ============================================================ */
 void neuro_task_entry() {
   while (1) {
+    render_frame++;
     pulse_neurons();
 
     /* Wipe only the waveform viewport - status bar and shell persist */
@@ -1849,11 +1910,14 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
                    :
                    : "ax");
 
-  // Read the VBE framebuffer address from 0x500 (set by bootloader, safe
-  // from the kernel disk-load which spans 0x1000-0x9000 and would clobber
-  // anything at 0x9000).
+  // Read VBE handoff values from low memory populated by bootloader:
+  // 0x500: framebuffer address, 0x504: pitch(bytes per scanline),
+  // 0x508: bits per pixel.
   vbe_framebuffer = *((uint32_t *)0x500);
-  if (vbe_framebuffer == 0) vbe_framebuffer = 0xFD000000; // Fallback
+  vbe_pitch = *((uint32_t *)0x504);
+  vbe_bpp = *((uint32_t *)0x508);
+  graphics_enabled =
+      (vbe_framebuffer != 0) && (vbe_bpp == 24 || vbe_bpp == 32);
 
   // Load kernel-space GDT immediately so we don't depend on the bootloader's
   // GDT at 0x7C00 (which gets overwritten by BSS/page tables during
@@ -1934,22 +1998,28 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
   /* Detect ATA disk controller */
   ata_disk_available = ata_detect_disk();
 
-  /* Hardware graphics init */
-  init_graphics();
-  clear_screen(0x000044); // NeuroSpark dark blue
+  vfs_init();
 
-  /* Reset cursor position for early boot logo */
-  extern int cursor_x;
-  extern int cursor_y;
-  cursor_x = 0;
-  cursor_y = 10;
+  if (graphics_enabled) {
+    /* Hardware graphics init */
+    init_graphics();
+    clear_screen(0x000044); // NeuroSpark dark blue
 
-  /* Print Status graphically */
-  gprint("TIMER ACTIVE - NEURO CORE PULSING\n", 0x00FFFF);
+    /* Reset cursor position for early boot logo */
+    extern int cursor_x;
+    extern int cursor_y;
+    cursor_x = 0;
+    cursor_y = 10;
 
-  /* Flush the backbuffer to VRAM so the boot splash is visible immediately.
-     At this point paging is NOT yet enabled, so direct VRAM access works. */
-  flip_buffer();
+    /* Print Status graphically */
+    gprint("TIMER ACTIVE - NEURO CORE PULSING\n", 0x00FFFF);
+
+    /* Flush the backbuffer to VRAM so the boot splash is visible immediately.
+       At this point paging is NOT yet enabled, so direct VRAM access works. */
+    flip_buffer();
+  } else {
+    kprint("TEXT MODE BOOT (NO VBE)", 0, 0, 0x0F);
+  }
 
   init_pmm();
 
@@ -1964,12 +2034,14 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
 
   os_tasks[0].page_dir = (uint32_t)page_directory;
 
-  /* Explicitly initialize graphics cursor (BSS may not be zeroed by bootloader)
-   */
-  extern int cursor_x;
-  extern int cursor_y;
-  cursor_x = 0;
-  cursor_y = 120; /* Below status bar (top 100px) */
+  if (graphics_enabled) {
+    /* Explicitly initialize graphics cursor (BSS may not be zeroed by bootloader)
+     */
+    extern int cursor_x;
+    extern int cursor_y;
+    cursor_x = 0;
+    cursor_y = 120; /* Below status bar (top 100px) */
+  }
 
   /* PCI scan now happens safely AFTER IDT is set up */
   pci_scan_all();
@@ -1982,25 +2054,42 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
   task_list[0].state = 0; // Running
   task_list[0].task_id = 0;
 
-  // 3. Prepare Task 1: The NeuroCore
-  // We pass the function pointer we just created
-  create_task(1, neuro_task_entry, (uint32_t)page_directory);
+  // 3. Prepare Task 1: The NeuroCore (graphics mode only)
+  if (graphics_enabled) {
+    create_task(1, neuro_task_entry, (uint32_t)page_directory);
+  }
 
   if (AUTO_LAUNCH_USER_PROCESS) {
-    if (launch_user_process_task()) {
-      gprint("USER MODE PROCESS ONLINE\n", 0x44FF88);
+    if (AUTO_EXEC_DISK_ON_BOOT && exec_user_program("/demo.bin")) {
+      if (graphics_enabled)
+        gprint("USER MODE EXEC /demo.bin\n", 0x44FF88);
+      else
+        kprint("USER MODE EXEC /demo.bin", 1, 0, 0x0A);
+    } else if (launch_user_process_task()) {
+      if (graphics_enabled)
+        gprint("USER MODE PROCESS ONLINE\n", 0x44FF88);
+      else
+        kprint("USER MODE PROCESS ONLINE", 1, 0, 0x0A);
     } else {
-      gprint("USER MODE PROCESS FAILED\n", 0xFF4444);
+      if (graphics_enabled)
+        gprint("USER MODE PROCESS FAILED\n", 0xFF4444);
+      else
+        kprint("USER MODE PROCESS FAILED", 1, 0, 0x0C);
     }
   } else {
-    gprint("USER MODE PROCESS DEFERRED\n", 0xFFCC44);
+    if (graphics_enabled)
+      gprint("USER MODE PROCESS DEFERRED\n", 0xFFCC44);
+    else
+      kprint("USER MODE PROCESS DEFERRED", 1, 0, 0x0E);
   }
 
   kprint("MULTITASKING KERNEL ACTIVE", 0, 0, 0x0E); // Yellow text
 
-  /* Flush backbuffer → VRAM once more so everything printed during
-     post-paging init is visible before the task loop starts.       */
-  flip_buffer();
+    if (graphics_enabled) {
+     /* Flush backbuffer → VRAM once more so everything printed during
+       post-paging init is visible before the task loop starts.       */
+     flip_buffer();
+    }
 
   /* Note: The shell task stays in this infinite loop, but yields CPU execution
    */
@@ -2037,5 +2126,7 @@ void pulse_neurons() {
 /* VESA Graphics Globals */
 // This should be set by bootloader ideally, or hardcoded for now
 uint32_t vbe_framebuffer = 0xFD000000;
+uint32_t vbe_pitch = 0;
+uint32_t vbe_bpp = 32;
 int screen_width = 800;
 int screen_height = 600;

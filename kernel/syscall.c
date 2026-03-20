@@ -100,6 +100,18 @@ void syscall_handler(uint32_t *regs) {
     break;
   }
 
+  /* ---- SYS_EXIT (1): terminate current user task ---- */
+  case SYS_EXIT: {
+    extern void task_terminate_current(void);
+    if (cpl != 3) {
+      regs[7] = NS_ERR_PERMISSION;
+      break;
+    }
+    regs[7] = NS_OK;
+    task_terminate_current();
+    break;
+  }
+
   /* ---- SYS_READ_KB (5): non-blocking keyboard buffer read ---- */
   case SYS_READ_KB: {
     unsigned int flags;

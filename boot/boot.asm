@@ -2,6 +2,7 @@
 [bits 16]
 
 KERNEL_OFFSET equ 0x1000
+%define FORCE_TEXT_MODE 0
 
 ; Entry point - BIOS loads us at 0x7c00
 start:
@@ -11,7 +12,9 @@ start:
     mov ds, ax
     mov es, ax
     mov ss, ax
-    mov sp, 0x7c00
+    ; Keep stack away from kernel load buffer (0x1000..0x7BFF)
+    ; so CALL/RET and BIOS internals are not overwritten by disk reads.
+    mov sp, 0x9000
     sti
     
     ; Save boot drive number
@@ -22,7 +25,22 @@ start:
     mov al, 'A'
     int 0x10
 
+%if FORCE_TEXT_MODE
+    ; Keep VGA text mode for maximum compatibility.
+    mov dword [vbe_framebuffer], 0
+    mov dword [0x500], 0
+    mov dword [0x504], 0
+    mov dword [0x508], 0
+    jmp .vesa_done
+%endif
+
     ; --- VESA GATEWAY TO GRAPHICS START ---
+    ; Default to "no framebuffer"; kernel may fallback safely.
+    mov dword [vbe_framebuffer], 0
+    mov dword [0x500], 0
+    mov dword [0x504], 0
+    mov dword [0x508], 0
+
     ; 1. Get VBE Mode Information
     mov ax, 0x4F01          ; VBE Get Mode Info function
     mov cx, 0x115           ; Mode 0x115: 800x600, 32-bit color
@@ -30,9 +48,20 @@ start:
     int 0x10                ; BIOS Video Interrupt
 
     cmp ax, 0x004F          ; Check for VBE success
-    jne vesa_error          ; Handle error if VESA isn't supported
+    jne .vesa_done          ; If unsupported, continue in text mode
 
-    ; 2. Save Physical Framebuffer Address (Offset 40 in ModeInfoBlock)
+    ; 2. Save Mode details and physical framebuffer address
+    ; Offset 16: BytesPerScanLine (pitch)
+    xor eax, eax
+    mov ax, [0x8000 + 16]
+    mov [0x504], eax
+
+    ; Offset 25: BitsPerPixel
+    xor eax, eax
+    mov al, [0x8000 + 25]
+    mov [0x508], eax
+
+    ; Offset 40: PhysBasePtr
     mov eax, [0x8000 + 40]
     mov [vbe_framebuffer], eax
     ; Store at 0x500 (BDA free area, safe from kernel load at 0x1000+)
@@ -42,6 +71,10 @@ start:
     mov ax, 0x4F02          ; VBE Set Mode function
     mov bx, 0x4115          ; 0x115 | 0x4000 (Set LFB bit for Linear Framebuffer)
     int 0x10
+    cmp ax, 0x004F
+    jne .vesa_done          ; Mode set failed, continue boot without VESA
+
+.vesa_done:
     ; --- VESA GATEWAY TO GRAPHICS END ---
 
     ; Load kernel from disk using LBA
@@ -81,9 +114,9 @@ load_kernel:
     ;-------------------------------------------------------------------
     ; Use INT 13h AH=42h (Extended Read / LBA) to load the kernel.
     ; This avoids CHS geometry issues with hard-disk images in QEMU.
-    ; We load 48 sectors (24 KB) starting at LBA 1 into 0x0000:0x1000.
-    ; MAX is 54 sectors (ends at 0x7C00) — beyond that it overwrites
-    ; the bootloader code itself! 48 leaves safe margin.
+    ; We load 54 sectors (27 KB) starting at LBA 1 into 0x0000:0x1000.
+    ; 54 sectors is the maximum safe value at this destination range
+    ; (ends exactly at 0x7C00, right before the bootsector location).
     ;-------------------------------------------------------------------
 
     ; First, test if LBA extensions are available
@@ -116,7 +149,7 @@ load_kernel:
     mov ch, 0               ; Cylinder 0
     mov dh, 0               ; Head 0
     mov cl, 2               ; Start from sector 2
-    mov di, 48              ; 48 sectors to read (must not overwrite bootloader at 0x7C00)
+    mov di, 54              ; 54 sectors to read (max safe to 0x7BFF)
 
 .read_loop:
     push cx
@@ -170,14 +203,6 @@ disk_error:
     hlt
     jmp $
 
-vesa_error:
-    mov ah, 0x0e
-    mov al, 'V'             ; Print 'V' for VESA Error
-    int 0x10
-    cli
-    hlt
-    jmp $
-
 ; Print AL as hex
 print_hex:
     push ax
@@ -205,7 +230,7 @@ ALIGN 4
 dap:
     db 0x10                  ; Size of DAP (16 bytes)
     db 0                     ; Reserved
-    dw 48                    ; Number of sectors to read (max 54, must not reach 0x7C00)
+    dw 54                    ; Number of sectors to read (max safe)
     dw KERNEL_OFFSET         ; Offset of destination buffer
     dw 0x0000                ; Segment of destination buffer
     dq 1                     ; Start LBA (sector 1 = first sector after bootsector)
