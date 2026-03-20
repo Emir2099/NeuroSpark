@@ -2,6 +2,7 @@
 #include "disk.h"
 #include "pci.h"
 #include "scheduler.h"
+#include "storage_manager.h"
 
 typedef unsigned char uint8_t;
 
@@ -68,6 +69,182 @@ extern volatile int flip_mutex;
 
 static uint8_t prev_phase[2] = {0, 0};
 
+static char task_state_code(uint32_t state) {
+  if (state == TASK_STATE_RUNNING) {
+    return 'R';
+  }
+  if (state == TASK_STATE_READY) {
+    return 'Y';
+  }
+  if (state == TASK_STATE_BLOCKED) {
+    return 'B';
+  }
+  if (state == TASK_STATE_SLEEPING) {
+    return 'S';
+  }
+  if (state == TASK_STATE_TERMINATED) {
+    return 'T';
+  }
+  return '?';
+}
+
+static void draw_hud_telemetry(void) {
+  const int y0 = 110;
+  const int y1 = 300;
+  const int left_x0 = 0;
+  const int left_x1 = 170;
+  const int right_x0 = 630;
+  const int right_x1 = 800;
+  const int total_user_pages = (0x2000000 - 0x100000) / 4096;
+  int free_pages = pmm_get_free_pages();
+  int used_pages = total_user_pages - free_pages;
+  int pressure_pct = 0;
+  int running = 0;
+  int ready = 0;
+  int blocked = 0;
+  int sleeping = 0;
+  int safe_task_count = os_task_count;
+  int safe_current_task = os_current_task;
+
+  if (safe_task_count < 0) {
+    safe_task_count = 0;
+  }
+  if (safe_task_count > MAX_TASKS) {
+    safe_task_count = MAX_TASKS;
+  }
+  if (safe_current_task < 0 || safe_current_task >= safe_task_count) {
+    safe_current_task = 0;
+  }
+
+  if (used_pages < 0) {
+    used_pages = 0;
+  }
+  if (total_user_pages > 0) {
+    pressure_pct = (used_pages * 100) / total_user_pages;
+  }
+
+  clear_region(left_x0, y0, left_x1, y1, 0x00142A);
+  clear_region(right_x0, y0, right_x1, y1, 0x00142A);
+  draw_hline(y0, left_x0, left_x1, 0x224466);
+  draw_hline(y1, left_x0, left_x1, 0x224466);
+  draw_hline(y0, right_x0, right_x1, 0x224466);
+  draw_hline(y1, right_x0, right_x1, 0x224466);
+
+  cursor_x = 8;
+  cursor_y = 116;
+  gprint("SPIKE HUD", 0x66E0FF);
+  cursor_x = 8;
+  cursor_y = 132;
+  gprint("P0 SPS:", 0xAACCEE);
+  gprint_dec(task_list[0].spikes_per_second, 0x44FF88);
+  cursor_x = 8;
+  cursor_y = 146;
+  gprint("P1 SPS:", 0xAACCEE);
+  gprint_dec(task_list[1].spikes_per_second, 0x44FF88);
+
+  cursor_x = 8;
+  cursor_y = 164;
+  gprint("RECENT:", 0xAACCEE);
+  gprint_dec(os_memory_map[0].pixel_recent_spikes, 0xFFE066);
+  gprint("/", 0x777777);
+  gprint_dec(os_memory_map[1].pixel_recent_spikes, 0xFFE066);
+
+  cursor_x = 8;
+  cursor_y = 182;
+  gprint("PHASE0:", 0xAACCEE);
+  gprint((os_memory_map[0].current_phase == 1) ? "RIGID" : "FLUID",
+         (os_memory_map[0].current_phase == 1) ? 0xFF7777 : 0x77FF77);
+  cursor_x = 8;
+  cursor_y = 196;
+  gprint("PHASE1:", 0xAACCEE);
+  gprint((os_memory_map[1].current_phase == 1) ? "RIGID" : "FLUID",
+         (os_memory_map[1].current_phase == 1) ? 0xFF7777 : 0x77FF77);
+
+  for (int i = 0; i < safe_task_count; i++) {
+    if (os_tasks[i].state == TASK_STATE_RUNNING) {
+      running++;
+    } else if (os_tasks[i].state == TASK_STATE_READY) {
+      ready++;
+    } else if (os_tasks[i].state == TASK_STATE_BLOCKED) {
+      blocked++;
+    } else if (os_tasks[i].state == TASK_STATE_SLEEPING) {
+      sleeping++;
+    }
+  }
+
+  cursor_x = 638;
+  cursor_y = 116;
+  gprint("SYSTEM HUD", 0x66E0FF);
+
+  cursor_x = 638;
+  cursor_y = 132;
+  gprint("TASK:", 0xAACCEE);
+  gprint_dec(safe_current_task, 0xFFFFFF);
+  gprint(" S:", 0xAACCEE);
+  char s[2] = {task_state_code(os_tasks[safe_current_task].state), '\0'};
+  gprint(s, 0xFFE066);
+
+  cursor_x = 638;
+  cursor_y = 146;
+  gprint("RUN:", 0xAACCEE);
+  gprint_dec(running, 0x77FF77);
+  gprint(" RDY:", 0xAACCEE);
+  gprint_dec(ready, 0x77FF77);
+
+  cursor_x = 638;
+  cursor_y = 160;
+  gprint("BLK:", 0xAACCEE);
+  gprint_dec(blocked, 0xFFAA66);
+  gprint(" SLP:", 0xAACCEE);
+  gprint_dec(sleeping, 0xFFAA66);
+
+  cursor_x = 638;
+  cursor_y = 178;
+  gprint("SLICE:", 0xAACCEE);
+  gprint_dec((int)os_tasks[safe_current_task].time_slice, 0xFFFFFF);
+
+  cursor_x = 638;
+  cursor_y = 196;
+  gprint("MEM:", 0xAACCEE);
+  gprint_dec(free_pages, 0x77FF77);
+  gprint(" free", 0xAACCEE);
+
+  cursor_x = 638;
+  cursor_y = 210;
+  gprint("PRESS:", 0xAACCEE);
+  gprint_dec(pressure_pct, 0xFFE066);
+  gprint("%", 0xAACCEE);
+
+  cursor_x = 638;
+  cursor_y = 228;
+  gprint("SNAP:", 0xAACCEE);
+  gprint_dec(storage_snapshot_used_count(), 0x88FFCC);
+  gprint("/", 0xAACCEE);
+  gprint_dec(storage_snapshot_capacity(), 0x88FFCC);
+  gprint(" slots", 0xAACCEE);
+
+  cursor_x = 638;
+  cursor_y = 242;
+  gprint("DISK:", 0xAACCEE);
+  gprint(ata_disk_available ? "ONLINE" : "OFFLINE",
+         ata_disk_available ? 0x77FF77 : 0xFF7777);
+}
+
+static void draw_command_overlay(void) {
+  clear_region(0, 346, 800, 374, 0x000A22);
+  draw_hline(346, 0, 800, 0x223355);
+  draw_hline(360, 0, 800, 0x112244);
+
+  cursor_x = 4;
+  cursor_y = 349;
+  gprint("HUD CMDS: help | ls | save <id> | load <id> | mkdemo | exec demo.bin",
+         0x77C8FF);
+  cursor_x = 4;
+  cursor_y = 363;
+  gprint("FAST KEYS: F1 stim0  F2 switch  F3 stim1  F4 save0  F5 load0",
+         0x66EEAA);
+}
+
 void draw_status_bar(void) {
   clear_region(0, 0, 800, 100, 0x001122);
   draw_hline(100, 0, 800, 0x00FFFF);
@@ -75,11 +252,11 @@ void draw_status_bar(void) {
 
   cursor_x = 4;
   cursor_y = 8;
-  gprint("NEUROSPARK OS | ", 0x00FFFF);
+  gprint("NEUROSPARK HUD | ", 0x00FFFF);
 
   gprint("PCI: ", 0xFFFF00);
   gprint_dec(pci_found_count, 0xFFFFFF);
-  gprint(" dev ", 0xFFFF00);
+  gprint(" dev", 0xFFFF00);
 
   cursor_x = 4;
   cursor_y = 22;
@@ -92,7 +269,7 @@ void draw_status_bar(void) {
   cursor_y = 36;
   gprint("TICK: ", 0xAAAAAA);
   gprint_dec((int)tick, 0xFF8800);
-  gprint(" SPS[0]: ", 0xAAAAAA);
+  gprint("  SPS[0]: ", 0xAAAAAA);
   gprint_dec(task_list[0].spikes_per_second, 0xFF5500);
   gprint(" SPS[1]: ", 0xAAAAAA);
   gprint_dec(task_list[1].spikes_per_second, 0xFF5500);
@@ -142,20 +319,29 @@ void draw_status_bar(void) {
 void draw_waveform(void) {
   const int WIN_Y0 = 110;
   const int WIN_Y1 = 300;
+  const int WIN_X0 = 176;
+  const int WIN_X1 = 624;
+  const int WIN_W = WIN_X1 - WIN_X0;
   const int WIN_H = WIN_Y1 - WIN_Y0;
   const int BASE_Y = WIN_Y0 + WIN_H - 10;
-  int BAR_W = 4 * zoom_level;
+  int safe_zoom = zoom_level;
+  if (safe_zoom < 1) {
+    safe_zoom = 1;
+  }
+
+  int BAR_W = 4 * safe_zoom;
   if (BAR_W > 20)
     BAR_W = 20;
 
-  draw_hline(WIN_Y0 - 1, 0, 800, 0x334455);
-  draw_hline(WIN_Y1, 0, 800, 0x334455);
+  clear_region(WIN_X0, WIN_Y0, WIN_X1, WIN_Y1, 0x000033);
+  draw_hline(WIN_Y0 - 1, WIN_X0, WIN_X1, 0x334455);
+  draw_hline(WIN_Y1, WIN_X0, WIN_X1, 0x334455);
 
-  cursor_x = 4;
+  cursor_x = WIN_X0 + 6;
   cursor_y = WIN_Y0;
-  gprint("NEURAL WAVEFORM [SRNEM]", 0x3366AA);
+  gprint("NEURAL WAVEFORM [HUD CORE]", 0x3366AA);
 
-  int neurons_visible = 16 / zoom_level;
+  int neurons_visible = 16 / safe_zoom;
   if (neurons_visible < 1)
     neurons_visible = 1;
   int start_n = zoom_offset;
@@ -164,7 +350,7 @@ void draw_waveform(void) {
   if (start_n < 0)
     start_n = 0;
 
-  int spacing = 800 / (neurons_visible + 1);
+  int spacing = WIN_W / (neurons_visible + 1);
   int prev_px = -1, prev_py = -1;
 
   for (int idx = 0; idx < neurons_visible; idx++) {
@@ -176,7 +362,7 @@ void draw_waveform(void) {
       potential = 1000;
 
     int bar_h = (potential * (WIN_H - 20)) / 1000;
-    int px = spacing + idx * spacing;
+    int px = WIN_X0 + spacing + idx * spacing;
     int py = BASE_Y - bar_h;
 
     uint32_t color;
@@ -244,9 +430,11 @@ void neuro_task_entry(void) {
 
     clear_region(0, 102, 800, 310, 0x000033);
     draw_status_bar();
+    draw_hud_telemetry();
     draw_waveform();
 
     shell_render();
+    draw_command_overlay();
     draw_cursor(tick);
 
     cursor_x = 0;

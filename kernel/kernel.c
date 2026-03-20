@@ -1899,6 +1899,9 @@ extern void put_pixel(int x, int y, uint32_t color);
 
 __attribute__((section(".text.entry"))) void kernel_main(void) {
 
+  /* Bootloader may leave IF enabled; block IRQs until IDT is ready. */
+  __asm__ volatile("cli");
+
   /* Set segments - already established as safe */
   __asm__ volatile("mov $0x10, %%ax\n"
                    "mov %%ax, %%ds\n"

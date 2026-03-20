@@ -62,6 +62,7 @@ extern void sys_save_task(int task_id, int slot);
 extern void disk_write_sector(uint32_t lba, uint16_t *buffer);
 extern void disk_read_sector(uint32_t lba, uint16_t *buffer);
 extern void pci_print_results(void);
+extern void set_cmd_output(const char *text);
 
 static int str_eq(const char *a, const char *b) {
   int i = 0;
@@ -155,10 +156,7 @@ static void cmd_exec(const char *args) {
   }
 
   /* Check if file exists before attempting to load */
-  struct {
-    unsigned int size;
-    unsigned int flags;
-  } stat_buf;
+  VfsFileStat stat_buf;
 
   int stat_result = vfs_stat(args, &stat_buf);
   if (stat_result != 0) {
@@ -198,8 +196,6 @@ static void cmd_mkdemo(const char *args) {
   0xEB, 0xFE,                   // jmp $ (fallback if exit denied)
       'D',  'I',  'S',  'K',  '-',  'U', 'S', 'E', 'R', '\n', '\0'};
 
-  extern void set_cmd_output(const char *);
-  
   if (vfs_write_file("/demo.bin", demo_flat, sizeof(demo_flat)) > 0) {
     set_cmd_output("MKDEMO OK");
   } else {

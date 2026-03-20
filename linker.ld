@@ -2,11 +2,11 @@ ENTRY(kernel_main)
 OUTPUT_FORMAT(binary)
 
 SECTIONS {
-    /* Kernel loads at 0x1000 */
-    . = 0x1000;
+    /* Kernel loads at 0x10000 */
+    . = 0x10000;
 
     .text : ALIGN(16) {
-        *(.text.entry)    /* Entry point first — bootloader jumps to 0x1000 */
+        *(.text.entry)    /* Entry point first — bootloader jumps to 0x10000 */
         *(.text)
         *(.text.*)
     }

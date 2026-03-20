@@ -106,3 +106,17 @@ int sys_load_task(int task_id, int slot) {
   klog_info("snapshot loaded");
   return 1;
 }
+
+int storage_snapshot_used_count(void) {
+  int used = 0;
+  for (int i = 0; i < 4; i++) {
+    if (synapse_disk[i].is_used) {
+      used++;
+    }
+  }
+  return used;
+}
+
+int storage_snapshot_capacity(void) {
+  return 4;
+}

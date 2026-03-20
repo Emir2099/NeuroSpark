@@ -1,7 +1,9 @@
 [org 0x7c00]
 [bits 16]
 
-KERNEL_OFFSET equ 0x1000
+KERNEL_OFFSET equ 0x10000
+KERNEL_SEGMENT equ 0x1000
+KERNEL_LOAD_SECTORS equ 120
 %define FORCE_TEXT_MODE 0
 
 ; Entry point - BIOS loads us at 0x7c00
@@ -12,10 +14,11 @@ start:
     mov ds, ax
     mov es, ax
     mov ss, ax
-    ; Keep stack away from kernel load buffer (0x1000..0x7BFF)
+    ; Keep stack below the kernel load buffer (0x10000+)
     ; so CALL/RET and BIOS internals are not overwritten by disk reads.
     mov sp, 0x9000
-    sti
+    ; Keep IRQs masked during loader + PM transition; kernel enables safely
+    ; after IDT/PIC setup.
     
     ; Save boot drive number
     mov [BOOT_DRIVE], dl
@@ -114,9 +117,8 @@ load_kernel:
     ;-------------------------------------------------------------------
     ; Use INT 13h AH=42h (Extended Read / LBA) to load the kernel.
     ; This avoids CHS geometry issues with hard-disk images in QEMU.
-    ; We load 54 sectors (27 KB) starting at LBA 1 into 0x0000:0x1000.
-    ; 54 sectors is the maximum safe value at this destination range
-    ; (ends exactly at 0x7C00, right before the bootsector location).
+    ; We load KERNEL_LOAD_SECTORS sectors starting at LBA 1 into
+    ; KERNEL_SEGMENT:0x0000 (physical 0x10000), safely away from boot code.
     ;-------------------------------------------------------------------
 
     ; First, test if LBA extensions are available
@@ -145,11 +147,13 @@ load_kernel:
 
     xor ax, ax
     mov es, ax
-    mov bx, KERNEL_OFFSET
+    mov ax, KERNEL_SEGMENT
+    mov es, ax
+    mov bx, 0
     mov ch, 0               ; Cylinder 0
     mov dh, 0               ; Head 0
     mov cl, 2               ; Start from sector 2
-    mov di, 54              ; 54 sectors to read (max safe to 0x7BFF)
+    mov di, KERNEL_LOAD_SECTORS
 
 .read_loop:
     push cx
@@ -230,9 +234,9 @@ ALIGN 4
 dap:
     db 0x10                  ; Size of DAP (16 bytes)
     db 0                     ; Reserved
-    dw 54                    ; Number of sectors to read (max safe)
-    dw KERNEL_OFFSET         ; Offset of destination buffer
-    dw 0x0000                ; Segment of destination buffer
+    dw KERNEL_LOAD_SECTORS    ; Number of sectors to read
+    dw 0x0000                 ; Offset of destination buffer
+    dw KERNEL_SEGMENT         ; Segment of destination buffer
     dq 1                     ; Start LBA (sector 1 = first sector after bootsector)
 
 ; GDT Definition
