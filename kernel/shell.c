@@ -142,25 +142,47 @@ static void cmd_help(const char *args) {
 }
 
 static void cmd_exec(const char *args) {
+
   if (args == 0 || args[0] == '\0') {
-    extern void set_cmd_output(const char *);
     set_cmd_output("USAGE: EXEC <PATH>");
     return;
   }
 
   /* Stable demo path: avoid launching a tight non-preemptible user loop. */
   if (str_eq(args, "/demo.bin") || str_eq(args, "demo.bin")) {
-    extern void set_cmd_output(const char *);
     set_cmd_output("EXEC OK - DISK-USER");
     return;
   }
 
-  extern void set_cmd_output(const char *);
-  
+  /* Check if file exists before attempting to load */
+  struct {
+    unsigned int size;
+    unsigned int flags;
+  } stat_buf;
+
+  int stat_result = vfs_stat(args, &stat_buf);
+  if (stat_result != 0) {
+    /* File not found or other error */
+    set_cmd_output("FILE NOT FOUND");
+    return;
+  }
+
+  if (stat_buf.size == 0 || stat_buf.size > 4096) {
+    set_cmd_output("FILE SIZE ERR");
+    return;
+  }
+
+  if (!stat_buf.flags) {
+    set_cmd_output("FILE DELETED");
+    return;
+  }
+
+  /* Attempt to execute the program */
   if (exec_user_program(args)) {
     set_cmd_output("EXEC OK");
   } else {
-    set_cmd_output("EXEC FAIL");
+    /* Execution failed; likely ELF32 validation or memory issue */
+    set_cmd_output("EXEC FORMAT ERR");
   }
 }
 

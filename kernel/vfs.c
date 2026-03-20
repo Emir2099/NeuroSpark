@@ -434,18 +434,46 @@ int vfs_write_file(const char *path, const void *buf, uint32_t size) {
   int total = 0;
 
   if (fd < 0) {
-    return -1;
+    return VFS_ERR_NOT_FOUND;
   }
 
   while ((uint32_t)total < size) {
     int n = vfs_write(fd, (const uint8_t *)buf + total, size - (uint32_t)total);
     if (n <= 0) {
       vfs_close(fd);
-      return -1;
+      return VFS_ERR_IO;
     }
     total += n;
   }
 
   vfs_close(fd);
   return total;
+}
+
+int vfs_stat(const char *path, VfsFileStat *stat_out) {
+  char name[12];
+  int entry_idx;
+
+  if (path == 0 || stat_out == 0) {
+    return VFS_ERR_INVALID_ARG;
+  }
+
+  if (!ata_disk_available) {
+    return VFS_ERR_IO;
+  }
+
+  if (!normalize_tfs_name(path, name)) {
+    return VFS_ERR_INVALID_ARG;
+  }
+
+  disk_read_sector(TFS_DIR_LBA, (uint16_t *)root_directory);
+  entry_idx = tfs_find_entry_by_name(name);
+
+  if (entry_idx < 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+
+  stat_out->size = root_directory[entry_idx].size;
+  stat_out->flags = root_directory[entry_idx].flags;
+  return VFS_OK;
 }

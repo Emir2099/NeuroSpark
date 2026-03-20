@@ -125,52 +125,87 @@ static int load_flat_image(const uint8_t *image, uint32_t size, uint32_t pd,
 static int load_elf32_image(const uint8_t *image, uint32_t size, uint32_t pd,
                             uint32_t *entry_out) {
   const Elf32_Ehdr *eh;
+  uint32_t phdr_table_size;
 
   if (size < sizeof(Elf32_Ehdr)) {
-    return 0;
+    return 0;  /* File too small for header */
   }
 
   eh = (const Elf32_Ehdr *)image;
+
+  /* Validate ELF magic number (0x7F 'E' 'L' 'F') */
   if (!(eh->e_ident[0] == 0x7F && eh->e_ident[1] == 'E' && eh->e_ident[2] == 'L' &&
         eh->e_ident[3] == 'F' && eh->e_ident[4] == 1)) {
-    return 0;
-  }
-  if (eh->e_machine != 3 || eh->e_phentsize != sizeof(Elf32_Phdr)) {
-    return 0;
-  }
-  if (eh->e_phoff + ((uint32_t)eh->e_phnum * sizeof(Elf32_Phdr)) > size) {
-    return 0;
+    return 0;  /* Not an ELF32 file */
   }
 
+  /* Must be i386 executable */
+  if (eh->e_machine != 3) {
+    return 0;  /* Wrong machine type */
+  }
+
+  /* Must be executable, not shared object or relocatable */
+  if (eh->e_type != 2 && eh->e_type != 3) {
+    return 0;  /* e_type must be 2 (executable) or 3 (shared) */
+  }
+
+  /* Validate program header entry size */
+  if (eh->e_phentsize != sizeof(Elf32_Phdr)) {
+    return 0;  /* Program header size mismatch */
+  }
+
+  /* Validate program header table bounds */
+  phdr_table_size = (uint32_t)eh->e_phnum * sizeof(Elf32_Phdr);
+  if (eh->e_phoff + phdr_table_size > size) {
+    return 0;  /* Program header table out of bounds */
+  }
+
+  /* Load each PT_LOAD segment */
   for (uint32_t i = 0; i < eh->e_phnum; i++) {
     const Elf32_Phdr *ph =
         (const Elf32_Phdr *)(image + eh->e_phoff + (i * sizeof(Elf32_Phdr)));
 
     if (ph->p_type != PT_LOAD || ph->p_memsz == 0) {
-      continue;
+      continue;  /* Skip non-loadable segments */
     }
+
+    /* Validate segment is in user virtual address space */
     if (!is_user_range((const void *)ph->p_vaddr, ph->p_memsz)) {
-      return 0;
-    }
-    if (ph->p_offset + ph->p_filesz > size || ph->p_filesz > ph->p_memsz) {
-      return 0;
+      return 0;  /* Segment outside user address range */
     }
 
+    /* Validate file offsets */
+    if (ph->p_offset + ph->p_filesz > size) {
+      return 0;  /* Segment data out of bounds */
+    }
+
+    if (ph->p_filesz > ph->p_memsz) {
+      return 0;  /* File size > memory size (invalid) */
+    }
+
+    /* Allocate and map pages for this segment */
     if (!map_user_range(pd, ph->p_vaddr, ph->p_memsz)) {
-      return 0;
+      return 0;  /* Page allocation failed */
     }
 
+    /* Copy segment data into mapped user pages */
     for (uint32_t b = 0; b < ph->p_filesz; b++) {
       uint32_t dst_phys = resolve_user_phys(pd, ph->p_vaddr + b);
       if (dst_phys == 0) {
-        return 0;
+        return 0;  /* Address resolution failed */
       }
       *((uint8_t *)dst_phys) = image[ph->p_offset + b];
     }
   }
 
   *entry_out = eh->e_entry;
-  return is_user_range((const void *)*entry_out, 1);
+
+  /* Validate entry point is in user address range */
+  if (!is_user_range((const void *)*entry_out, 1)) {
+    return 0;  /* Entry point outside user space */
+  }
+
+  return 1;
 }
 
 static int setup_user_stack(uint32_t pd) {
