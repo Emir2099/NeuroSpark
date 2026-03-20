@@ -11,7 +11,7 @@ enum {
   TASK_STATE_TERMINATED = 4,
 };
 
-#define MAX_TASKS 2
+#define MAX_TASKS 3
 
 typedef struct {
   uint32_t esp;

@@ -14,6 +14,8 @@ switch_task:
 
     ; 2. Load new task's context
     mov eax, [esp + 24]     ; Get the 'new' TCB pointer (second argument)
+    mov ecx, [eax + 12]     ; Load new task CR3 (TCB.page_dir)
+    mov cr3, ecx
     mov esp, [eax]          ; Load the new task's ESP
 
     ; 3. Restore new task's registers

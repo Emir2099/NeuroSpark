@@ -1,0 +1,16 @@
+#ifndef PAGING_H
+#define PAGING_H
+
+typedef unsigned int uint32_t;
+
+extern uint32_t page_directory[1024];
+
+void init_paging(void);
+void map_page(uint32_t phys_addr, uint32_t virt_addr);
+void map_page_flags(uint32_t phys_addr, uint32_t virt_addr, uint32_t flags);
+
+uint32_t create_user_page_directory(void);
+int map_user_page(uint32_t pd_phys, uint32_t phys_addr, uint32_t virt_addr);
+int is_user_range(const void *ptr, uint32_t size);
+
+#endif

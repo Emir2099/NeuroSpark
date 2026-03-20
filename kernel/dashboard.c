@@ -63,6 +63,8 @@ extern void gprint_dec(int val, uint32_t color);
 extern void clear_region(int x0, int y0, int x1, int y1, uint32_t color);
 extern void draw_hline(int y, int x0, int x1, uint32_t color);
 extern void put_pixel(int x, int y, uint32_t color);
+extern void flip_buffer(void);
+extern volatile int flip_mutex;
 
 static uint8_t prev_phase[2] = {0, 0};
 
@@ -238,7 +240,12 @@ void neuro_task_entry(void) {
     cursor_x = 0;
     cursor_y = 312;
 
-    __asm__ volatile("mov $10, %%eax; int $0x80" : : : "eax");
+    /* Kernel dashboard task flips directly to avoid syscall privilege ambiguity. */
+    __asm__ volatile("cli");
+    flip_mutex = 1;
+    flip_buffer();
+    flip_mutex = 0;
+    __asm__ volatile("sti");
 
     for (volatile int d = 0; d < 400000; d++)
       ;

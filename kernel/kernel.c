@@ -43,8 +43,40 @@ struct gdt_ptr_struct {
   uint32_t base;
 } __attribute__((packed));
 
-// 3 entries: null, code, data (same as bootloader GDT)
-struct gdt_entry_struct kernel_gdt[3] = {
+struct tss_entry_struct {
+  uint32_t prev_tss;
+  uint32_t esp0;
+  uint32_t ss0;
+  uint32_t esp1;
+  uint32_t ss1;
+  uint32_t esp2;
+  uint32_t ss2;
+  uint32_t cr3;
+  uint32_t eip;
+  uint32_t eflags;
+  uint32_t eax;
+  uint32_t ecx;
+  uint32_t edx;
+  uint32_t ebx;
+  uint32_t esp;
+  uint32_t ebp;
+  uint32_t esi;
+  uint32_t edi;
+  uint32_t es;
+  uint32_t cs;
+  uint32_t ss;
+  uint32_t ds;
+  uint32_t fs;
+  uint32_t gs;
+  uint32_t ldt;
+  uint16_t trap;
+  uint16_t iomap_base;
+} __attribute__((packed));
+
+static struct tss_entry_struct kernel_tss;
+
+// 6 entries: null, kernel code/data, user code/data, TSS
+struct gdt_entry_struct kernel_gdt[6] = {
     // Null descriptor
     {0, 0, 0, 0, 0, 0},
     // Code segment: base=0, limit=0xFFFFF, present, ring 0, exec, readable,
@@ -53,6 +85,12 @@ struct gdt_entry_struct kernel_gdt[3] = {
     // Data segment: base=0, limit=0xFFFFF, present, ring 0, writable, 32-bit,
     // 4K granularity
     {0xFFFF, 0x0000, 0x00, 0x92, 0xCF, 0x00},
+    // User code segment (ring 3)
+    {0xFFFF, 0x0000, 0x00, 0xFA, 0xCF, 0x00},
+    // User data segment (ring 3)
+    {0xFFFF, 0x0000, 0x00, 0xF2, 0xCF, 0x00},
+    // TSS descriptor, set at runtime
+    {0, 0, 0, 0, 0, 0},
 };
 
 struct gdt_ptr_struct kernel_gdtp = {
@@ -61,6 +99,44 @@ struct gdt_ptr_struct kernel_gdtp = {
 };
 
 void load_kernel_gdt() {
+  uint32_t tss_base = (uint32_t)&kernel_tss;
+  uint32_t tss_limit = sizeof(kernel_tss) - 1;
+
+  kernel_tss.prev_tss = 0;
+  kernel_tss.esp0 = 0;
+  kernel_tss.ss0 = 0x10;
+  kernel_tss.esp1 = 0;
+  kernel_tss.ss1 = 0;
+  kernel_tss.esp2 = 0;
+  kernel_tss.ss2 = 0;
+  kernel_tss.cr3 = 0;
+  kernel_tss.eip = 0;
+  kernel_tss.eflags = 0;
+  kernel_tss.eax = 0;
+  kernel_tss.ecx = 0;
+  kernel_tss.edx = 0;
+  kernel_tss.ebx = 0;
+  kernel_tss.esp = 0;
+  kernel_tss.ebp = 0;
+  kernel_tss.esi = 0;
+  kernel_tss.edi = 0;
+  kernel_tss.es = 0x13;
+  kernel_tss.cs = 0x0B;
+  kernel_tss.ss = 0x13;
+  kernel_tss.ds = 0x13;
+  kernel_tss.fs = 0x13;
+  kernel_tss.gs = 0x13;
+  kernel_tss.ldt = 0;
+  kernel_tss.trap = 0;
+  kernel_tss.iomap_base = sizeof(kernel_tss);
+
+  kernel_gdt[5].limit_lo = (uint16_t)(tss_limit & 0xFFFF);
+  kernel_gdt[5].base_lo = (uint16_t)(tss_base & 0xFFFF);
+  kernel_gdt[5].base_mid = (uint8_t)((tss_base >> 16) & 0xFF);
+  kernel_gdt[5].access = 0x89;
+  kernel_gdt[5].flags_limit_hi = (uint8_t)((tss_limit >> 16) & 0x0F);
+  kernel_gdt[5].base_hi = (uint8_t)((tss_base >> 24) & 0xFF);
+
   kernel_gdtp.base = (uint32_t)&kernel_gdt;
   __asm__ volatile("lgdt (%0)\n"
                    // Reload all segment registers with the new GDT's selectors
@@ -75,6 +151,12 @@ void load_kernel_gdt() {
                    :
                    : "r"(&kernel_gdtp)
                    : "ax");
+
+  __asm__ volatile("ltr %%ax" : : "a"(0x28));
+}
+
+void tss_set_kernel_stack(uint32_t kernel_stack_top) {
+  kernel_tss.esp0 = kernel_stack_top;
 }
 
 // External Tasking
@@ -103,6 +185,8 @@ extern void disk_read_sector(uint32_t lba, uint16_t *buffer);
 #define FILENAME_LEN 8
 
 #define COMMAND_MAX_LEN 32
+
+#define AUTO_LAUNCH_USER_PROCESS 1
 
 #define SHELL_START_ROW 15
 #define SHELL_MIN_ROW 15
@@ -154,6 +238,8 @@ extern void draw_cursor(uint32_t tick);
 #include "dashboard.h"
 #include "storage_manager.h"
 #include "klog.h"
+#include "paging.h"
+#include "usermode.h"
 
 volatile int current_shell_row = SHELL_START_ROW;
 
@@ -286,6 +372,16 @@ void exception_handler() {
   video[1] = 0x4F00 | 'X';
   video[2] = 0x4F00 | 'C';
   video[3] = 0x4F00 | '!';
+
+  // Also emit a visible marker in the VESA framebuffer if graphics is active.
+  if (lfb != 0) {
+    for (int y = 260; y < 340; y++) {
+      for (int x = 200; x < 600; x++) {
+        lfb[y * 800 + x] = 0x660000;
+      }
+    }
+  }
+
   while (1) {
     __asm__ volatile("hlt");
   }
@@ -1856,7 +1952,17 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
   flip_buffer();
 
   init_pmm();
+
+  {
+    uint32_t isr_stack = (uint32_t)pmm_alloc_page();
+    if (isr_stack != 0) {
+      tss_set_kernel_stack(isr_stack + 4096);
+    }
+  }
+
   init_paging(); // The "Nervous System" is now active — 8MB identity mapped
+
+  os_tasks[0].page_dir = (uint32_t)page_directory;
 
   /* Explicitly initialize graphics cursor (BSS may not be zeroed by bootloader)
    */
@@ -1879,6 +1985,16 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
   // 3. Prepare Task 1: The NeuroCore
   // We pass the function pointer we just created
   create_task(1, neuro_task_entry, (uint32_t)page_directory);
+
+  if (AUTO_LAUNCH_USER_PROCESS) {
+    if (launch_user_process_task()) {
+      gprint("USER MODE PROCESS ONLINE\n", 0x44FF88);
+    } else {
+      gprint("USER MODE PROCESS FAILED\n", 0xFF4444);
+    }
+  } else {
+    gprint("USER MODE PROCESS DEFERRED\n", 0xFFCC44);
+  }
 
   kprint("MULTITASKING KERNEL ACTIVE", 0, 0, 0x0E); // Yellow text
 
