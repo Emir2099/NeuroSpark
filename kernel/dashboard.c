@@ -242,9 +242,10 @@ static void draw_hud_telemetry(void) {
 }
 
 static void draw_command_overlay(void) {
-  clear_region(0, 346, 800, 374, 0x000A22);
+  clear_region(0, 346, 800, 388, 0x000A22);
   draw_hline(346, 0, 800, 0x223355);
   draw_hline(360, 0, 800, 0x112244);
+  draw_hline(374, 0, 800, 0x112244);
 
   cursor_x = 4;
   cursor_y = 349;
@@ -254,6 +255,10 @@ static void draw_command_overlay(void) {
   cursor_y = 363;
   gprint("FAST KEYS: F1 stim0  F2 switch  F3 stim1  F4 save0  F5 load0",
          0x66EEAA);
+  cursor_x = 4;
+  cursor_y = 377;
+  gprint("RESEARCH: synview synset synrule synpreset syncmp | sbrowse spreview stag sdiff",
+    0xFFD37A);
 }
 
 void draw_status_bar(void) {

@@ -156,6 +156,12 @@ static int clamp_i32(int value, int lo, int hi) {
   return value;
 }
 
+static int abs_i32(int v) {
+  if (v < 0)
+    return -v;
+  return v;
+}
+
 static int preset_profile(const char *preset, int *weight_delta, int *thr_delta,
                           int *base_integration, int *fire_threshold) {
   if (str_ieq(preset, "calm")) {
@@ -428,6 +434,7 @@ static void cmd_sbrowse(const char *args) {
 static void cmd_spreview(const char *args) {
   int slot = parse_u32_dec(args);
   int sv = 0, sw = 0, st = 0;
+  int spread = 0;
   char tag[20];
 
   if (!storage_get_snapshot_signature(slot, &sv, &sw, &st)) {
@@ -450,6 +457,16 @@ static void cmd_spreview(const char *args) {
   gprint("/", 0x666666);
   gprint_dec(st, 0xFFFFFF);
   gprint("\n", 0x000000);
+
+  spread = abs_i32(sv - st) + abs_i32(sw - st);
+  gprint("STATE: ", 0x99EEFF);
+  if (spread < 1000) {
+    gprint("CONSOLIDATED\n", 0x77FFAA);
+  } else if (spread < 2500) {
+    gprint("PLASTIC-DRIFT\n", 0xFFE066);
+  } else {
+    gprint("HIGH-DRIFT\n", 0xFF7777);
+  }
 }
 
 static void cmd_stag(const char *args) {
@@ -483,6 +500,8 @@ static void cmd_sdiff(const char *args) {
   int a = parse_u32_dec(t_a);
   int b = parse_u32_dec(t_b);
   int dv = 0, dw = 0, dt = 0;
+  int drift_score = 0;
+  int drift_bar = 0;
   if (!storage_diff_snapshots(a, b, &dv, &dw, &dt)) {
     gprint("ERR: diff failed (empty slot?)\n", 0xFF5555);
     return;
@@ -499,6 +518,33 @@ static void cmd_sdiff(const char *args) {
   gprint(" T:", 0x99EEFF);
   gprint_dec(dt, 0xFFAA66);
   gprint("\n", 0x000000);
+
+  drift_score = abs_i32(dv) + abs_i32(dw) + abs_i32(dt);
+  drift_bar = drift_score / 200;
+  if (drift_bar > 12)
+    drift_bar = 12;
+
+  gprint("DRIFT:", 0x99EEFF);
+  for (int i = 0; i < drift_bar; i++) {
+    gprint("#", 0xFFE066);
+  }
+  if (drift_bar == 0) {
+    gprint(".", 0x66AA66);
+  }
+  gprint(" ", 0x000000);
+  gprint_dec(drift_score, 0xFFFFFF);
+  gprint(" ", 0x000000);
+
+  if (drift_score < 300) {
+    gprint("CONSOLIDATED\n", 0x77FFAA);
+    set_cmd_output("SDIFF: CONSOLIDATED");
+  } else if (drift_score < 1200) {
+    gprint("MODERATE-DRIFT\n", 0xFFE066);
+    set_cmd_output("SDIFF: MODERATE-DRIFT");
+  } else {
+    gprint("HIGH-DRIFT\n", 0xFF7777);
+    set_cmd_output("SDIFF: HIGH-DRIFT");
+  }
 }
 
 static void cmd_exec(const char *args) {

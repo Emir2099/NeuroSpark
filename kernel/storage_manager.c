@@ -37,6 +37,7 @@ typedef struct {
 typedef struct {
   char name[8];
   int is_used;
+  char snapshot_tag[16];
   int voltages[5];
   int weights[5];
   int thresholds[5];
@@ -51,7 +52,13 @@ extern void disk_read_sector(uint32_t lba, unsigned short *buffer);
 #define SNAPSHOT_SLOTS 4
 #define SNAPSHOT_TAG_LEN 16
 
-static char snapshot_tags[SNAPSHOT_SLOTS][SNAPSHOT_TAG_LEN];
+static void copy_bytes(void *dst, const void *src, int len) {
+  unsigned char *d = (unsigned char *)dst;
+  const unsigned char *s = (const unsigned char *)src;
+  for (int i = 0; i < len; i++) {
+    d[i] = s[i];
+  }
+}
 
 static void copy_text(char *dst, const char *src, int max_len) {
   int i = 0;
@@ -75,10 +82,14 @@ void sys_save_task(int task_id, int slot) {
 
   volatile VirtualFile *f = &synapse_disk[slot];
   TaskControlBlock *t = &task_list[task_id];
+  int first_save = (f->is_used == 0);
 
   for (int i = 0; i < 8; i++)
     f->name[i] = t->task_name[i];
   f->is_used = 1;
+  if (first_save) {
+    f->snapshot_tag[0] = '\0';
+  }
 
   int px = t->target_pixel;
   for (int n = 0; n < 5; n++) {
@@ -90,7 +101,12 @@ void sys_save_task(int task_id, int slot) {
   __asm__ volatile("" ::: "memory");
 
   if (ata_disk_available) {
-    disk_write_sector(DISK_DATA_OFFSET + slot, (unsigned short *)f);
+    uint16_t sector_buf[256];
+    for (int i = 0; i < 256; i++) {
+      sector_buf[i] = 0;
+    }
+    copy_bytes((void *)sector_buf, (const void *)f, (int)sizeof(VirtualFile));
+    disk_write_sector(DISK_DATA_OFFSET + slot, sector_buf);
     klog_info("snapshot persisted to disk");
   } else {
     klog_warn("disk unavailable, snapshot kept in memory");
@@ -102,7 +118,10 @@ int sys_load_task(int task_id, int slot) {
     return 0;
 
   if (ata_disk_available) {
-    disk_read_sector(DISK_DATA_OFFSET + slot, (unsigned short *)&synapse_disk[slot]);
+    uint16_t sector_buf[256];
+    disk_read_sector(DISK_DATA_OFFSET + slot, sector_buf);
+    copy_bytes((void *)&synapse_disk[slot], (const void *)sector_buf,
+               (int)sizeof(VirtualFile));
   }
 
   __asm__ volatile("" ::: "memory");
@@ -149,7 +168,19 @@ int storage_set_snapshot_tag(int slot, const char *tag) {
   if (!synapse_disk[slot].is_used) {
     return 0;
   }
-  copy_text(snapshot_tags[slot], tag, SNAPSHOT_TAG_LEN);
+
+  copy_text((char *)synapse_disk[slot].snapshot_tag, tag, SNAPSHOT_TAG_LEN);
+
+  if (ata_disk_available) {
+    uint16_t sector_buf[256];
+    for (int i = 0; i < 256; i++) {
+      sector_buf[i] = 0;
+    }
+    copy_bytes((void *)sector_buf, (const void *)&synapse_disk[slot],
+               (int)sizeof(VirtualFile));
+    disk_write_sector(DISK_DATA_OFFSET + slot, sector_buf);
+  }
+
   return 1;
 }
 
@@ -161,7 +192,8 @@ int storage_get_snapshot_tag(int slot, char *out, int out_len) {
     out[0] = '\0';
     return 0;
   }
-  copy_text(out, snapshot_tags[slot], out_len);
+
+  copy_text(out, (const char *)synapse_disk[slot].snapshot_tag, out_len);
   return 1;
 }
 

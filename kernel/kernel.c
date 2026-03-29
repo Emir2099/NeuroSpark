@@ -322,6 +322,7 @@ TaskControlBlock task_list[2];
 typedef struct {
   char name[FILENAME_LEN];
   int is_used;
+  char snapshot_tag[16];
   // Data payload: The saved state of 5 neurons
   int voltages[NEURONS_PER_PIXEL];
   int weights[NEURONS_PER_PIXEL];
