@@ -414,6 +414,11 @@ void exception_handler() {
 }
 
 void init_idt() {
+  /* CRITICAL: Mask ALL PIC interrupts FIRST to prevent any interrupt
+     from firing while we're setting up the new IDT. */
+  outb(0x21, 0xFF);     /* Mask all on Master PIC */
+  outb(0xA1, 0xFF);     /* Mask all on Slave PIC */
+
   idtp.limit = (sizeof(struct idt_entry) * 256) - 1;
   idtp.base = (uint32_t)&idt;
 
@@ -433,11 +438,10 @@ void init_idt() {
   outb(0x21, 0x01);
   outb(0xA1, 0x01);
 
-  /* Mask (disable) all IRQs except what we need:
-   * Master PIC (0x21): IRQ0(timer), IRQ1(keyboard), IRQ2(cascade)
-   *   0xF8 = 11111000
-   * Slave PIC (0xA1): unmask IRQ12 (PS/2 mouse), keep others masked
-   *   0xEF = 11101111
+  /* Now mask (disable) only the IRQs we don't want,
+   * keeping IRQ0(timer), IRQ1(keyboard), IRQ2(cascade) unmasked.
+   * Master PIC (0x21): IRQ0, IRQ1, IRQ2 enabled = 11111000 = 0xF8
+   * Slave PIC (0xA1): IRQ12 (mouse) enabled = 11101111 = 0xEF
    */
   outb(0x21, 0xF8);
   outb(0xA1, 0xEF);
@@ -2008,8 +2012,8 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
   model_manager_init();
 
   /* Setup the NeuroCore pulse */
-  init_timer(100); /* 100Hz frequency */
-  init_idt();      /* Register timer_handler and start interrupts */
+  init_idt();      /* Register timer_handler and enable interrupts FIRST */
+  init_timer(100); /* 100Hz frequency - now IDT is ready for IRQ0 */
   init_input_stack();
 
   /* Detect ATA disk controller */

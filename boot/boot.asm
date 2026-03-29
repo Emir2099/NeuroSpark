@@ -4,8 +4,10 @@
 KERNEL_OFFSET equ 0x10000
 KERNEL_SEGMENT equ 0x1000
 ; INT 13h extended read commonly allows up to 127 sectors per request.
-; Keep this at 127 to cover current kernel size while avoiding E0E read errors.
+; Read in two passes to support kernels larger than 127 sectors while
+; keeping each INT 13h request BIOS-safe.
 KERNEL_LOAD_SECTORS equ 127
+KERNEL_LOAD_EXTRA_SECTORS equ 64
 %define FORCE_TEXT_MODE 0
 
 ; Entry point - BIOS loads us at 0x7c00
@@ -130,9 +132,15 @@ load_kernel:
     int 0x13
     jc .try_chs              ; No LBA support, fallback to CHS
 
-    ; --- LBA path (preferred) ---
-    mov si, dap              ; DS:SI -> Disk Address Packet
-    mov ah, 0x42             ; Extended Read
+    ; --- LBA path (preferred): two-pass read ---
+    mov si, dap              ; Pass 1: 127 sectors from LBA 1 -> 0x1000:0000
+    mov ah, 0x42
+    mov dl, [BOOT_DRIVE]
+    int 0x13
+    jc disk_error
+
+    mov si, dap2             ; Pass 2: extra sectors from LBA 128 -> next segment
+    mov ah, 0x42
     mov dl, [BOOT_DRIVE]
     int 0x13
     jc disk_error
@@ -195,6 +203,7 @@ load_kernel:
     jnz .read_loop
     ret
 
+
 disk_error:
     mov ah, 0x0e
     mov al, 'E'
@@ -239,7 +248,16 @@ dap:
     dw KERNEL_LOAD_SECTORS    ; Number of sectors to read
     dw 0x0000                 ; Offset of destination buffer
     dw KERNEL_SEGMENT         ; Segment of destination buffer
-    dq 1                     ; Start LBA (sector 1 = first sector after bootsector)
+    dq 1                      ; Start LBA (sector 1 = first sector after bootsector)
+
+dap2:
+    db 0x10
+    db 0
+    dw KERNEL_LOAD_EXTRA_SECTORS
+    dw 0x0000
+    ; Segment advance: 127 sectors * 512 bytes / 16 = 0x0FE0 paragraphs
+    dw (KERNEL_SEGMENT + 0x0FE0)
+    dq 128                    ; Continue loading from LBA 128
 
 ; GDT Definition
 gdt_start:

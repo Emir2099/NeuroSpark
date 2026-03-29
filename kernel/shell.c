@@ -184,6 +184,48 @@ static int abs_i32(int v) {
   return v;
 }
 
+static int parse_ipv4(const char *s, uint32_t *out) {
+  int idx = 0;
+  uint32_t parts[4] = {0, 0, 0, 0};
+  if (s == 0 || out == 0) {
+    return 0;
+  }
+
+  while (*s) {
+    if (*s >= '0' && *s <= '9') {
+      parts[idx] = (parts[idx] * 10u) + (uint32_t)(*s - '0');
+      if (parts[idx] > 255u) {
+        return 0;
+      }
+    } else if (*s == '.') {
+      idx++;
+      if (idx > 3) {
+        return 0;
+      }
+    } else {
+      return 0;
+    }
+    s++;
+  }
+
+  if (idx != 3) {
+    return 0;
+  }
+
+  *out = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+  return 1;
+}
+
+static void print_ipv4(uint32_t ip) {
+  gprint_dec((int)((ip >> 24) & 0xFFu), 0xFFFFFF);
+  gprint(".", 0x666666);
+  gprint_dec((int)((ip >> 16) & 0xFFu), 0xFFFFFF);
+  gprint(".", 0x666666);
+  gprint_dec((int)((ip >> 8) & 0xFFu), 0xFFFFFF);
+  gprint(".", 0x666666);
+  gprint_dec((int)(ip & 0xFFu), 0xFFFFFF);
+}
+
 static const char *task_state_name(uint32_t state) {
   if (state == TASK_STATE_READY) {
     return "READY";
@@ -350,13 +392,14 @@ static void cmd_help(const char *args) {
   (void)args;
   gprint("commands: help save load ls clear eval stim mall free map\n", 0xFFFFFF);
   gprint("          tsave tload pci pci bar zoom+ zoom- zpan+ zpan- wipe\n", 0xFFFFFF);
-  gprint("          exec <path> mkdemo net net tx net export <slot>\n", 0xFFFFFF);
+  gprint("          exec <path> mkdemo net up|cfg|status|tx|export|profile remote ...\n", 0xFFFFFF);
   gprint("phase8:   manifest save|load|show  replay rec on|off|run|show|clear\n", 0x88E0FF);
   gprint("          dataset export <path>  dataset import <path>\n", 0x88E0FF);
   gprint("phase9:   profile on|off|show|reset|export <path>|hud compact|detail\n", 0x88E0FF);
   gprint("phase10:  model show|select|param ...  stdp on|off\n", 0x88E0FF);
   gprint("phase11:  ps  kill <pid>  nice <pid> <0..3>  trace <pid> on|off|show\n", 0x88E0FF);
   gprint("phase11.1: ipc send <ch> <val> | ipc recv <ch> | ipc stat <ch>\n", 0x88E0FF);
+  gprint("phase12:  net up  net cfg <ip> <mask> <gw>  remote on|off|token <hex>\n", 0x88E0FF);
   gprint("phase6:   synview synset synrule synpreset syncmp\n", 0x77C8FF);
   gprint("          sbrowse spreview stag sdiff\n", 0x77C8FF);
 }
@@ -972,16 +1015,62 @@ static void cmd_replay(const char *args) {
 
 static void cmd_net(const char *args) {
   char sub[16];
+  char a[24];
+  char b[24];
+  char c[24];
+  uint32_t ip = 0, mask = 0, gw = 0;
   args = next_token(args, sub, sizeof(sub));
+  args = next_token(args, a, sizeof(a));
+  args = next_token(args, b, sizeof(b));
+  next_token(args, c, sizeof(c));
+
+  if (str_eq(sub, "up")) {
+    if (net_up()) {
+      set_cmd_output("NET UP");
+    } else {
+      set_cmd_output("NET UP FAIL");
+    }
+    return;
+  }
+
+  if (str_eq(sub, "cfg")) {
+    if (!parse_ipv4(a, &ip) || !parse_ipv4(b, &mask) || !parse_ipv4(c, &gw)) {
+      set_cmd_output("USAGE: net cfg <ip> <mask> <gw>");
+      return;
+    }
+    if (net_set_ipv4(ip, mask, gw)) {
+      set_cmd_output("NET CFG OK");
+    } else {
+      set_cmd_output("NET CFG FAIL");
+    }
+    return;
+  }
 
   if (sub[0] == '\0' || str_eq(sub, "status")) {
     uint8_t mac[6];
+    net_get_ipv4(&ip, &mask, &gw);
     gprint("NET: ", 0x99EEFF);
     gprint(net_is_ready() ? "ONLINE" : "OFFLINE", net_is_ready() ? 0x44FF88 : 0xFF5555);
     gprint(" DRV:", 0x99EEFF);
     gprint((char *)net_driver_name(), 0xFFFFFF);
     gprint(" IO:", 0x99EEFF);
     gprint_hex(net_nic_io_base(), 8, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("IP:", 0x99EEFF);
+    print_ipv4(ip);
+    gprint(" MASK:", 0x99EEFF);
+    print_ipv4(mask);
+    gprint(" GW:", 0x99EEFF);
+    print_ipv4(gw);
+    gprint("\n", 0x000000);
+
+    gprint("REMOTE:", 0x99EEFF);
+    gprint(remote_is_enabled() ? "ON" : "OFF", remote_is_enabled() ? 0x44FF88 : 0xFFAA66);
+    gprint(" TOK:", 0x99EEFF);
+    gprint_hex(remote_get_token(), 8, 0xFFFFFF);
+    gprint(" SID:", 0x99EEFF);
+    gprint_hex(remote_get_session(), 8, 0xFFFFFF);
     gprint("\n", 0x000000);
 
     if (net_is_ready()) {
@@ -1021,7 +1110,56 @@ static void cmd_net(const char *args) {
     return;
   }
 
-  set_cmd_output("USAGE: net [status|tx|export <slot>]");
+  if (str_eq(sub, "profile")) {
+    if (net_export_profile()) {
+      set_cmd_output("NET PROFILE EXPORTED");
+    } else {
+      set_cmd_output("NET PROFILE EXPORT FAIL");
+    }
+    return;
+  }
+
+  set_cmd_output("USAGE: net up|cfg|status|tx|export <slot>|profile");
+}
+
+static void cmd_remote(const char *args) {
+  char sub[12];
+  char tok[24];
+  args = next_token(args, sub, sizeof(sub));
+  next_token(args, tok, sizeof(tok));
+
+  if (sub[0] == '\0') {
+    gprint("REMOTE:", 0x99EEFF);
+    gprint(remote_is_enabled() ? "ON" : "OFF", remote_is_enabled() ? 0x44FF88 : 0xFFAA66);
+    gprint(" TOKEN:", 0x99EEFF);
+    gprint_hex(remote_get_token(), 8, 0xFFFFFF);
+    gprint(" SESSION:", 0x99EEFF);
+    gprint_hex(remote_get_session(), 8, 0xFFFFFF);
+    gprint("\n", 0x000000);
+    return;
+  }
+
+  if (str_eq(sub, "on")) {
+    remote_set_enabled(1);
+    set_cmd_output("REMOTE ON");
+    return;
+  }
+  if (str_eq(sub, "off")) {
+    remote_set_enabled(0);
+    set_cmd_output("REMOTE OFF");
+    return;
+  }
+  if (str_eq(sub, "token")) {
+    if (tok[0] == '\0') {
+      set_cmd_output("USAGE: remote token <hex>");
+      return;
+    }
+    remote_set_token(parse_u32_hex(tok));
+    set_cmd_output("REMOTE TOKEN SET");
+    return;
+  }
+
+  set_cmd_output("USAGE: remote on|off|token <hex>");
 }
 
 static void cmd_synview(const char *args) {
@@ -1710,6 +1848,7 @@ static const CommandEntry command_table[] = {
     {"nice", cmd_nice},
     {"trace", cmd_trace},
     {"ipc", cmd_ipc},
+    {"remote", cmd_remote},
     {"manifest", cmd_manifest},
     {"dataset", cmd_dataset},
     {"replay", cmd_replay},
@@ -1774,6 +1913,9 @@ void process_command(char *cmd) {
 done:
   cmd_delta = profile_end_and_get(PROFILE_SLOT_COMMAND, cmd_stamp);
   profile_record_command(cmd_delta);
+  if (remote_is_enabled()) {
+    remote_send_command_result(cmd + i);
+  }
   if (profile_name != 0 && profile_name[0] != '\0') {
     profile_record_named_command(profile_name, cmd_delta);
   }

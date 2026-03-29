@@ -352,7 +352,7 @@ static void draw_hud_telemetry(void) {
 }
 
 static void draw_command_overlay(void) {
-  clear_region(0, 346, 800, 476, 0x000A22);
+  clear_region(0, 346, 800, 490, 0x000A22);
   draw_hline(346, 0, 800, 0x223355);
   draw_hline(360, 0, 800, 0x112244);
   draw_hline(374, 0, 800, 0x112244);
@@ -362,6 +362,7 @@ static void draw_command_overlay(void) {
   draw_hline(430, 0, 800, 0x112244);
   draw_hline(444, 0, 800, 0x112244);
   draw_hline(458, 0, 800, 0x112244);
+  draw_hline(472, 0, 800, 0x112244);
 
   cursor_x = 4;
   cursor_y = 349;
@@ -377,7 +378,7 @@ static void draw_command_overlay(void) {
     0xFFD37A);
   cursor_x = 4;
   cursor_y = 391;
-  gprint("NET: net status | net tx | net export <slot>", 0x88E0FF);
+  gprint("NET: net up|cfg|status|tx|export <slot>|profile  remote on|off|token", 0x88E0FF);
   cursor_x = 4;
   cursor_y = 405;
   gprint("PHASE8: manifest save|load|show  replay rec on|off|run  dataset export|import",
@@ -394,6 +395,9 @@ static void draw_command_overlay(void) {
   cursor_x = 4;
   cursor_y = 461;
   gprint("PHASE11.1: ipc send|recv|stat <ch> [val]", 0xE8B6FF);
+  cursor_x = 4;
+  cursor_y = 475;
+  gprint("PHASE12: net up|cfg|status|profile  remote on|off|token <hex>", 0xB6E8FF);
 }
 
 void draw_status_bar(void) {
