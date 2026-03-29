@@ -103,6 +103,85 @@ static uint32_t parse_u32_hex(const char *s) {
   return v;
 }
 
+static int str_ieq(const char *a, const char *b) {
+  int i = 0;
+  while (a[i] && b[i]) {
+    char ca = a[i];
+    char cb = b[i];
+    if (ca >= 'A' && ca <= 'Z')
+      ca = (char)(ca + 32);
+    if (cb >= 'A' && cb <= 'Z')
+      cb = (char)(cb + 32);
+    if (ca != cb)
+      return 0;
+    i++;
+  }
+  return a[i] == '\0' && b[i] == '\0';
+}
+
+static const char *next_token(const char *src, char *out, int out_len) {
+  int i = 0;
+  if (src == 0 || out == 0 || out_len <= 0) {
+    return src;
+  }
+
+  while (*src == ' ') {
+    src++;
+  }
+  if (*src == '\0') {
+    out[0] = '\0';
+    return src;
+  }
+
+  while (src[i] && src[i] != ' ' && i < out_len - 1) {
+    out[i] = src[i];
+    i++;
+  }
+  out[i] = '\0';
+
+  while (src[i] && src[i] != ' ') {
+    i++;
+  }
+  while (src[i] == ' ') {
+    i++;
+  }
+  return src + i;
+}
+
+static int clamp_i32(int value, int lo, int hi) {
+  if (value < lo)
+    return lo;
+  if (value > hi)
+    return hi;
+  return value;
+}
+
+static int preset_profile(const char *preset, int *weight_delta, int *thr_delta,
+                          int *base_integration, int *fire_threshold) {
+  if (str_ieq(preset, "calm")) {
+    *weight_delta = -40;
+    *thr_delta = 220;
+    *base_integration = 20;
+    *fire_threshold = 1200;
+    return 1;
+  }
+  if (str_ieq(preset, "focus")) {
+    *weight_delta = 60;
+    *thr_delta = 80;
+    *base_integration = 35;
+    *fire_threshold = 1000;
+    return 1;
+  }
+  if (str_ieq(preset, "plastic")) {
+    *weight_delta = 120;
+    *thr_delta = -120;
+    *base_integration = 55;
+    *fire_threshold = 850;
+    return 1;
+  }
+  return 0;
+}
+
 void scroll_shell(void) {
   current_shell_row = 24;
 }
@@ -140,6 +219,286 @@ static void cmd_help(const char *args) {
   gprint("commands: help save load ls clear eval stim mall free map\n", 0xFFFFFF);
   gprint("          tsave tload pci pci bar zoom+ zoom- zpan+ zpan- wipe\n", 0xFFFFFF);
   gprint("          exec <path> mkdemo\n", 0xFFFFFF);
+  gprint("phase6:   synview synset synrule synpreset syncmp\n", 0x77C8FF);
+  gprint("          sbrowse spreview stag sdiff\n", 0x77C8FF);
+}
+
+static void cmd_synview(const char *args) {
+  int task_idx = parse_u32_dec(args);
+  if (task_idx < 0 || task_idx > 1) {
+    gprint("USAGE: synview <task:0|1>\n", 0xFF5555);
+    return;
+  }
+
+  int px = task_list[task_idx].target_pixel;
+  gprint("SYNAPSE VIEW T", 0x99EEFF);
+  gprint_dec(task_idx, 0xFFFFFF);
+  gprint("\n", 0x000000);
+
+  for (int n = 0; n < 5; n++) {
+    gprint("N", 0xAACCEE);
+    gprint_dec(n, 0xFFFFFF);
+    gprint(" V:", 0xAACCEE);
+    gprint_dec(os_memory_map[px].neurons[n].voltage, 0x77FFAA);
+    gprint(" W:", 0xAACCEE);
+    gprint_dec(os_memory_map[px].neurons[n].synaptic_weight, 0xFFE066);
+    gprint(" T:", 0xAACCEE);
+    gprint_dec(os_memory_map[px].neurons[n].dynamic_threshold, 0xFFAA66);
+    gprint("\n", 0x000000);
+  }
+}
+
+static void cmd_synset(const char *args) {
+  char t_task[8], t_neuron[8], t_field[16], t_value[16];
+  args = next_token(args, t_task, sizeof(t_task));
+  args = next_token(args, t_neuron, sizeof(t_neuron));
+  args = next_token(args, t_field, sizeof(t_field));
+  next_token(args, t_value, sizeof(t_value));
+
+  if (t_task[0] == '\0' || t_neuron[0] == '\0' || t_field[0] == '\0' ||
+      t_value[0] == '\0') {
+    gprint("USAGE: synset <task> <neuron> <weight|thr|volt> <value>\n", 0xFF5555);
+    return;
+  }
+
+  int task_idx = parse_u32_dec(t_task);
+  int neuron_idx = parse_u32_dec(t_neuron);
+  int value = parse_u32_dec(t_value);
+  if (task_idx < 0 || task_idx > 1 || neuron_idx < 0 || neuron_idx >= 5) {
+    gprint("ERR: invalid task/neuron\n", 0xFF5555);
+    return;
+  }
+
+  int px = task_list[task_idx].target_pixel;
+  if (str_ieq(t_field, "weight") || str_ieq(t_field, "w")) {
+    value = clamp_i32(value, 50, 2000);
+    os_memory_map[px].neurons[neuron_idx].synaptic_weight = value;
+    task_list[task_idx].saved_weights[neuron_idx] = value;
+  } else if (str_ieq(t_field, "thr") || str_ieq(t_field, "threshold") ||
+             str_ieq(t_field, "t")) {
+    value = clamp_i32(value, 100, 8000);
+    os_memory_map[px].neurons[neuron_idx].dynamic_threshold = value;
+    task_list[task_idx].saved_thresholds[neuron_idx] = value;
+  } else if (str_ieq(t_field, "volt") || str_ieq(t_field, "v")) {
+    value = clamp_i32(value, 0, 10000);
+    os_memory_map[px].neurons[neuron_idx].voltage = value;
+    task_list[task_idx].saved_voltages[neuron_idx] = value;
+  } else {
+    gprint("ERR: field must be weight|thr|volt\n", 0xFF5555);
+    return;
+  }
+
+  set_cmd_output("SYNSET OK");
+}
+
+static void cmd_synrule(const char *args) {
+  char t_task[8], t_rule[16], t_value[16];
+  args = next_token(args, t_task, sizeof(t_task));
+  args = next_token(args, t_rule, sizeof(t_rule));
+  next_token(args, t_value, sizeof(t_value));
+
+  if (t_task[0] == '\0' || t_rule[0] == '\0' || t_value[0] == '\0') {
+    gprint("USAGE: synrule <task> <base|fire> <value>\n", 0xFF5555);
+    return;
+  }
+
+  int task_idx = parse_u32_dec(t_task);
+  int value = parse_u32_dec(t_value);
+  if (task_idx < 0 || task_idx > 1) {
+    gprint("ERR: invalid task\n", 0xFF5555);
+    return;
+  }
+
+  if (str_ieq(t_rule, "base")) {
+    task_list[task_idx].base_integration = clamp_i32(value, 1, 200);
+    set_cmd_output("RULE BASE OK");
+  } else if (str_ieq(t_rule, "fire")) {
+    task_list[task_idx].fire_threshold = clamp_i32(value, 100, 8000);
+    set_cmd_output("RULE FIRE OK");
+  } else {
+    gprint("ERR: rule must be base|fire\n", 0xFF5555);
+  }
+}
+
+static void cmd_synpreset(const char *args) {
+  char t_task[8], t_preset[16];
+  args = next_token(args, t_task, sizeof(t_task));
+  next_token(args, t_preset, sizeof(t_preset));
+
+  if (t_task[0] == '\0' || t_preset[0] == '\0') {
+    gprint("USAGE: synpreset <task> <calm|focus|plastic>\n", 0xFF5555);
+    return;
+  }
+
+  int task_idx = parse_u32_dec(t_task);
+  int wd = 0, td = 0, bi = 0, ft = 0;
+  if (task_idx < 0 || task_idx > 1) {
+    gprint("ERR: invalid task\n", 0xFF5555);
+    return;
+  }
+  if (!preset_profile(t_preset, &wd, &td, &bi, &ft)) {
+    gprint("ERR: preset must be calm|focus|plastic\n", 0xFF5555);
+    return;
+  }
+
+  int px = task_list[task_idx].target_pixel;
+  for (int n = 0; n < 5; n++) {
+    int w = os_memory_map[px].neurons[n].synaptic_weight + wd;
+    int t = os_memory_map[px].neurons[n].dynamic_threshold + td;
+    w = clamp_i32(w, 50, 2000);
+    t = clamp_i32(t, 100, 8000);
+    os_memory_map[px].neurons[n].synaptic_weight = w;
+    os_memory_map[px].neurons[n].dynamic_threshold = t;
+    task_list[task_idx].saved_weights[n] = w;
+    task_list[task_idx].saved_thresholds[n] = t;
+  }
+  task_list[task_idx].base_integration = bi;
+  task_list[task_idx].fire_threshold = ft;
+
+  set_cmd_output("PRESET APPLIED");
+}
+
+static void cmd_syncmp(const char *args) {
+  char t_task[8], t_a[16], t_b[16];
+  args = next_token(args, t_task, sizeof(t_task));
+  args = next_token(args, t_a, sizeof(t_a));
+  next_token(args, t_b, sizeof(t_b));
+
+  if (t_task[0] == '\0' || t_a[0] == '\0' || t_b[0] == '\0') {
+    gprint("USAGE: syncmp <task> <presetA> <presetB>\n", 0xFF5555);
+    return;
+  }
+
+  int task_idx = parse_u32_dec(t_task);
+  int aw = 0, at = 0, abi = 0, aft = 0;
+  int bw = 0, bt = 0, bbi = 0, bft = 0;
+  if (task_idx < 0 || task_idx > 1) {
+    gprint("ERR: invalid task\n", 0xFF5555);
+    return;
+  }
+  if (!preset_profile(t_a, &aw, &at, &abi, &aft) ||
+      !preset_profile(t_b, &bw, &bt, &bbi, &bft)) {
+    gprint("ERR: presets must be calm|focus|plastic\n", 0xFF5555);
+    return;
+  }
+
+  gprint("PRESET DIFF A-B W:", 0x99EEFF);
+  gprint_dec((aw - bw) * 5, 0xFFE066);
+  gprint(" T:", 0x99EEFF);
+  gprint_dec((at - bt) * 5, 0xFFAA66);
+  gprint(" BASE:", 0x99EEFF);
+  gprint_dec(abi - bbi, 0x77FFAA);
+  gprint(" FIRE:", 0x99EEFF);
+  gprint_dec(aft - bft, 0x77FFAA);
+  gprint("\n", 0x000000);
+}
+
+static void cmd_sbrowse(const char *args) {
+  (void)args;
+  gprint("SLOT TAG            SIG[V/W/T]\n", 0x99EEFF);
+  gprint("--------------------------------\n", 0x557799);
+
+  int cap = storage_snapshot_capacity();
+  for (int i = 0; i < cap; i++) {
+    int sv = 0, sw = 0, st = 0;
+    char tag[20];
+    if (!storage_get_snapshot_signature(i, &sv, &sw, &st)) {
+      continue;
+    }
+
+    if (!storage_get_snapshot_tag(i, tag, sizeof(tag)) || tag[0] == '\0') {
+      tag[0] = '-';
+      tag[1] = '\0';
+    }
+
+    gprint("S", 0xAACCEE);
+    gprint_dec(i, 0xFFFFFF);
+    gprint("   ", 0x000000);
+    gprint(tag, 0x77FFAA);
+    gprint("   ", 0x000000);
+    gprint_dec(sv, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec(sw, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec(st, 0xFFFFFF);
+    gprint("\n", 0x000000);
+  }
+}
+
+static void cmd_spreview(const char *args) {
+  int slot = parse_u32_dec(args);
+  int sv = 0, sw = 0, st = 0;
+  char tag[20];
+
+  if (!storage_get_snapshot_signature(slot, &sv, &sw, &st)) {
+    gprint("ERR: invalid/empty slot\n", 0xFF5555);
+    return;
+  }
+  if (!storage_get_snapshot_tag(slot, tag, sizeof(tag)) || tag[0] == '\0') {
+    tag[0] = '-';
+    tag[1] = '\0';
+  }
+
+  gprint("SLOT ", 0x99EEFF);
+  gprint_dec(slot, 0xFFFFFF);
+  gprint(" TAG:", 0x99EEFF);
+  gprint(tag, 0x77FFAA);
+  gprint(" SIG ", 0x99EEFF);
+  gprint_dec(sv, 0xFFFFFF);
+  gprint("/", 0x666666);
+  gprint_dec(sw, 0xFFFFFF);
+  gprint("/", 0x666666);
+  gprint_dec(st, 0xFFFFFF);
+  gprint("\n", 0x000000);
+}
+
+static void cmd_stag(const char *args) {
+  char t_slot[8], t_tag[20];
+  args = next_token(args, t_slot, sizeof(t_slot));
+  next_token(args, t_tag, sizeof(t_tag));
+
+  if (t_slot[0] == '\0' || t_tag[0] == '\0') {
+    gprint("USAGE: stag <slot> <tag>\n", 0xFF5555);
+    return;
+  }
+
+  int slot = parse_u32_dec(t_slot);
+  if (storage_set_snapshot_tag(slot, t_tag)) {
+    set_cmd_output("SNAP TAGGED");
+  } else {
+    gprint("ERR: tag failed (empty slot?)\n", 0xFF5555);
+  }
+}
+
+static void cmd_sdiff(const char *args) {
+  char t_a[8], t_b[8];
+  args = next_token(args, t_a, sizeof(t_a));
+  next_token(args, t_b, sizeof(t_b));
+
+  if (t_a[0] == '\0' || t_b[0] == '\0') {
+    gprint("USAGE: sdiff <slotA> <slotB>\n", 0xFF5555);
+    return;
+  }
+
+  int a = parse_u32_dec(t_a);
+  int b = parse_u32_dec(t_b);
+  int dv = 0, dw = 0, dt = 0;
+  if (!storage_diff_snapshots(a, b, &dv, &dw, &dt)) {
+    gprint("ERR: diff failed (empty slot?)\n", 0xFF5555);
+    return;
+  }
+
+  gprint("DIFF S", 0x99EEFF);
+  gprint_dec(a, 0xFFFFFF);
+  gprint("-S", 0x99EEFF);
+  gprint_dec(b, 0xFFFFFF);
+  gprint(" V:", 0x99EEFF);
+  gprint_dec(dv, 0x77FFAA);
+  gprint(" W:", 0x99EEFF);
+  gprint_dec(dw, 0xFFE066);
+  gprint(" T:", 0x99EEFF);
+  gprint_dec(dt, 0xFFAA66);
+  gprint("\n", 0x000000);
 }
 
 static void cmd_exec(const char *args) {
@@ -501,6 +860,15 @@ static const CommandEntry command_table[] = {
     {"wipe", cmd_wipe},
     {"exec", cmd_exec},
     {"mkdemo", cmd_mkdemo},
+    {"synview", cmd_synview},
+    {"synset", cmd_synset},
+    {"synrule", cmd_synrule},
+    {"synpreset", cmd_synpreset},
+    {"syncmp", cmd_syncmp},
+    {"sbrowse", cmd_sbrowse},
+    {"spreview", cmd_spreview},
+    {"stag", cmd_stag},
+    {"sdiff", cmd_sdiff},
 };
 
 void process_command(char *cmd) {

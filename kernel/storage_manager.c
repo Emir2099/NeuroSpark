@@ -48,8 +48,29 @@ extern NeuralPixel os_memory_map[2];
 extern void disk_write_sector(uint32_t lba, unsigned short *buffer);
 extern void disk_read_sector(uint32_t lba, unsigned short *buffer);
 
+#define SNAPSHOT_SLOTS 4
+#define SNAPSHOT_TAG_LEN 16
+
+static char snapshot_tags[SNAPSHOT_SLOTS][SNAPSHOT_TAG_LEN];
+
+static void copy_text(char *dst, const char *src, int max_len) {
+  int i = 0;
+  if (max_len <= 0) {
+    return;
+  }
+  if (src == 0) {
+    dst[0] = '\0';
+    return;
+  }
+  while (src[i] && i < max_len - 1) {
+    dst[i] = src[i];
+    i++;
+  }
+  dst[i] = '\0';
+}
+
 void sys_save_task(int task_id, int slot) {
-  if (slot >= 4)
+  if (slot < 0 || slot >= SNAPSHOT_SLOTS)
     return;
 
   volatile VirtualFile *f = &synapse_disk[slot];
@@ -77,7 +98,7 @@ void sys_save_task(int task_id, int slot) {
 }
 
 int sys_load_task(int task_id, int slot) {
-  if (slot >= 4)
+  if (slot < 0 || slot >= SNAPSHOT_SLOTS)
     return 0;
 
   if (ata_disk_available) {
@@ -109,7 +130,7 @@ int sys_load_task(int task_id, int slot) {
 
 int storage_snapshot_used_count(void) {
   int used = 0;
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < SNAPSHOT_SLOTS; i++) {
     if (synapse_disk[i].is_used) {
       used++;
     }
@@ -118,5 +139,74 @@ int storage_snapshot_used_count(void) {
 }
 
 int storage_snapshot_capacity(void) {
-  return 4;
+  return SNAPSHOT_SLOTS;
+}
+
+int storage_set_snapshot_tag(int slot, const char *tag) {
+  if (slot < 0 || slot >= SNAPSHOT_SLOTS || tag == 0 || tag[0] == '\0') {
+    return 0;
+  }
+  if (!synapse_disk[slot].is_used) {
+    return 0;
+  }
+  copy_text(snapshot_tags[slot], tag, SNAPSHOT_TAG_LEN);
+  return 1;
+}
+
+int storage_get_snapshot_tag(int slot, char *out, int out_len) {
+  if (slot < 0 || slot >= SNAPSHOT_SLOTS || out == 0 || out_len <= 0) {
+    return 0;
+  }
+  if (!synapse_disk[slot].is_used) {
+    out[0] = '\0';
+    return 0;
+  }
+  copy_text(out, snapshot_tags[slot], out_len);
+  return 1;
+}
+
+int storage_get_snapshot_signature(int slot, int *voltage_sum, int *weight_sum,
+                                   int *threshold_sum) {
+  int v = 0;
+  int w = 0;
+  int t = 0;
+
+  if (slot < 0 || slot >= SNAPSHOT_SLOTS || voltage_sum == 0 || weight_sum == 0 ||
+      threshold_sum == 0) {
+    return 0;
+  }
+  if (!synapse_disk[slot].is_used) {
+    return 0;
+  }
+
+  for (int i = 0; i < 5; i++) {
+    v += synapse_disk[slot].voltages[i];
+    w += synapse_disk[slot].weights[i];
+    t += synapse_disk[slot].thresholds[i];
+  }
+
+  *voltage_sum = v;
+  *weight_sum = w;
+  *threshold_sum = t;
+  return 1;
+}
+
+int storage_diff_snapshots(int slot_a, int slot_b, int *voltage_delta,
+                           int *weight_delta, int *threshold_delta) {
+  int av = 0, aw = 0, at = 0;
+  int bv = 0, bw = 0, bt = 0;
+
+  if (voltage_delta == 0 || weight_delta == 0 || threshold_delta == 0) {
+    return 0;
+  }
+
+  if (!storage_get_snapshot_signature(slot_a, &av, &aw, &at) ||
+      !storage_get_snapshot_signature(slot_b, &bv, &bw, &bt)) {
+    return 0;
+  }
+
+  *voltage_delta = av - bv;
+  *weight_delta = aw - bw;
+  *threshold_delta = at - bt;
+  return 1;
 }
