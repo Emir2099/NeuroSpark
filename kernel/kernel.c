@@ -6,6 +6,7 @@ typedef unsigned int uint32_t;
 /* External assembly wrapper for the timer */
 extern void timer_wrapper(void);
 extern void keyboard_wrapper(void);
+extern void mouse_wrapper(void);
 
 // External PMM functions
 extern void init_pmm();
@@ -261,6 +262,7 @@ extern void draw_cursor(uint32_t tick);
 #include "paging.h"
 #include "usermode.h"
 #include "vfs.h"
+#include "net.h"
 
 volatile int current_shell_row = SHELL_START_ROW;
 
@@ -430,18 +432,19 @@ void init_idt() {
   outb(0xA1, 0x01);
 
   /* Mask (disable) all IRQs except what we need:
-   * Master PIC (0x21): bit0=IRQ0(timer), bit1=IRQ1(keyboard)
-   *   0xFC = 11111100 → only IRQ 0 and IRQ 1 unmasked
-   * Slave PIC (0xA1): mask everything (0xFF)
-   *   Especially IRQ 14 (IDE) which has no handler and would triple-fault
+   * Master PIC (0x21): IRQ0(timer), IRQ1(keyboard), IRQ2(cascade)
+   *   0xF8 = 11111000
+   * Slave PIC (0xA1): unmask IRQ12 (PS/2 mouse), keep others masked
+   *   0xEF = 11101111
    */
-  outb(0x21, 0xFC);
-  outb(0xA1, 0xFF);
+  outb(0x21, 0xF8);
+  outb(0xA1, 0xEF);
 
   /* Register our timer wrapper (IRQ0 -> Index 32) */
   set_idt_gate(32, (uint32_t)timer_wrapper, 0x08, 0x8E);
 
   set_idt_gate(33, (uint32_t)keyboard_wrapper, 0x08, 0x8E); // Keyboard
+  set_idt_gate(44, (uint32_t)mouse_wrapper, 0x08, 0x8E);    // Mouse IRQ12
 
   /* Load the IDT into the CPU and enable interrupts */
   __asm__ volatile("lidt (%0)" : : "r"(&idtp));
@@ -1998,6 +2001,7 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
   /* Setup the NeuroCore pulse */
   init_timer(100); /* 100Hz frequency */
   init_idt();      /* Register timer_handler and start interrupts */
+  init_input_stack();
 
   /* Detect ATA disk controller */
   ata_disk_available = ata_detect_disk();
@@ -2049,6 +2053,7 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
 
   /* PCI scan now happens safely AFTER IDT is set up */
   pci_scan_all();
+  net_init();
 
   void init_syscalls();
   init_syscalls(); // Plug in 'int 0x80'

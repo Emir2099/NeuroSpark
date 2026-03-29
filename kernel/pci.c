@@ -34,6 +34,24 @@ uint32_t pci_read_config(uint8_t bus, uint8_t slot, uint8_t func,
   return inl(PCI_CONFIG_DATA);
 }
 
+void pci_write_config(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset,
+                      uint32_t value) {
+  uint32_t address =
+      (uint32_t)(((uint32_t)bus << 16) | ((uint32_t)slot << 11) |
+                 ((uint32_t)func << 8) | (offset & 0xFC) | 0x80000000);
+  outl(PCI_CONFIG_ADDRESS, address);
+  outl(PCI_CONFIG_DATA, value);
+}
+
+uint32_t pci_read_bar(int device_index, uint8_t bar_index) {
+  if (device_index < 0 || device_index >= pci_found_count || bar_index > 5)
+    return 0;
+  PciDevice *d = &pci_found[device_index];
+  uint32_t bar = pci_read_config(d->bus, d->slot, d->function,
+                                 (uint8_t)(0x10 + (bar_index * 4)));
+  return bar & 0xFFFFFFF0;
+}
+
 /* ============================================================
  * pci_check_function – SILENT: store only, no gprint here.
  * ============================================================ */
@@ -79,12 +97,7 @@ void pci_scan_all() {
  * Returns the 32-bit base address (memory-mapped).
  * ============================================================ */
 uint32_t pci_read_bar5(int device_index) {
-  if (device_index < 0 || device_index >= pci_found_count)
-    return 0;
-  PciDevice *d = &pci_found[device_index];
-  uint32_t bar5 = pci_read_config(d->bus, d->slot, d->function, 0x24);
-  /* Mask out the lower 4 bits (type/prefetchable flags) for MMIO BARs */
-  return bar5 & 0xFFFFFFF0;
+  return pci_read_bar(device_index, 5);
 }
 
 /* ============================================================
@@ -99,6 +112,34 @@ int pci_find_storage_controller(void) {
     }
   }
   return -1;
+}
+
+int pci_find_network_controller(void) {
+  for (int i = 0; i < pci_found_count; i++) {
+    if (pci_found[i].class_code == 0x02) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+int pci_prepare_storage_mmio(uint32_t *mmio_base, uint32_t *mmio_size,
+                             uint8_t *storage_subclass) {
+  int idx = pci_find_storage_controller();
+  if (idx < 0 || mmio_base == 0 || mmio_size == 0 || storage_subclass == 0)
+    return 0;
+
+  *storage_subclass = pci_found[idx].subclass;
+  if (pci_found[idx].subclass == 0x06) {
+    *mmio_base = pci_read_bar5(idx); /* AHCI ABAR */
+    *mmio_size = 0x2000;
+  } else if (pci_found[idx].subclass == 0x08) {
+    *mmio_base = pci_read_bar(idx, 0); /* NVMe BAR0 */
+    *mmio_size = 0x4000;
+  } else {
+    return 0;
+  }
+  return *mmio_base != 0;
 }
 
 /* ============================================================
@@ -126,6 +167,8 @@ void pci_print_results() {
 
     if (pci_found[i].class_code == 0x01 && pci_found[i].subclass == 0x08) {
       gprint(" <NVMe>", 0x00FF88);
+      gprint(" BAR0:", 0xAAAAAA);
+      gprint_hex(pci_read_bar(i, 0), 8, 0x00FF88);
       gprint(" BAR5:", 0xAAAAAA);
       gprint_hex(pci_read_bar5(i), 8, 0x00FF88);
     } else if (pci_found[i].class_code == 0x01 &&

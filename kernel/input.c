@@ -1,6 +1,8 @@
 #include "input.h"
 
 typedef unsigned char uint8_t;
+typedef unsigned int uint32_t;
+typedef unsigned short uint16_t;
 
 extern volatile char input_buffer[32];
 extern volatile int buffer_idx;
@@ -31,6 +33,103 @@ typedef struct {
 
 extern NeuralPixel os_memory_map[2];
 
+#define SCREEN_WIDTH 800
+#define SCREEN_HEIGHT 600
+
+volatile int mouse_x = SCREEN_WIDTH / 2;
+volatile int mouse_y = SCREEN_HEIGHT / 2;
+volatile int mouse_buttons = 0;
+static int mouse_enabled = 0;
+
+static int key_shift = 0;
+static int key_ctrl = 0;
+static int key_alt = 0;
+static int key_caps = 0;
+
+static uint8_t mouse_packet[3];
+static int mouse_packet_idx = 0;
+
+static inline uint8_t inb(uint16_t port) {
+  uint8_t ret;
+  __asm__ volatile("inb %1, %0" : "=a"(ret) : "Nd"(port));
+  return ret;
+}
+
+static inline void outb(uint16_t port, uint8_t val) {
+  __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static int wait_input_empty(void) {
+  for (uint32_t i = 0; i < 100000; i++) {
+    if ((inb(0x64) & 0x02) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int wait_output_full(void) {
+  for (uint32_t i = 0; i < 100000; i++) {
+    if (inb(0x64) & 0x01) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int is_alpha(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+static char shift_symbol(char c) {
+  switch (c) {
+  case '1':
+    return '!';
+  case '2':
+    return '@';
+  case '3':
+    return '#';
+  case '4':
+    return '$';
+  case '5':
+    return '%';
+  case '6':
+    return '^';
+  case '7':
+    return '&';
+  case '8':
+    return '*';
+  case '9':
+    return '(';
+  case '0':
+    return ')';
+  case '-':
+    return '_';
+  case '=':
+    return '+';
+  case '[':
+    return '{';
+  case ']':
+    return '}';
+  case '\\':
+    return '|';
+  case ';':
+    return ':';
+  case '\'':
+    return '"';
+  case ',':
+    return '<';
+  case '.':
+    return '>';
+  case '/':
+    return '?';
+  case '`':
+    return '~';
+  default:
+    return c;
+  }
+}
+
 static char get_ascii(uint8_t scancode) {
   static char map[0x80] = {
       0,   27,  '1',  '2',  '3',  '4', '5', '6',  '7', '8', '9', '0',
@@ -38,19 +137,93 @@ static char get_ascii(uint8_t scancode) {
       'o', 'p', '[',  ']',  '\n', 0,   'a', 's',  'd', 'f', 'g', 'h',
       'j', 'k', 'l',  ';',  '\'', '`', 0,   '\\', 'z', 'x', 'c', 'v',
       'b', 'n', 'm',  ',',  '.',  '/', 0,   '*',  0,   ' '};
-  return map[scancode];
+  char c = map[scancode];
+  if (c == 0) {
+    return 0;
+  }
+
+  if (is_alpha(c)) {
+    int upper = (key_shift ^ key_caps);
+    if (upper && c >= 'a' && c <= 'z') {
+      c = (char)(c - ('a' - 'A'));
+    }
+  } else if (key_shift) {
+    c = shift_symbol(c);
+  }
+  return c;
+}
+
+static void update_modifier(uint8_t scancode, int pressed) {
+  if (scancode == 0x2A || scancode == 0x36) {
+    key_shift = pressed;
+  } else if (scancode == 0x1D) {
+    key_ctrl = pressed;
+  } else if (scancode == 0x38) {
+    key_alt = pressed;
+  } else if (scancode == 0x3A && pressed) {
+    key_caps = !key_caps;
+  }
+}
+
+void init_input_stack(void) {
+  key_shift = 0;
+  key_ctrl = 0;
+  key_alt = 0;
+  key_caps = 0;
+
+  mouse_packet_idx = 0;
+  mouse_enabled = 0;
+  mouse_x = SCREEN_WIDTH / 2;
+  mouse_y = SCREEN_HEIGHT / 2;
+  mouse_buttons = 0;
+
+  /* Enable auxiliary PS/2 mouse device and streaming packets (IRQ12). */
+  if (!wait_input_empty())
+    return;
+  outb(0x64, 0xA8);
+
+  if (!wait_input_empty())
+    return;
+  outb(0x64, 0x20);
+  if (!wait_output_full())
+    return;
+  uint8_t status = inb(0x60);
+
+  status |= 0x02;
+  if (!wait_input_empty())
+    return;
+  outb(0x64, 0x60);
+  if (!wait_input_empty())
+    return;
+  outb(0x60, status);
+
+  if (!wait_input_empty())
+    return;
+  outb(0x64, 0xD4);
+  if (!wait_input_empty())
+    return;
+  outb(0x60, 0xF4); /* Enable streaming */
+  if (!wait_output_full())
+    return;
+  (void)inb(0x60); /* ACK (or controller response) */
+  mouse_enabled = 1;
 }
 
 void keyboard_handler(void) {
-  uint8_t scancode = 0;
-  __asm__ volatile("inb $0x60, %0" : "=a"(scancode));
-
-  if (scancode >= 0x80)
+  uint8_t scancode = inb(0x60);
+  if (scancode == 0xE0 || scancode == 0xE1)
     return;
 
-  char c = get_ascii(scancode);
+  int is_release = (scancode & 0x80) != 0;
+  uint8_t code = (uint8_t)(scancode & 0x7F);
 
-  if (scancode == 0x1C) {
+  update_modifier(code, !is_release);
+  if (is_release)
+    return;
+
+  char c = get_ascii(code);
+
+  if (code == 0x1C) {
     input_buffer[buffer_idx] = '\0';
     char cmd_copy[32];
     for (int i = 0; i <= buffer_idx && i < 32; i++)
@@ -62,35 +235,35 @@ void keyboard_handler(void) {
     return;
   }
 
-  if (scancode == 0x0E && buffer_idx > 0) {
+  if (code == 0x0E && buffer_idx > 0) {
     buffer_idx--;
     shell_dirty = 1;
     return;
   }
 
-  if (scancode == 0x3B) {
+  if (code == 0x3B) {
     for (int n = 0; n < 5; n++)
       os_memory_map[0].neurons[n].voltage += 300;
     return;
   }
 
-  if (scancode == 0x3C) {
+  if (code == 0x3C) {
     switch_tasks();
     return;
   }
 
-  if (scancode == 0x3D) {
+  if (code == 0x3D) {
     for (int n = 0; n < 5; n++)
       os_memory_map[1].neurons[n].voltage += 1000;
     return;
   }
 
-  if (scancode == 0x3E) {
+  if (code == 0x3E) {
     sys_save_task(0, 0);
     return;
   }
 
-  if (scancode == 0x3F) {
+  if (code == 0x3F) {
     sys_load_task(0, 0);
     return;
   }
@@ -106,4 +279,40 @@ void keyboard_handler(void) {
   } else if (!c) {
     os_memory_map[0].neurons[0].voltage += 500;
   }
+}
+
+void mouse_handler(void) {
+    if (!mouse_enabled) {
+      return;
+    }
+  int x_delta;
+  int y_delta;
+  uint8_t data = inb(0x60);
+
+  if (mouse_packet_idx == 0 && (data & 0x08) == 0) {
+    return;
+  }
+
+  mouse_packet[mouse_packet_idx++] = data;
+  if (mouse_packet_idx < 3) {
+    return;
+  }
+  mouse_packet_idx = 0;
+
+  x_delta = (int)((signed char)mouse_packet[1]);
+  y_delta = (int)((signed char)mouse_packet[2]);
+
+  mouse_x += x_delta;
+  mouse_y -= y_delta;
+
+  if (mouse_x < 0)
+    mouse_x = 0;
+  if (mouse_x > SCREEN_WIDTH - 1)
+    mouse_x = SCREEN_WIDTH - 1;
+  if (mouse_y < 0)
+    mouse_y = 0;
+  if (mouse_y > SCREEN_HEIGHT - 1)
+    mouse_y = SCREEN_HEIGHT - 1;
+
+  mouse_buttons = mouse_packet[0] & 0x07;
 }

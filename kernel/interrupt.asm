@@ -29,6 +29,21 @@ keyboard_wrapper:
     popa
     iretd
 
+global mouse_wrapper
+extern mouse_handler
+
+mouse_wrapper:
+    pusha
+    call mouse_handler
+
+    ; IRQ12 comes from slave PIC: EOI slave first, then master
+    mov al, 0x20
+    out 0xA0, al
+    out 0x20, al
+
+    popa
+    iretd
+
 extern schedule ; Defined in task.c
 
 irq0_handler:

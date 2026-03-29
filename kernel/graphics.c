@@ -208,6 +208,9 @@ void gprint_dec(int val, uint32_t color) {
  * ============================================================ */
 int shell_cursor_x = 0;
 int shell_cursor_y = 312;
+extern volatile int mouse_x;
+extern volatile int mouse_y;
+extern volatile int mouse_buttons;
 
 /* ============================================================
  * BLINKING CURSOR – renders a coloured block at (cursor_x, cursor_y)
@@ -229,4 +232,24 @@ void draw_cursor(uint32_t tick) {
         }
     }
     /* Invisible half: area was already cleared by clear_region */
+}
+
+/* ============================================================
+ * MOUSE CURSOR – compact crosshair + button state cue
+ * ============================================================ */
+void draw_mouse_cursor(void) {
+    int mx = mouse_x;
+    int my = mouse_y;
+    uint32_t color = (mouse_buttons & 0x1) ? 0xFFAA44 : 0xFFFFFF;
+
+    if (mx < 3 || mx >= SCREEN_WIDTH - 3 || my < 3 || my >= SCREEN_HEIGHT - 3) {
+        return;
+    }
+
+    for (int i = -3; i <= 3; i++) {
+        put_pixel(mx + i, my, color);
+        put_pixel(mx, my + i, color);
+    }
+
+    put_pixel(mx + 1, my + 1, 0x000000);
 }

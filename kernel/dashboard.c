@@ -3,6 +3,7 @@
 #include "pci.h"
 #include "scheduler.h"
 #include "storage_manager.h"
+#include "net.h"
 
 typedef unsigned char uint8_t;
 
@@ -55,6 +56,7 @@ extern volatile int ata_disk_available;
 
 extern void pulse_neurons(void);
 extern void draw_cursor(uint32_t tick);
+extern void draw_mouse_cursor(void);
 extern void disk_read_sector(uint32_t lba, uint16_t *buffer);
 extern void disk_write_sector(uint32_t lba, uint16_t *buffer);
 extern int find_free_slot(FileEntry *dir);
@@ -239,13 +241,20 @@ static void draw_hud_telemetry(void) {
   gprint("DISK:", 0xAACCEE);
   gprint(ata_disk_available ? "ONLINE" : "OFFLINE",
          ata_disk_available ? 0x77FF77 : 0xFF7777);
+
+    cursor_x = 638;
+    cursor_y = 276;
+    gprint("NET:", 0xAACCEE);
+    gprint(net_is_ready() ? "ONLINE" : "OFFLINE",
+      net_is_ready() ? 0x77FF77 : 0xFF7777);
 }
 
 static void draw_command_overlay(void) {
-  clear_region(0, 346, 800, 388, 0x000A22);
+  clear_region(0, 346, 800, 404, 0x000A22);
   draw_hline(346, 0, 800, 0x223355);
   draw_hline(360, 0, 800, 0x112244);
   draw_hline(374, 0, 800, 0x112244);
+  draw_hline(388, 0, 800, 0x112244);
 
   cursor_x = 4;
   cursor_y = 349;
@@ -259,6 +268,9 @@ static void draw_command_overlay(void) {
   cursor_y = 377;
   gprint("RESEARCH: synview synset synrule synpreset syncmp | sbrowse spreview stag sdiff",
     0xFFD37A);
+  cursor_x = 4;
+  cursor_y = 391;
+  gprint("NET: net status | net tx | net export <slot>", 0x88E0FF);
 }
 
 void draw_status_bar(void) {
@@ -452,6 +464,7 @@ void neuro_task_entry(void) {
     shell_render();
     draw_command_overlay();
     draw_cursor(tick);
+    draw_mouse_cursor();
 
     cursor_x = 0;
     cursor_y = 312;

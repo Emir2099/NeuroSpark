@@ -5,9 +5,11 @@
 #include "klog.h"
 #include "vfs.h"
 #include "usermode.h"
+#include "net.h"
 
 typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
+typedef unsigned char uint8_t;
 
 typedef struct {
   int voltage;
@@ -224,9 +226,63 @@ static void cmd_help(const char *args) {
   (void)args;
   gprint("commands: help save load ls clear eval stim mall free map\n", 0xFFFFFF);
   gprint("          tsave tload pci pci bar zoom+ zoom- zpan+ zpan- wipe\n", 0xFFFFFF);
-  gprint("          exec <path> mkdemo\n", 0xFFFFFF);
+  gprint("          exec <path> mkdemo net net tx net export <slot>\n", 0xFFFFFF);
   gprint("phase6:   synview synset synrule synpreset syncmp\n", 0x77C8FF);
   gprint("          sbrowse spreview stag sdiff\n", 0x77C8FF);
+}
+
+static void cmd_net(const char *args) {
+  char sub[16];
+  args = next_token(args, sub, sizeof(sub));
+
+  if (sub[0] == '\0' || str_eq(sub, "status")) {
+    uint8_t mac[6];
+    gprint("NET: ", 0x99EEFF);
+    gprint(net_is_ready() ? "ONLINE" : "OFFLINE", net_is_ready() ? 0x44FF88 : 0xFF5555);
+    gprint(" DRV:", 0x99EEFF);
+    gprint((char *)net_driver_name(), 0xFFFFFF);
+    gprint(" IO:", 0x99EEFF);
+    gprint_hex(net_nic_io_base(), 8, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    if (net_is_ready()) {
+      net_get_mac(mac);
+      gprint("MAC: ", 0x99EEFF);
+      for (int i = 0; i < 6; i++) {
+        gprint_hex(mac[i], 2, 0xFFFFFF);
+        if (i != 5)
+          gprint(":", 0x666666);
+      }
+      gprint("\n", 0x000000);
+    }
+    return;
+  }
+
+  if (str_eq(sub, "tx")) {
+    if (net_send_probe()) {
+      set_cmd_output("NET TX PROBE SENT");
+    } else {
+      set_cmd_output("NET TX FAILED");
+    }
+    return;
+  }
+
+  if (str_eq(sub, "export")) {
+    char t_slot[8];
+    next_token(args, t_slot, sizeof(t_slot));
+    if (t_slot[0] == '\0') {
+      set_cmd_output("USAGE: net export <slot>");
+      return;
+    }
+    if (net_export_snapshot(parse_u32_dec(t_slot))) {
+      set_cmd_output("NET SNAPSHOT EXPORTED");
+    } else {
+      set_cmd_output("NET EXPORT FAILED");
+    }
+    return;
+  }
+
+  set_cmd_output("USAGE: net [status|tx|export <slot>]");
 }
 
 static void cmd_synview(const char *args) {
@@ -806,18 +862,20 @@ static void cmd_tload(const char *args) {
 
 static void cmd_pci(const char *args) {
   if (str_eq(args, "bar")) {
-    extern int pci_find_storage_controller(void);
-    extern uint32_t pci_read_bar5(int device_index);
-    int idx = pci_find_storage_controller();
-    if (idx >= 0) {
-      uint32_t bar5 = pci_read_bar5(idx);
-      gprint("STORAGE BAR5: ", 0x99EEFF);
-      gprint_hex(bar5, 8, 0xFFFFFF);
+    uint32_t mmio_base = 0;
+    uint32_t mmio_size = 0;
+    uint8_t subclass = 0;
+    if (pci_prepare_storage_mmio(&mmio_base, &mmio_size, &subclass)) {
+      gprint("STORAGE MMIO: ", 0x99EEFF);
+      gprint_hex(mmio_base, 8, 0xFFFFFF);
+      gprint(" SIZE:", 0x99EEFF);
+      gprint_hex(mmio_size, 4, 0xFFFFFF);
+      gprint(" TYPE:", 0x99EEFF);
+      gprint((subclass == 0x06) ? "AHCI" : "NVME", 0x44FF88);
       gprint("\n", 0x000000);
-      if (bar5 != 0) {
-        map_mmio_region(bar5, 0x2000);
-        gprint("MMIO MAPPED\n", 0x44FF88);
-      }
+
+      map_mmio_region(mmio_base, mmio_size);
+      gprint("MMIO MAPPED\n", 0x44FF88);
     } else {
       gprint("NO STORAGE CTRL FOUND\n", 0xFF5555);
     }
@@ -904,6 +962,7 @@ static const CommandEntry command_table[] = {
     {"zpan+", cmd_zpanp},
     {"zpan-", cmd_zpanm},
     {"wipe", cmd_wipe},
+    {"net", cmd_net},
     {"exec", cmd_exec},
     {"mkdemo", cmd_mkdemo},
     {"synview", cmd_synview},
