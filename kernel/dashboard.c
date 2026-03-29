@@ -5,6 +5,7 @@
 #include "storage_manager.h"
 #include "net.h"
 #include "profiling.h"
+#include "model_manager.h"
 
 typedef unsigned char uint8_t;
 
@@ -70,7 +71,254 @@ extern void put_pixel(int x, int y, uint32_t color);
 extern void flip_buffer(void);
 extern volatile int flip_mutex;
 
+static int viz_mode = VIZ_MODE_OFF;
+static int viz_scrub = 0;
+static int viz_compare_a = 0;
+static int viz_compare_b = 1;
+static int viz_autoplay = 0;
+static int raster_head = 0;
+static uint8_t raster_ring[64][16];
+
 static uint8_t prev_phase[2] = {0, 0};
+
+void viz_set_mode(int mode) {
+  if (mode < VIZ_MODE_OFF || mode > VIZ_MODE_COMPARE) {
+    return;
+  }
+  viz_mode = mode;
+}
+
+int viz_get_mode(void) { return viz_mode; }
+
+void viz_set_scrub(int index) {
+  if (index < 0) {
+    index = 0;
+  }
+  if (index > 63) {
+    index = 63;
+  }
+  viz_scrub = index;
+}
+
+int viz_get_scrub(void) { return viz_scrub; }
+
+int viz_set_compare_slots(int slot_a, int slot_b) {
+  if (slot_a < 0 || slot_b < 0 || slot_a >= storage_snapshot_capacity() ||
+      slot_b >= storage_snapshot_capacity()) {
+    return 0;
+  }
+  viz_compare_a = slot_a;
+  viz_compare_b = slot_b;
+  return 1;
+}
+
+void viz_set_autoplay(int enabled) { viz_autoplay = enabled ? 1 : 0; }
+
+int viz_get_autoplay(void) { return viz_autoplay; }
+
+void viz_step_scrub(int delta) {
+  int next = viz_scrub + delta;
+  while (next < 0) {
+    next += 64;
+  }
+  while (next > 63) {
+    next -= 64;
+  }
+  viz_scrub = next;
+}
+
+static int heat_color(int v, int lo, int hi) {
+  if (hi <= lo) {
+    return 0x335577;
+  }
+  int span = hi - lo;
+  int x = (v - lo) * 255 / span;
+  if (x < 0) {
+    x = 0;
+  }
+  if (x > 255) {
+    x = 255;
+  }
+
+  int r = x;
+  int g = 255 - ((x - 128) < 0 ? (128 - x) : (x - 128));
+  int b = 255 - x;
+  if (g < 0) {
+    g = 0;
+  }
+  return ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+}
+
+static void draw_viz_heatmap(void) {
+  const int x0 = 184;
+  const int y0 = 132;
+  const int cell_w = 24;
+  const int cell_h = 68;
+  int min_w = 32767;
+  int max_w = -32768;
+
+  for (int p = 0; p < 2; p++) {
+    for (int n = 0; n < 5; n++) {
+      int w = os_memory_map[p].neurons[n].synaptic_weight;
+      if (w < min_w)
+        min_w = w;
+      if (w > max_w)
+        max_w = w;
+    }
+  }
+
+  clear_region(x0 - 6, y0 - 20, x0 + (10 * cell_w) + 6, y0 + cell_h + 30,
+               0x001933);
+  cursor_x = x0;
+  cursor_y = y0 - 16;
+  gprint("VIZ HEATMAP (weights)", 0x9AF0C8);
+
+  for (int p = 0; p < 2; p++) {
+    for (int n = 0; n < 5; n++) {
+      int idx = (p * 5) + n;
+      int cx = x0 + idx * cell_w;
+      int cy = y0;
+      int color = heat_color(os_memory_map[p].neurons[n].synaptic_weight, min_w, max_w);
+      clear_region(cx, cy, cx + cell_w - 2, cy + cell_h, color);
+      if (n == 0) {
+        cursor_x = cx;
+        cursor_y = y0 + cell_h + 2;
+        gprint((p == 0) ? "T0" : "T1", 0xAACCEE);
+      }
+    }
+  }
+}
+
+static void record_raster_sample(void) {
+  int row = raster_head & 63;
+  for (int i = 0; i < 16; i++) {
+    int p = i / 8;
+    int n = i % 5;
+    uint8_t spike = 0;
+    if (n < 5 && p < 2) {
+      spike = (os_memory_map[p].neurons[n].voltage >=
+               os_memory_map[p].neurons[n].dynamic_threshold)
+                  ? 1
+                  : 0;
+    }
+    raster_ring[row][i] = spike;
+  }
+  raster_head = (raster_head + 1) & 63;
+}
+
+static void draw_viz_raster(void) {
+  const int x0 = 184;
+  const int y0 = 120;
+  const int w = 400;
+  const int h = 170;
+  int scrub = viz_scrub;
+  if (scrub < 0)
+    scrub = 0;
+  if (scrub > 63)
+    scrub = 63;
+
+  clear_region(x0 - 6, y0 - 16, x0 + w + 8, y0 + h + 26, 0x001933);
+  cursor_x = x0;
+  cursor_y = y0 - 14;
+  gprint("VIZ RASTER", 0xB6E8FF);
+  gprint(" scrub:", 0xAACCEE);
+  gprint_dec(scrub, 0xFFFFFF);
+
+  for (int t = 0; t < 64; t++) {
+    int ring_idx = (raster_head + t) & 63;
+    int x = x0 + (t * w) / 64;
+    for (int n = 0; n < 10; n++) {
+      int y = y0 + (n * h) / 10;
+      uint32_t c = raster_ring[ring_idx][n] ? 0x66FF66 : 0x22384A;
+      put_pixel(x, y, c);
+      if (x + 1 < x0 + w)
+        put_pixel(x + 1, y, c);
+    }
+  }
+
+  {
+    int sx = x0 + (scrub * w) / 64;
+    for (int y = y0; y < y0 + h; y++) {
+      put_pixel(sx, y, 0xFFE066);
+    }
+  }
+}
+
+static void draw_viz_compare(void) {
+  int dv = 0, dw = 0, dt = 0;
+  int dvv[5], dww[5], dtt[5];
+  clear_region(180, 124, 620, 296, 0x001933);
+  cursor_x = 188;
+  cursor_y = 128;
+  gprint("VIZ COMPARE", 0xFFD37A);
+  gprint(" slots ", 0xAACCEE);
+  gprint_dec(viz_compare_a, 0xFFFFFF);
+  gprint(" vs ", 0xAACCEE);
+  gprint_dec(viz_compare_b, 0xFFFFFF);
+
+  cursor_x = 188;
+  cursor_y = 148;
+  if (!storage_diff_snapshots(viz_compare_a, viz_compare_b, &dv, &dw, &dt)) {
+    gprint("No snapshot data for selected slots", 0xFF7777);
+    return;
+  }
+
+  if (!storage_diff_snapshots_vector(viz_compare_a, viz_compare_b, dvv, dww, dtt, 5)) {
+    gprint("Vector diff unavailable", 0xFF7777);
+    return;
+  }
+
+  gprint("drift V:", 0xAACCEE);
+  gprint_dec(dv, 0xFFFFFF);
+  gprint("  W:", 0xAACCEE);
+  gprint_dec(dw, 0xFFFFFF);
+  gprint("  T:", 0xAACCEE);
+  gprint_dec(dt, 0xFFFFFF);
+
+  cursor_x = 188;
+  cursor_y = 166;
+  gprint("divergence markers: ", 0xAACCEE);
+  gprint((dv > 2000 || dv < -2000) ? "V! " : "v ", (dv > 2000 || dv < -2000) ? 0xFF7777 : 0x77FF77);
+  gprint((dw > 600 || dw < -600) ? "W! " : "w ", (dw > 600 || dw < -600) ? 0xFF7777 : 0x77FF77);
+  gprint((dt > 1200 || dt < -1200) ? "T!" : "t", (dt > 1200 || dt < -1200) ? 0xFF7777 : 0x77FF77);
+
+  cursor_x = 188;
+  cursor_y = 184;
+  gprint("param diff summary", 0xAACCEE);
+  cursor_x = 188;
+  cursor_y = 198;
+  gprint("task0 model:", 0x88E0FF);
+  gprint((char *)model_name(0), 0xFFFFFF);
+  cursor_x = 188;
+  cursor_y = 212;
+  gprint("task1 model:", 0x88E0FF);
+  gprint((char *)model_name(1), 0xFFFFFF);
+
+  cursor_x = 188;
+  cursor_y = 232;
+  gprint("N dV dW dT", 0x9AF0C8);
+  for (int i = 0; i < 5; i++) {
+    cursor_x = 188;
+    cursor_y = 246 + (i * 10);
+    gprint_dec(i, 0xFFFFFF);
+    gprint(" ", 0x666666);
+    gprint_dec(dvv[i], 0xFFFFFF);
+    gprint(" ", 0x666666);
+    gprint_dec(dww[i], 0xFFFFFF);
+    gprint(" ", 0x666666);
+    gprint_dec(dtt[i], 0xFFFFFF);
+  }
+}
+
+static void draw_phase13_viz(void) {
+  if (viz_mode == VIZ_MODE_HEATMAP) {
+    draw_viz_heatmap();
+  } else if (viz_mode == VIZ_MODE_RASTER) {
+    draw_viz_raster();
+  } else if (viz_mode == VIZ_MODE_COMPARE) {
+    draw_viz_compare();
+  }
+}
 
 static uint32_t metric_avg_cycles(const ProfileMetric *m) {
   if (m == 0 || m->count == 0) {
@@ -398,6 +646,9 @@ static void draw_command_overlay(void) {
   cursor_x = 4;
   cursor_y = 475;
   gprint("PHASE12: net up|cfg|status|profile  remote on|off|token <hex>", 0xB6E8FF);
+  cursor_x = 4;
+  cursor_y = 489;
+  gprint("PHASE13: viz heatmap|raster|off|show  viz scrub <0..63|+|->  viz play on|off", 0xFFE0A0);
 }
 
 void draw_status_bar(void) {
@@ -584,11 +835,16 @@ void neuro_task_entry(void) {
     uint32_t render_profile_stamp = profile_begin();
 
     pulse_neurons();
+    record_raster_sample();
+    if (viz_mode == VIZ_MODE_RASTER && viz_autoplay) {
+      viz_step_scrub(1);
+    }
 
     clear_region(0, 102, 800, 310, 0x000033);
     draw_status_bar();
     draw_hud_telemetry();
     draw_waveform();
+    draw_phase13_viz();
 
     shell_render();
     draw_command_overlay();

@@ -10,6 +10,7 @@
 #include "model_manager.h"
 #include "task.h"
 #include "scheduler.h"
+#include "dashboard.h"
 
 typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
@@ -182,6 +183,47 @@ static int abs_i32(int v) {
   if (v < 0)
     return -v;
   return v;
+}
+
+static void append_text(char *out, int out_len, int *cursor, const char *text) {
+  int i = 0;
+  if (out == 0 || cursor == 0 || text == 0 || out_len <= 0) {
+    return;
+  }
+  while (text[i] && *cursor < out_len - 1) {
+    out[*cursor] = text[i];
+    (*cursor)++;
+    i++;
+  }
+  out[*cursor] = '\0';
+}
+
+static void append_dec(char *out, int out_len, int *cursor, int value) {
+  char tmp[16];
+  int i = 0;
+  int neg = 0;
+
+  if (value == 0) {
+    append_text(out, out_len, cursor, "0");
+    return;
+  }
+  if (value < 0) {
+    neg = 1;
+    value = -value;
+  }
+  while (value > 0 && i < 15) {
+    tmp[i++] = (char)('0' + (value % 10));
+    value /= 10;
+  }
+  if (neg && i < 15) {
+    tmp[i++] = '-';
+  }
+  while (i > 0) {
+    char c[2];
+    c[0] = tmp[--i];
+    c[1] = '\0';
+    append_text(out, out_len, cursor, c);
+  }
 }
 
 static int parse_ipv4(const char *s, uint32_t *out) {
@@ -400,8 +442,165 @@ static void cmd_help(const char *args) {
   gprint("phase11:  ps  kill <pid>  nice <pid> <0..3>  trace <pid> on|off|show\n", 0x88E0FF);
   gprint("phase11.1: ipc send <ch> <val> | ipc recv <ch> | ipc stat <ch>\n", 0x88E0FF);
   gprint("phase12:  net up  net cfg <ip> <mask> <gw>  remote on|off|token <hex>\n", 0x88E0FF);
+  gprint("phase13:  viz heatmap|raster|off|show  viz scrub <0..63|+|->  viz play on|off\n", 0x88E0FF);
+  gprint("          viz compare <a> <b>  viz export <path>\n", 0x88E0FF);
   gprint("phase6:   synview synset synrule synpreset syncmp\n", 0x77C8FF);
   gprint("          sbrowse spreview stag sdiff\n", 0x77C8FF);
+}
+
+static void cmd_viz(const char *args) {
+  char sub[16];
+  char a[16];
+  char b[16];
+  char c[40];
+
+  args = next_token(args, sub, sizeof(sub));
+  args = next_token(args, a, sizeof(a));
+  args = next_token(args, b, sizeof(b));
+  next_token(args, c, sizeof(c));
+
+  if (sub[0] == '\0' || str_eq(sub, "show")) {
+    gprint("VIZ MODE: ", 0x99EEFF);
+    if (viz_get_mode() == VIZ_MODE_HEATMAP) {
+      gprint("HEATMAP", 0x77FFAA);
+    } else if (viz_get_mode() == VIZ_MODE_RASTER) {
+      gprint("RASTER", 0x77FFAA);
+    } else if (viz_get_mode() == VIZ_MODE_COMPARE) {
+      gprint("COMPARE", 0x77FFAA);
+    } else {
+      gprint("OFF", 0xFFAA66);
+    }
+    gprint(" SCRUB:", 0x99EEFF);
+    gprint_dec(viz_get_scrub(), 0xFFFFFF);
+    gprint(" PLAY:", 0x99EEFF);
+    gprint(viz_get_autoplay() ? "ON" : "OFF", viz_get_autoplay() ? 0x44FF88 : 0xFFAA66);
+    gprint("\n", 0x000000);
+    return;
+  }
+
+  if (str_eq(sub, "off")) {
+    viz_set_mode(VIZ_MODE_OFF);
+    set_cmd_output("VIZ OFF");
+    return;
+  }
+
+  if (str_eq(sub, "heatmap")) {
+    viz_set_mode(VIZ_MODE_HEATMAP);
+    set_cmd_output("VIZ HEATMAP");
+    return;
+  }
+
+  if (str_eq(sub, "raster")) {
+    viz_set_mode(VIZ_MODE_RASTER);
+    set_cmd_output("VIZ RASTER");
+    return;
+  }
+
+  if (str_eq(sub, "scrub")) {
+    if (str_eq(a, "+")) {
+      viz_step_scrub(1);
+      set_cmd_output("VIZ SCRUB +");
+      return;
+    }
+    if (str_eq(a, "-")) {
+      viz_step_scrub(-1);
+      set_cmd_output("VIZ SCRUB -");
+      return;
+    }
+    if (!is_dec_number(a)) {
+      set_cmd_output("USAGE: viz scrub <0..63|+|->");
+      return;
+    }
+    viz_set_scrub(parse_u32_dec(a));
+    set_cmd_output("VIZ SCRUB SET");
+    return;
+  }
+
+  if (str_eq(sub, "play")) {
+    if (str_eq(a, "on")) {
+      viz_set_autoplay(1);
+      set_cmd_output("VIZ PLAY ON");
+      return;
+    }
+    if (str_eq(a, "off")) {
+      viz_set_autoplay(0);
+      set_cmd_output("VIZ PLAY OFF");
+      return;
+    }
+    set_cmd_output("USAGE: viz play on|off");
+    return;
+  }
+
+  if (str_eq(sub, "compare")) {
+    int sa, sb;
+    if (!is_dec_number(a) || !is_dec_number(b)) {
+      set_cmd_output("USAGE: viz compare <a> <b>");
+      return;
+    }
+    sa = parse_u32_dec(a);
+    sb = parse_u32_dec(b);
+    if (!viz_set_compare_slots(sa, sb)) {
+      set_cmd_output("VIZ COMPARE FAIL");
+      return;
+    }
+    viz_set_mode(VIZ_MODE_COMPARE);
+    set_cmd_output("VIZ COMPARE");
+    return;
+  }
+
+  if (str_eq(sub, "export")) {
+    char path[40];
+    char report[480];
+    int cur = 0;
+    int dv = 0, dw = 0, dt = 0;
+    int dvv[5], dww[5], dtt[5];
+
+    copy_cmd_text(path, a, sizeof(path));
+    if (path[0] == '\0') {
+      copy_cmd_text(path, "/viz.rpt", sizeof(path));
+    }
+
+    append_text(report, sizeof(report), &cur, "viz_mode=");
+    append_dec(report, sizeof(report), &cur, viz_get_mode());
+    append_text(report, sizeof(report), &cur, " scrub=");
+    append_dec(report, sizeof(report), &cur, viz_get_scrub());
+    append_text(report, sizeof(report), &cur, " autoplay=");
+    append_dec(report, sizeof(report), &cur, viz_get_autoplay());
+    append_text(report, sizeof(report), &cur, "\n");
+
+    if (storage_diff_snapshots(0, 1, &dv, &dw, &dt)) {
+      append_text(report, sizeof(report), &cur, "slot01 dV=");
+      append_dec(report, sizeof(report), &cur, dv);
+      append_text(report, sizeof(report), &cur, " dW=");
+      append_dec(report, sizeof(report), &cur, dw);
+      append_text(report, sizeof(report), &cur, " dT=");
+      append_dec(report, sizeof(report), &cur, dt);
+      append_text(report, sizeof(report), &cur, "\n");
+    }
+
+    if (storage_diff_snapshots_vector(0, 1, dvv, dww, dtt, 5)) {
+      for (int i = 0; i < 5; i++) {
+        append_text(report, sizeof(report), &cur, "n");
+        append_dec(report, sizeof(report), &cur, i);
+        append_text(report, sizeof(report), &cur, " dV=");
+        append_dec(report, sizeof(report), &cur, dvv[i]);
+        append_text(report, sizeof(report), &cur, " dW=");
+        append_dec(report, sizeof(report), &cur, dww[i]);
+        append_text(report, sizeof(report), &cur, " dT=");
+        append_dec(report, sizeof(report), &cur, dtt[i]);
+        append_text(report, sizeof(report), &cur, "\n");
+      }
+    }
+
+    if (vfs_write_file(path, report, (uint32_t)cur) >= 0) {
+      set_cmd_output("VIZ REPORT EXPORTED");
+    } else {
+      set_cmd_output("VIZ EXPORT FAIL");
+    }
+    return;
+  }
+
+  set_cmd_output("USAGE: viz heatmap|raster|off|show|scrub <0..63|+|->|play on|off|compare <a> <b>|export <path>");
 }
 
 static void cmd_ps(const char *args) {
@@ -1849,6 +2048,7 @@ static const CommandEntry command_table[] = {
     {"trace", cmd_trace},
     {"ipc", cmd_ipc},
     {"remote", cmd_remote},
+    {"viz", cmd_viz},
     {"manifest", cmd_manifest},
     {"dataset", cmd_dataset},
     {"replay", cmd_replay},

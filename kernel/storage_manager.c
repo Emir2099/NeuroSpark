@@ -328,6 +328,28 @@ int storage_diff_snapshots(int slot_a, int slot_b, int *voltage_delta,
   return 1;
 }
 
+int storage_diff_snapshots_vector(int slot_a, int slot_b, int *voltage_delta_vec,
+                                  int *weight_delta_vec, int *threshold_delta_vec,
+                                  int vec_len) {
+  if (slot_a < 0 || slot_b < 0 || slot_a >= SNAPSHOT_SLOTS || slot_b >= SNAPSHOT_SLOTS) {
+    return 0;
+  }
+  if (vec_len < 5 || voltage_delta_vec == 0 || weight_delta_vec == 0 ||
+      threshold_delta_vec == 0) {
+    return 0;
+  }
+  if (!synapse_disk[slot_a].is_used || !synapse_disk[slot_b].is_used) {
+    return 0;
+  }
+
+  for (int i = 0; i < 5; i++) {
+    voltage_delta_vec[i] = synapse_disk[slot_a].voltages[i] - synapse_disk[slot_b].voltages[i];
+    weight_delta_vec[i] = synapse_disk[slot_a].weights[i] - synapse_disk[slot_b].weights[i];
+    threshold_delta_vec[i] = synapse_disk[slot_a].thresholds[i] - synapse_disk[slot_b].thresholds[i];
+  }
+  return 1;
+}
+
 int storage_manifest_save(const char *path) {
   SessionManifest mf;
 
