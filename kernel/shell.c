@@ -8,6 +8,8 @@
 #include "net.h"
 #include "profiling.h"
 #include "model_manager.h"
+#include "task.h"
+#include "scheduler.h"
 
 typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
@@ -182,6 +184,74 @@ static int abs_i32(int v) {
   return v;
 }
 
+static const char *task_state_name(uint32_t state) {
+  if (state == TASK_STATE_READY) {
+    return "READY";
+  }
+  if (state == TASK_STATE_RUNNING) {
+    return "RUN";
+  }
+  if (state == TASK_STATE_BLOCKED) {
+    return "BLK";
+  }
+  if (state == TASK_STATE_SLEEPING) {
+    return "SLP";
+  }
+  if (state == TASK_STATE_TERMINATED) {
+    return "TERM";
+  }
+  return "?";
+}
+
+static const char *workload_name(uint32_t klass) {
+  if (klass == WORKLOAD_CLASS_SIM) {
+    return "SIM";
+  }
+  if (klass == WORKLOAD_CLASS_LOG) {
+    return "LOG";
+  }
+  if (klass == WORKLOAD_CLASS_EXPORT) {
+    return "EXP";
+  }
+  return "GEN";
+}
+
+static const char *trace_event_name(uint32_t evt) {
+  if (evt == TASK_TRACE_EVT_SWITCH_IN) {
+    return "SW-IN";
+  }
+  if (evt == TASK_TRACE_EVT_SWITCH_OUT) {
+    return "SW-OUT";
+  }
+  if (evt == TASK_TRACE_EVT_SYSCALL) {
+    return "SYSCALL";
+  }
+  if (evt == TASK_TRACE_EVT_SLEEP) {
+    return "SLEEP";
+  }
+  if (evt == TASK_TRACE_EVT_WAKE) {
+    return "WAKE";
+  }
+  if (evt == TASK_TRACE_EVT_TERMINATE) {
+    return "TERM";
+  }
+  if (evt == TASK_TRACE_EVT_PRIORITY) {
+    return "PRIO";
+  }
+  if (evt == TASK_TRACE_EVT_KILL) {
+    return "KILL";
+  }
+  return "NONE";
+}
+
+static int require_admin_context(void) {
+  if (os_current_task != 0) {
+    set_cmd_output("ERR: PRIVILEGED (TASK0)");
+    return 0;
+  }
+  return 1;
+}
+
 #define REPLAY_MAX_CMDS 64
 static char replay_cmds[REPLAY_MAX_CMDS][32];
 static int replay_count = 0;
@@ -285,8 +355,214 @@ static void cmd_help(const char *args) {
   gprint("          dataset export <path>  dataset import <path>\n", 0x88E0FF);
   gprint("phase9:   profile on|off|show|reset|export <path>|hud compact|detail\n", 0x88E0FF);
   gprint("phase10:  model show|select|param ...  stdp on|off\n", 0x88E0FF);
+  gprint("phase11:  ps  kill <pid>  nice <pid> <0..3>  trace <pid> on|off|show\n", 0x88E0FF);
+  gprint("phase11.1: ipc send <ch> <val> | ipc recv <ch> | ipc stat <ch>\n", 0x88E0FF);
   gprint("phase6:   synview synset synrule synpreset syncmp\n", 0x77C8FF);
   gprint("          sbrowse spreview stag sdiff\n", 0x77C8FF);
+}
+
+static void cmd_ps(const char *args) {
+  (void)args;
+
+  gprint("PID ST   PR CLS RT CSW TRACE EVT ARG\n", 0x99EEFF);
+  for (int i = 0; i < os_task_count; i++) {
+    gprint_dec(i, 0xFFFFFF);
+    gprint("   ", 0x000000);
+    gprint((char *)task_state_name(os_tasks[i].state), 0x77FFAA);
+    gprint(" ", 0x000000);
+    gprint_dec((int)os_tasks[i].priority, 0xFFE066);
+    gprint("  ", 0x000000);
+    gprint((char *)workload_name(os_tasks[i].workload_class), 0xA0E0FF);
+    gprint("  ", 0x000000);
+    gprint_dec((int)os_tasks[i].runtime_ticks, 0xFFFFFF);
+    gprint(" ", 0x000000);
+    gprint_dec((int)os_tasks[i].context_switches, 0xFFFFFF);
+    gprint("   ", 0x000000);
+    gprint(os_tasks[i].trace_enabled ? "ON " : "OFF", os_tasks[i].trace_enabled ? 0x44FF88 : 0xFFAA66);
+    gprint(" ", 0x000000);
+    gprint((char *)trace_event_name(os_tasks[i].trace_last_event), 0x77C8FF);
+    gprint(" ", 0x000000);
+    gprint_dec((int)os_tasks[i].trace_last_arg, 0xFFFFFF);
+    gprint("\n", 0x000000);
+  }
+}
+
+static void cmd_kill(const char *args) {
+  if (!require_admin_context()) {
+    return;
+  }
+  int pid = parse_u32_dec(args);
+  if (!is_dec_number(args)) {
+    set_cmd_output("USAGE: kill <pid>");
+    return;
+  }
+  if (pid <= 0 || pid >= os_task_count) {
+    set_cmd_output("KILL DENIED");
+    return;
+  }
+  if (os_tasks[pid].state == TASK_STATE_TERMINATED) {
+    set_cmd_output("ALREADY TERM");
+    return;
+  }
+
+  os_tasks[pid].state = TASK_STATE_TERMINATED;
+  os_tasks[pid].time_slice = 0;
+  task_trace_event(pid, TASK_TRACE_EVT_KILL, (uint32_t)os_current_task);
+  set_cmd_output("TASK KILLED");
+}
+
+static void cmd_nice(const char *args) {
+  if (!require_admin_context()) {
+    return;
+  }
+  char t_pid[8];
+  char t_prio[8];
+  args = next_token(args, t_pid, sizeof(t_pid));
+  next_token(args, t_prio, sizeof(t_prio));
+
+  if (!is_dec_number(t_pid) || !is_dec_number(t_prio)) {
+    set_cmd_output("USAGE: nice <pid> <0..3>");
+    return;
+  }
+
+  {
+    int pid = parse_u32_dec(t_pid);
+    int prio = parse_u32_dec(t_prio);
+    if (pid < 0 || pid >= os_task_count || prio < 0 || prio > 3) {
+      set_cmd_output("NICE FAIL");
+      return;
+    }
+
+    os_tasks[pid].priority = (uint32_t)prio;
+    task_trace_event(pid, TASK_TRACE_EVT_PRIORITY, (uint32_t)prio);
+    set_cmd_output("NICE OK");
+  }
+}
+
+static void cmd_trace(const char *args) {
+  char t_pid[8];
+  char t_mode[8];
+  args = next_token(args, t_pid, sizeof(t_pid));
+  next_token(args, t_mode, sizeof(t_mode));
+
+  if (!is_dec_number(t_pid)) {
+    set_cmd_output("USAGE: trace <pid> on|off|show");
+    return;
+  }
+
+  {
+    int pid = parse_u32_dec(t_pid);
+    if (pid < 0 || pid >= os_task_count) {
+      set_cmd_output("TRACE FAIL");
+      return;
+    }
+
+    if (t_mode[0] == '\0' || str_eq(t_mode, "show")) {
+      gprint("TRACE PID ", 0x99EEFF);
+      gprint_dec(pid, 0xFFFFFF);
+      gprint(" ", 0x000000);
+      gprint(os_tasks[pid].trace_enabled ? "ON" : "OFF",
+             os_tasks[pid].trace_enabled ? 0x44FF88 : 0xFFAA66);
+      gprint(" EVT:", 0x99EEFF);
+      gprint((char *)trace_event_name(os_tasks[pid].trace_last_event), 0x77C8FF);
+      gprint(" ARG:", 0x99EEFF);
+      gprint_dec((int)os_tasks[pid].trace_last_arg, 0xFFFFFF);
+      gprint(" CNT:", 0x99EEFF);
+      gprint_dec((int)os_tasks[pid].trace_event_count, 0xFFFFFF);
+      gprint("\n", 0x000000);
+      return;
+    }
+
+    if (str_eq(t_mode, "on")) {
+      if (!require_admin_context()) {
+        return;
+      }
+      os_tasks[pid].trace_enabled = 1;
+      task_trace_event(pid, TASK_TRACE_EVT_PRIORITY, os_tasks[pid].priority);
+      set_cmd_output("TRACE ON");
+      return;
+    }
+    if (str_eq(t_mode, "off")) {
+      if (!require_admin_context()) {
+        return;
+      }
+      os_tasks[pid].trace_enabled = 0;
+      set_cmd_output("TRACE OFF");
+      return;
+    }
+  }
+
+  set_cmd_output("USAGE: trace <pid> on|off|show");
+}
+
+static void cmd_ipc(const char *args) {
+  char sub[8];
+  char t_ch[8];
+  char t_val[16];
+  int ch;
+
+  args = next_token(args, sub, sizeof(sub));
+  args = next_token(args, t_ch, sizeof(t_ch));
+  next_token(args, t_val, sizeof(t_val));
+
+  if (sub[0] == '\0') {
+    set_cmd_output("USAGE: ipc send|recv|stat <ch> [val]");
+    return;
+  }
+  if (!is_dec_number(t_ch)) {
+    set_cmd_output("USAGE: ipc send|recv|stat <ch> [val]");
+    return;
+  }
+  ch = parse_u32_dec(t_ch);
+
+  if (str_eq(sub, "send")) {
+    int val;
+    if (!require_admin_context()) {
+      return;
+    }
+    if (!is_dec_number(t_val)) {
+      set_cmd_output("USAGE: ipc send <ch> <val>");
+      return;
+    }
+    val = parse_u32_dec(t_val);
+    if (ipc_send(ch, val)) {
+      set_cmd_output("IPC SENT");
+    } else {
+      set_cmd_output("IPC SEND FAIL");
+    }
+    return;
+  }
+
+  if (str_eq(sub, "recv")) {
+    int out = 0;
+    if (ipc_recv(ch, &out)) {
+      gprint("IPC[", 0x99EEFF);
+      gprint_dec(ch, 0xFFFFFF);
+      gprint("] -> ", 0x99EEFF);
+      gprint_dec(out, 0x77FFAA);
+      gprint("\n", 0x000000);
+      set_cmd_output("IPC RECV OK");
+    } else {
+      set_cmd_output("IPC EMPTY");
+    }
+    return;
+  }
+
+  if (str_eq(sub, "stat")) {
+    int depth = ipc_queue_depth(ch);
+    if (depth < 0) {
+      set_cmd_output("IPC CH INVALID");
+      return;
+    }
+    gprint("IPC[", 0x99EEFF);
+    gprint_dec(ch, 0xFFFFFF);
+    gprint("] depth=", 0x99EEFF);
+    gprint_dec(depth, 0x77FFAA);
+    gprint("\n", 0x000000);
+    return;
+  }
+
+  set_cmd_output("USAGE: ipc send|recv|stat <ch> [val]");
 }
 
 static void cmd_model(const char *args) {
@@ -1429,6 +1705,11 @@ static const CommandEntry command_table[] = {
     {"profile", cmd_profile},
     {"model", cmd_model},
     {"stdp", cmd_stdp},
+    {"ps", cmd_ps},
+    {"kill", cmd_kill},
+    {"nice", cmd_nice},
+    {"trace", cmd_trace},
+    {"ipc", cmd_ipc},
     {"manifest", cmd_manifest},
     {"dataset", cmd_dataset},
     {"replay", cmd_replay},

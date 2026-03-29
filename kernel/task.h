@@ -13,6 +13,23 @@ enum {
 
 #define MAX_TASKS 3
 
+enum {
+  WORKLOAD_CLASS_SIM = 0,
+  WORKLOAD_CLASS_LOG = 1,
+  WORKLOAD_CLASS_EXPORT = 2,
+};
+
+enum {
+  TASK_TRACE_EVT_SWITCH_IN = 1,
+  TASK_TRACE_EVT_SWITCH_OUT = 2,
+  TASK_TRACE_EVT_SYSCALL = 3,
+  TASK_TRACE_EVT_SLEEP = 4,
+  TASK_TRACE_EVT_WAKE = 5,
+  TASK_TRACE_EVT_TERMINATE = 6,
+  TASK_TRACE_EVT_PRIORITY = 7,
+  TASK_TRACE_EVT_KILL = 8,
+};
+
 typedef struct {
   uint32_t esp;
   uint32_t ebp;
@@ -23,6 +40,12 @@ typedef struct {
   uint32_t time_slice;
   uint32_t runtime_ticks;
   uint32_t context_switches;
+  uint32_t priority;
+  uint32_t workload_class;
+  uint32_t trace_enabled;
+  uint32_t trace_last_event;
+  uint32_t trace_last_arg;
+  uint32_t trace_event_count;
   int wait_reason;
   int task_id;
 } TCB;
@@ -32,5 +55,8 @@ extern int os_current_task;
 extern int os_task_count;
 
 void create_task(int index, void (*func_ptr)(), uint32_t page_dir);
+int task_is_valid(int task_id);
+void task_trace_event(int task_id, uint32_t event, uint32_t arg);
+void task_trace_syscall(int task_id, uint32_t syscall_num, uint32_t result);
 
 #endif

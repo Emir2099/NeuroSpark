@@ -3,7 +3,9 @@
 
 KERNEL_OFFSET equ 0x10000
 KERNEL_SEGMENT equ 0x1000
-KERNEL_LOAD_SECTORS equ 120
+; INT 13h extended read commonly allows up to 127 sectors per request.
+; Keep this at 127 to cover current kernel size while avoiding E0E read errors.
+KERNEL_LOAD_SECTORS equ 127
 %define FORCE_TEXT_MODE 0
 
 ; Entry point - BIOS loads us at 0x7c00

@@ -3,6 +3,9 @@
 typedef unsigned int uint32_t;
 typedef unsigned char uint8_t;
 
+#include "task.h"
+#include "scheduler.h"
+
 extern int is_user_range(const void *ptr, uint32_t size);
 
 enum {
@@ -27,6 +30,8 @@ enum {
      */
 #define SYS_CLOSE 6
 #define SYS_FLIP 10
+#define SYS_IPC_SEND 11
+#define SYS_IPC_RECV 12
 
 /* ============================================================
  * Externals
@@ -43,14 +48,11 @@ extern volatile int kb_tail;
 
 /* Task yield */
 extern void task_yield(void);
-extern void irq_lock_acquire(void *lock, unsigned int *flags_out);
-extern void irq_lock_release(void *lock, unsigned int flags);
-
-typedef struct {
-  volatile int locked;
-} irq_lock_t;
+extern int ipc_send(int channel, int value);
+extern int ipc_recv(int channel, int *out_value);
 
 static irq_lock_t kb_lock = {0};
+extern int os_current_task;
 
 static uint32_t syscall_caller_cpl(uint32_t *regs) {
   uint32_t *iret_frame = (uint32_t *)((uint8_t *)regs + (8 * sizeof(uint32_t)));
@@ -97,6 +99,7 @@ void syscall_handler(uint32_t *regs) {
     }
     gprint(msg, 0x00FF00);       /* Green */
     regs[7] = NS_OK;
+    task_trace_syscall(os_current_task, syscall_num, regs[7]);
     break;
   }
 
@@ -105,9 +108,11 @@ void syscall_handler(uint32_t *regs) {
     extern void task_terminate_current(void);
     if (cpl != 3) {
       regs[7] = NS_ERR_PERMISSION;
+      task_trace_syscall(os_current_task, syscall_num, regs[7]);
       break;
     }
     regs[7] = NS_OK;
+    task_trace_syscall(os_current_task, syscall_num, regs[7]);
     task_terminate_current();
     break;
   }
@@ -128,6 +133,7 @@ void syscall_handler(uint32_t *regs) {
       irq_lock_release(&kb_lock, flags);
       regs[7] = (uint32_t)(unsigned char)c; /* Return ASCII code */
     }
+    task_trace_syscall(os_current_task, syscall_num, regs[7]);
     break;
   }
 
@@ -135,6 +141,7 @@ void syscall_handler(uint32_t *regs) {
   case SYS_FLIP: {
     if (cpl == 3) {
       regs[7] = NS_ERR_PERMISSION;
+      task_trace_syscall(os_current_task, syscall_num, regs[7]);
       break;
     }
 
@@ -146,11 +153,41 @@ void syscall_handler(uint32_t *regs) {
     flip_mutex = 0;
     __asm__ volatile("sti");
     regs[7] = NS_OK;
+    task_trace_syscall(os_current_task, syscall_num, regs[7]);
+    break;
+  }
+
+  case SYS_IPC_SEND: {
+    int channel = (int)regs[4];
+    int value = (int)regs[5];
+    if (channel < 0 || channel >= IPC_CHANNELS) {
+      regs[7] = NS_ERR_BAD_POINTER;
+    } else if (ipc_send(channel, value)) {
+      regs[7] = NS_OK;
+    } else {
+      regs[7] = NS_ERR_WOULD_BLOCK;
+    }
+    task_trace_syscall(os_current_task, syscall_num, regs[7]);
+    break;
+  }
+
+  case SYS_IPC_RECV: {
+    int channel = (int)regs[4];
+    int out = 0;
+    if (channel < 0 || channel >= IPC_CHANNELS) {
+      regs[7] = NS_ERR_BAD_POINTER;
+    } else if (ipc_recv(channel, &out)) {
+      regs[7] = (uint32_t)out;
+    } else {
+      regs[7] = NS_ERR_WOULD_BLOCK;
+    }
+    task_trace_syscall(os_current_task, syscall_num, regs[7]);
     break;
   }
 
   default:
     regs[7] = NS_ERR_INVALID_SYSCALL;
+    task_trace_syscall(os_current_task, syscall_num, regs[7]);
     break;
   }
 }

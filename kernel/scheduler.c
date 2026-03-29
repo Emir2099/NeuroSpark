@@ -40,6 +40,41 @@ extern NeuralPixel os_memory_map[2];
 static irq_lock_t scheduler_lock = {0};
 static volatile uint32_t scheduler_ticks = 0;
 
+typedef struct {
+  int queue[IPC_QUEUE_CAPACITY];
+  int head;
+  int tail;
+  int count;
+} ipc_channel_t;
+
+static ipc_channel_t ipc_channels[IPC_CHANNELS];
+static int ipc_initialized = 0;
+
+static void ipc_init_once(void) {
+  if (ipc_initialized) {
+    return;
+  }
+  for (int c = 0; c < IPC_CHANNELS; c++) {
+    ipc_channels[c].head = 0;
+    ipc_channels[c].tail = 0;
+    ipc_channels[c].count = 0;
+    for (int i = 0; i < IPC_QUEUE_CAPACITY; i++) {
+      ipc_channels[c].queue[i] = 0;
+    }
+  }
+  ipc_initialized = 1;
+}
+
+static uint32_t time_slice_for_priority(uint32_t prio) {
+  if (prio == 0) {
+    return 3;
+  }
+  if (prio >= 3) {
+    return 8;
+  }
+  return 5 + prio;
+}
+
 unsigned int irq_save(void) {
   unsigned int flags;
   __asm__ volatile("pushf; pop %0; cli" : "=r"(flags) : : "memory");
@@ -73,16 +108,28 @@ static void scheduler_wake_sleepers_locked(void) {
         os_tasks[i].wake_tick <= scheduler_ticks) {
       os_tasks[i].state = TASK_STATE_READY;
       os_tasks[i].wake_tick = 0;
+      task_trace_event(i, TASK_TRACE_EVT_WAKE, scheduler_ticks);
     }
   }
 }
 
 static int scheduler_pick_next_locked(int old_task) {
+  int best_idx = -1;
+  uint32_t best_prio = 0;
+
   for (int step = 1; step <= os_task_count; step++) {
     int idx = (old_task + step) % os_task_count;
     if (os_tasks[idx].state == TASK_STATE_READY) {
-      return idx;
+      uint32_t prio = os_tasks[idx].priority;
+      if (best_idx < 0 || prio > best_prio) {
+        best_idx = idx;
+        best_prio = prio;
+      }
     }
+  }
+
+  if (best_idx >= 0) {
+    return best_idx;
   }
 
   if (os_tasks[old_task].state == TASK_STATE_RUNNING ||
@@ -118,8 +165,10 @@ static void scheduler_select_and_switch(int force_current_ready) {
 
   os_current_task = new_task;
   os_tasks[new_task].state = TASK_STATE_RUNNING;
-  os_tasks[new_task].time_slice = SCHED_TIME_SLICE_TICKS;
+  os_tasks[new_task].time_slice = time_slice_for_priority(os_tasks[new_task].priority);
   if (new_task != old_task) {
+    task_trace_event(old_task, TASK_TRACE_EVT_SWITCH_OUT, new_task);
+    task_trace_event(new_task, TASK_TRACE_EVT_SWITCH_IN, old_task);
     os_tasks[new_task].context_switches++;
   }
 
@@ -147,6 +196,7 @@ void task_sleep(unsigned int ticks) {
   current = os_current_task;
   os_tasks[current].state = TASK_STATE_SLEEPING;
   os_tasks[current].wake_tick = scheduler_ticks + ticks;
+  task_trace_event(current, TASK_TRACE_EVT_SLEEP, ticks);
   irq_lock_release(&scheduler_lock, flags);
 
   scheduler_select_and_switch(0);
@@ -156,6 +206,7 @@ void task_terminate_current(void) {
   unsigned int flags;
 
   irq_lock_acquire(&scheduler_lock, &flags);
+  task_trace_event(os_current_task, TASK_TRACE_EVT_TERMINATE, 0);
   os_tasks[os_current_task].state = TASK_STATE_TERMINATED;
   irq_lock_release(&scheduler_lock, flags);
 
@@ -195,12 +246,80 @@ void scheduler_timer_tick(void) {
      * Keep round-robin accounting and let normal task yield points switch. */
     irq_lock_acquire(&scheduler_lock, &flags);
     if (os_tasks[current].state == TASK_STATE_RUNNING) {
-      os_tasks[current].time_slice = SCHED_TIME_SLICE_TICKS;
+      os_tasks[current].time_slice = time_slice_for_priority(os_tasks[current].priority);
     }
     irq_lock_release(&scheduler_lock, flags);
   }
 
   profile_end(PROFILE_SLOT_SCHED_TICK, profile_stamp);
+}
+
+uint32_t scheduler_now_ticks(void) { return scheduler_ticks; }
+
+int ipc_send(int channel, int value) {
+  unsigned int flags;
+  ipc_channel_t *ch;
+
+  if (channel < 0 || channel >= IPC_CHANNELS) {
+    return 0;
+  }
+
+  ipc_init_once();
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+  ch = &ipc_channels[channel];
+  if (ch->count >= IPC_QUEUE_CAPACITY) {
+    irq_lock_release(&scheduler_lock, flags);
+    return 0;
+  }
+
+  ch->queue[ch->tail] = value;
+  ch->tail = (ch->tail + 1) % IPC_QUEUE_CAPACITY;
+  ch->count++;
+
+  irq_lock_release(&scheduler_lock, flags);
+  return 1;
+}
+
+int ipc_recv(int channel, int *out_value) {
+  unsigned int flags;
+  ipc_channel_t *ch;
+
+  if (channel < 0 || channel >= IPC_CHANNELS || out_value == 0) {
+    return 0;
+  }
+
+  ipc_init_once();
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+  ch = &ipc_channels[channel];
+  if (ch->count <= 0) {
+    irq_lock_release(&scheduler_lock, flags);
+    return 0;
+  }
+
+  *out_value = ch->queue[ch->head];
+  ch->head = (ch->head + 1) % IPC_QUEUE_CAPACITY;
+  ch->count--;
+
+  irq_lock_release(&scheduler_lock, flags);
+  return 1;
+}
+
+int ipc_queue_depth(int channel) {
+  unsigned int flags;
+  int depth;
+
+  if (channel < 0 || channel >= IPC_CHANNELS) {
+    return -1;
+  }
+
+  ipc_init_once();
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+  depth = ipc_channels[channel].count;
+  irq_lock_release(&scheduler_lock, flags);
+  return depth;
 }
 
 void wait_queue_init(wait_queue_t *queue) {

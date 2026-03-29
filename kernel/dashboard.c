@@ -104,7 +104,7 @@ static char task_state_code(uint32_t state) {
 
 static void draw_hud_telemetry(void) {
   const int y0 = 110;
-  const int y1 = 310;
+  const int y1 = 326;
   const int left_x0 = 0;
   const int left_x1 = 170;
   const int right_x0 = 630;
@@ -322,11 +322,37 @@ static void draw_hud_telemetry(void) {
       gprint(" S:", 0xAACCEE);
       gprint_dec((int)sched_avg, 0xFFFFFF);
     }
+
+    cursor_x = 638;
+    cursor_y = 310;
+    gprint("P0 ", 0xAACCEE);
+    gprint((char[]){task_state_code(os_tasks[0].state), '\0'}, 0x77FFAA);
+    gprint(" pr", 0xAACCEE);
+    gprint_dec((int)os_tasks[0].priority, 0xFFFFFF);
+    gprint(" tr", 0xAACCEE);
+    gprint(os_tasks[0].trace_enabled ? "1" : "0", os_tasks[0].trace_enabled ? 0x44FF88 : 0xFFAA66);
+    gprint(" rt", 0xAACCEE);
+    gprint_dec((int)os_tasks[0].runtime_ticks, 0xFFFFFF);
+
+    cursor_x = 638;
+    cursor_y = 322;
+    if (os_task_count > 1) {
+      gprint("P1 ", 0xAACCEE);
+      gprint((char[]){task_state_code(os_tasks[1].state), '\0'}, 0x77FFAA);
+      gprint(" pr", 0xAACCEE);
+      gprint_dec((int)os_tasks[1].priority, 0xFFFFFF);
+      gprint(" tr", 0xAACCEE);
+      gprint(os_tasks[1].trace_enabled ? "1" : "0", os_tasks[1].trace_enabled ? 0x44FF88 : 0xFFAA66);
+      gprint(" rt", 0xAACCEE);
+      gprint_dec((int)os_tasks[1].runtime_ticks, 0xFFFFFF);
+    } else {
+      gprint("P1 --", 0x666666);
+    }
   }
 }
 
 static void draw_command_overlay(void) {
-  clear_region(0, 346, 800, 448, 0x000A22);
+  clear_region(0, 346, 800, 476, 0x000A22);
   draw_hline(346, 0, 800, 0x223355);
   draw_hline(360, 0, 800, 0x112244);
   draw_hline(374, 0, 800, 0x112244);
@@ -334,6 +360,8 @@ static void draw_command_overlay(void) {
   draw_hline(402, 0, 800, 0x112244);
   draw_hline(416, 0, 800, 0x112244);
   draw_hline(430, 0, 800, 0x112244);
+  draw_hline(444, 0, 800, 0x112244);
+  draw_hline(458, 0, 800, 0x112244);
 
   cursor_x = 4;
   cursor_y = 349;
@@ -360,6 +388,12 @@ static void draw_command_overlay(void) {
   cursor_x = 4;
   cursor_y = 433;
   gprint("PHASE10: model show|select|param  stdp on|off", 0xC9F59A);
+  cursor_x = 4;
+  cursor_y = 447;
+  gprint("PHASE11: ps  kill <pid>  nice <pid> <0..3>  trace <pid> on|off|show", 0xF5C89A);
+  cursor_x = 4;
+  cursor_y = 461;
+  gprint("PHASE11.1: ipc send|recv|stat <ch> [val]", 0xE8B6FF);
 }
 
 void draw_status_bar(void) {
