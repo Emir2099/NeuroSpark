@@ -21,6 +21,8 @@ typedef struct {
   uint32_t state;
   uint32_t wake_tick;
   uint32_t time_slice;
+  uint32_t runtime_ticks;
+  uint32_t context_switches;
   int wait_reason;
   int task_id;
 } TCB;

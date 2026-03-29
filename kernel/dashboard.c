@@ -204,19 +204,30 @@ static void draw_hud_telemetry(void) {
   gprint_dec((int)os_tasks[safe_current_task].time_slice, 0xFFFFFF);
 
   cursor_x = 638;
-  cursor_y = 196;
+  cursor_y = 192;
+  gprint("RT:", 0xAACCEE);
+  gprint_dec((int)os_tasks[safe_current_task].runtime_ticks, 0xFFFFFF);
+  gprint("t", 0xAACCEE);
+
+  cursor_x = 638;
+  cursor_y = 206;
+  gprint("CSW:", 0xAACCEE);
+  gprint_dec((int)os_tasks[safe_current_task].context_switches, 0xFFE066);
+
+  cursor_x = 638;
+  cursor_y = 220;
   gprint("MEM:", 0xAACCEE);
   gprint_dec(free_pages, 0x77FF77);
   gprint(" free", 0xAACCEE);
 
   cursor_x = 638;
-  cursor_y = 210;
+  cursor_y = 234;
   gprint("PRESS:", 0xAACCEE);
   gprint_dec(pressure_pct, 0xFFE066);
   gprint("%", 0xAACCEE);
 
   cursor_x = 638;
-  cursor_y = 228;
+  cursor_y = 248;
   gprint("SNAP:", 0xAACCEE);
   gprint_dec(storage_snapshot_used_count(), 0x88FFCC);
   gprint("/", 0xAACCEE);
@@ -224,7 +235,7 @@ static void draw_hud_telemetry(void) {
   gprint(" slots", 0xAACCEE);
 
   cursor_x = 638;
-  cursor_y = 242;
+  cursor_y = 262;
   gprint("DISK:", 0xAACCEE);
   gprint(ata_disk_available ? "ONLINE" : "OFFLINE",
          ata_disk_available ? 0x77FF77 : 0xFF7777);

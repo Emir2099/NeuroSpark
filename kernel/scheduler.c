@@ -118,6 +118,9 @@ static void scheduler_select_and_switch(int force_current_ready) {
   os_current_task = new_task;
   os_tasks[new_task].state = TASK_STATE_RUNNING;
   os_tasks[new_task].time_slice = SCHED_TIME_SLICE_TICKS;
+  if (new_task != old_task) {
+    os_tasks[new_task].context_switches++;
+  }
 
   irq_lock_release(&scheduler_lock, flags);
 
@@ -172,6 +175,7 @@ void scheduler_timer_tick(void) {
 
   current = os_current_task;
   if (os_tasks[current].state == TASK_STATE_RUNNING) {
+    os_tasks[current].runtime_ticks++;
     if (os_tasks[current].time_slice > 0) {
       os_tasks[current].time_slice--;
     }

@@ -4,9 +4,9 @@
 extern void *pmm_alloc_page(void);
 
 TCB os_tasks[MAX_TASKS] = {
-    {0, 0, 0, 0, TASK_STATE_RUNNING, 0, SCHED_TIME_SLICE_TICKS, 0, 0},
-    {0, 0, 0, 0, TASK_STATE_TERMINATED, 0, SCHED_TIME_SLICE_TICKS, 0, 1},
-    {0, 0, 0, 0, TASK_STATE_TERMINATED, 0, SCHED_TIME_SLICE_TICKS, 0, 2},
+    {0, 0, 0, 0, TASK_STATE_RUNNING, 0, SCHED_TIME_SLICE_TICKS, 0, 0, 0, 0},
+    {0, 0, 0, 0, TASK_STATE_TERMINATED, 0, SCHED_TIME_SLICE_TICKS, 0, 0, 0, 1},
+    {0, 0, 0, 0, TASK_STATE_TERMINATED, 0, SCHED_TIME_SLICE_TICKS, 0, 0, 0, 2},
 };
 int os_current_task = 0;
 int os_task_count = 1;
@@ -40,6 +40,8 @@ void create_task(int index, void (*func_ptr)(), uint32_t page_dir) {
     os_tasks[index].state = TASK_STATE_READY;
     os_tasks[index].wake_tick = 0;
     os_tasks[index].time_slice = SCHED_TIME_SLICE_TICKS;
+    os_tasks[index].runtime_ticks = 0;
+    os_tasks[index].context_switches = 0;
     os_tasks[index].wait_reason = 0;
     os_tasks[index].task_id = index;
 
