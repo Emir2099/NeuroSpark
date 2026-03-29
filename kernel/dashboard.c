@@ -4,6 +4,7 @@
 #include "scheduler.h"
 #include "storage_manager.h"
 #include "net.h"
+#include "profiling.h"
 
 typedef unsigned char uint8_t;
 
@@ -70,6 +71,13 @@ extern void flip_buffer(void);
 extern volatile int flip_mutex;
 
 static uint8_t prev_phase[2] = {0, 0};
+
+static uint32_t metric_avg_cycles(const ProfileMetric *m) {
+  if (m == 0 || m->count == 0) {
+    return 0;
+  }
+  return m->total_cycles / m->count;
+}
 
 static char task_state_code(uint32_t state) {
   if (state == TASK_STATE_RUNNING) {
@@ -242,20 +250,44 @@ static void draw_hud_telemetry(void) {
   gprint(ata_disk_available ? "ONLINE" : "OFFLINE",
          ata_disk_available ? 0x77FF77 : 0xFF7777);
 
+  cursor_x = 638;
+  cursor_y = 276;
+  gprint("NET:", 0xAACCEE);
+  gprint(net_is_ready() ? "ONLINE" : "OFFLINE",
+         net_is_ready() ? 0x77FF77 : 0xFF7777);
+
+  {
+    ProfileSnapshot snap;
+    uint32_t render_avg;
+    uint32_t sched_avg;
+    uint32_t cmd_avg;
+    profile_snapshot(&snap);
+
+    render_avg = metric_avg_cycles(&snap.slots[PROFILE_SLOT_RENDER_PASS]);
+    sched_avg = metric_avg_cycles(&snap.slots[PROFILE_SLOT_SCHED_TICK]);
+    cmd_avg = metric_avg_cycles(&snap.slots[PROFILE_SLOT_COMMAND]);
+
     cursor_x = 638;
-    cursor_y = 276;
-    gprint("NET:", 0xAACCEE);
-    gprint(net_is_ready() ? "ONLINE" : "OFFLINE",
-      net_is_ready() ? 0x77FF77 : 0xFF7777);
+    cursor_y = 290;
+    gprint("PRF:", 0xAACCEE);
+    gprint(snap.enabled ? "ON" : "OFF", snap.enabled ? 0x77FF77 : 0xFFAA66);
+    gprint(" R:", 0xAACCEE);
+    gprint_dec((int)render_avg, 0xFFFFFF);
+    gprint(" C:", 0xAACCEE);
+    gprint_dec((int)cmd_avg, 0xFFFFFF);
+    gprint(" S:", 0xAACCEE);
+    gprint_dec((int)sched_avg, 0xFFFFFF);
+  }
 }
 
 static void draw_command_overlay(void) {
-  clear_region(0, 346, 800, 420, 0x000A22);
+  clear_region(0, 346, 800, 434, 0x000A22);
   draw_hline(346, 0, 800, 0x223355);
   draw_hline(360, 0, 800, 0x112244);
   draw_hline(374, 0, 800, 0x112244);
   draw_hline(388, 0, 800, 0x112244);
   draw_hline(402, 0, 800, 0x112244);
+  draw_hline(416, 0, 800, 0x112244);
 
   cursor_x = 4;
   cursor_y = 349;
@@ -276,6 +308,9 @@ static void draw_command_overlay(void) {
   cursor_y = 405;
   gprint("PHASE8: manifest save|load|show  replay rec on|off|run  dataset export|import",
          0xA0E0FF);
+  cursor_x = 4;
+  cursor_y = 419;
+  gprint("PHASE9: profile on|off|show|reset|export <path>", 0x9AF0C8);
 }
 
 void draw_status_bar(void) {
@@ -459,6 +494,8 @@ void shell_render(void) {
 
 void neuro_task_entry(void) {
   while (1) {
+    uint32_t render_profile_stamp = profile_begin();
+
     pulse_neurons();
 
     clear_region(0, 102, 800, 310, 0x000033);
@@ -480,6 +517,8 @@ void neuro_task_entry(void) {
     flip_buffer();
     flip_mutex = 0;
     __asm__ volatile("sti");
+
+    profile_end(PROFILE_SLOT_RENDER_PASS, render_profile_stamp);
 
     for (volatile int d = 0; d < 400000; d++)
       ;

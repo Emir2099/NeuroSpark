@@ -6,6 +6,7 @@
 #include "vfs.h"
 #include "usermode.h"
 #include "net.h"
+#include "profiling.h"
 
 typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
@@ -267,8 +268,120 @@ static void cmd_help(const char *args) {
   gprint("          exec <path> mkdemo net net tx net export <slot>\n", 0xFFFFFF);
   gprint("phase8:   manifest save|load|show  replay rec on|off|run|show|clear\n", 0x88E0FF);
   gprint("          dataset export <path>  dataset import <path>\n", 0x88E0FF);
+  gprint("phase9:   profile on|off|show|reset|export <path>\n", 0x88E0FF);
   gprint("phase6:   synview synset synrule synpreset syncmp\n", 0x77C8FF);
   gprint("          sbrowse spreview stag sdiff\n", 0x77C8FF);
+}
+
+static uint32_t metric_avg_cycles(const ProfileMetric *m) {
+  if (m == 0 || m->count == 0) {
+    return 0;
+  }
+  return m->total_cycles / m->count;
+}
+
+static uint32_t metric_min_cycles(const ProfileMetric *m) {
+  if (m == 0 || m->count == 0) {
+    return 0;
+  }
+  return m->min_cycles;
+}
+
+static uint32_t metric_max_cycles(const ProfileMetric *m) {
+  if (m == 0 || m->count == 0) {
+    return 0;
+  }
+  return m->max_cycles;
+}
+
+static void cmd_profile(const char *args) {
+  char sub[12];
+  char path[48];
+  ProfileSnapshot snap;
+
+  args = next_token(args, sub, sizeof(sub));
+  next_token(args, path, sizeof(path));
+
+  if (sub[0] == '\0' || str_eq(sub, "show")) {
+    profile_snapshot(&snap);
+    gprint("PROFILE ", 0x99EEFF);
+    gprint(snap.enabled ? "ON" : "OFF", snap.enabled ? 0x44FF88 : 0xFFAA66);
+    gprint("\n", 0x000000);
+
+    gprint("RENDER  avg:", 0xAACCEE);
+    gprint_dec((int)metric_avg_cycles(&snap.slots[PROFILE_SLOT_RENDER_PASS]), 0xFFFFFF);
+    gprint(" min:", 0xAACCEE);
+    gprint_dec((int)metric_min_cycles(&snap.slots[PROFILE_SLOT_RENDER_PASS]), 0xFFFFFF);
+    gprint(" max:", 0xAACCEE);
+    gprint_dec((int)metric_max_cycles(&snap.slots[PROFILE_SLOT_RENDER_PASS]), 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("SCHED   avg:", 0xAACCEE);
+    gprint_dec((int)metric_avg_cycles(&snap.slots[PROFILE_SLOT_SCHED_TICK]), 0xFFFFFF);
+    gprint(" min:", 0xAACCEE);
+    gprint_dec((int)metric_min_cycles(&snap.slots[PROFILE_SLOT_SCHED_TICK]), 0xFFFFFF);
+    gprint(" max:", 0xAACCEE);
+    gprint_dec((int)metric_max_cycles(&snap.slots[PROFILE_SLOT_SCHED_TICK]), 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("SPIKE   avg:", 0xAACCEE);
+    gprint_dec((int)metric_avg_cycles(&snap.slots[PROFILE_SLOT_SPIKE_UPDATE]), 0xFFFFFF);
+    gprint(" min:", 0xAACCEE);
+    gprint_dec((int)metric_min_cycles(&snap.slots[PROFILE_SLOT_SPIKE_UPDATE]), 0xFFFFFF);
+    gprint(" max:", 0xAACCEE);
+    gprint_dec((int)metric_max_cycles(&snap.slots[PROFILE_SLOT_SPIKE_UPDATE]), 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("CMD     avg:", 0xAACCEE);
+    gprint_dec((int)metric_avg_cycles(&snap.slots[PROFILE_SLOT_COMMAND]), 0xFFFFFF);
+    gprint(" min:", 0xAACCEE);
+    gprint_dec((int)metric_min_cycles(&snap.slots[PROFILE_SLOT_COMMAND]), 0xFFFFFF);
+    gprint(" max:", 0xAACCEE);
+    gprint_dec((int)metric_max_cycles(&snap.slots[PROFILE_SLOT_COMMAND]), 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("HIST <50k/200k/500k/1M/>1M: ", 0x99EEFF);
+    for (int i = 0; i < PROFILE_CMD_HIST_BUCKETS; i++) {
+      gprint_dec((int)snap.cmd_hist[i], 0xFFFFFF);
+      if (i != PROFILE_CMD_HIST_BUCKETS - 1) {
+        gprint("/", 0x666666);
+      }
+    }
+    gprint("\n", 0x000000);
+    return;
+  }
+
+  if (str_eq(sub, "on")) {
+    profile_set_enabled(1);
+    set_cmd_output("PROFILE ON");
+    return;
+  }
+
+  if (str_eq(sub, "off")) {
+    profile_set_enabled(0);
+    set_cmd_output("PROFILE OFF");
+    return;
+  }
+
+  if (str_eq(sub, "reset")) {
+    profile_reset();
+    set_cmd_output("PROFILE RESET");
+    return;
+  }
+
+  if (str_eq(sub, "export")) {
+    if (path[0] == '\0') {
+      copy_cmd_text(path, "/profile.prf", sizeof(path));
+    }
+    if (profile_export(path)) {
+      set_cmd_output("PROFILE EXPORTED");
+    } else {
+      set_cmd_output("PROFILE EXPORT FAIL");
+    }
+    return;
+  }
+
+  set_cmd_output("USAGE: profile on|off|show|reset|export <path>");
 }
 
 static void cmd_manifest(const char *args) {
@@ -1142,6 +1255,7 @@ static const CommandEntry command_table[] = {
     {"zpan-", cmd_zpanm},
     {"wipe", cmd_wipe},
     {"net", cmd_net},
+    {"profile", cmd_profile},
     {"manifest", cmd_manifest},
     {"dataset", cmd_dataset},
     {"replay", cmd_replay},
@@ -1160,6 +1274,8 @@ static const CommandEntry command_table[] = {
 
 void process_command(char *cmd) {
   char name[16];
+  uint32_t cmd_stamp = profile_begin();
+  uint32_t cmd_delta = 0;
   int i = 0;
   while (cmd[i] == ' ') {
     i++;
@@ -1178,7 +1294,7 @@ void process_command(char *cmd) {
   if (name[0] == '\0') {
     extern void set_cmd_output(const char *);
     set_cmd_output("EMPTY COMMAND");
-    return;
+    goto done;
   }
 
   const char *args = "";
@@ -1188,7 +1304,7 @@ void process_command(char *cmd) {
   for (unsigned int k = 0; k < sizeof(command_table) / sizeof(command_table[0]); k++) {
     if (str_eq(name, command_table[k].name)) {
       command_table[k].handler(args);
-      return;
+      goto done;
     }
   }
 
@@ -1197,4 +1313,8 @@ void process_command(char *cmd) {
     set_cmd_output("UNKNOWN COMMAND");
   }
   klog_warn("unknown command");
+
+done:
+  cmd_delta = profile_end_and_get(PROFILE_SLOT_COMMAND, cmd_stamp);
+  profile_record_command(cmd_delta);
 }

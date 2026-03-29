@@ -1,4 +1,5 @@
 #include "scheduler.h"
+#include "profiling.h"
 
 typedef unsigned int uint32_t;
 
@@ -168,6 +169,7 @@ void scheduler_timer_tick(void) {
   int should_preempt = 0;
   unsigned int flags;
   int current;
+  uint32_t profile_stamp = profile_begin();
 
   irq_lock_acquire(&scheduler_lock, &flags);
   scheduler_ticks++;
@@ -197,6 +199,8 @@ void scheduler_timer_tick(void) {
     }
     irq_lock_release(&scheduler_lock, flags);
   }
+
+  profile_end(PROFILE_SLOT_SCHED_TICK, profile_stamp);
 }
 
 void wait_queue_init(wait_queue_t *queue) {

@@ -263,6 +263,7 @@ extern void draw_cursor(uint32_t tick);
 #include "usermode.h"
 #include "vfs.h"
 #include "net.h"
+#include "profiling.h"
 
 volatile int current_shell_row = SHELL_START_ROW;
 
@@ -467,6 +468,7 @@ void timer_handler(void) {
   }
   
   unsigned short *video = (unsigned short *)0xB8000;
+  uint32_t spike_profile_stamp = profile_begin();
 
   // Iterate through each Pixelated Cluster
   for (int p = 0; p < PIXELS_COUNT; p++) {
@@ -602,6 +604,8 @@ void timer_handler(void) {
   if (tick % 10 == 0) { // Update monitor every 10 ticks to save cycles
     update_monitor();
   }
+
+  profile_end(PROFILE_SLOT_SPIKE_UPDATE, spike_profile_stamp);
 
   /* Scheduler quantum accounting and preemption point (IRQ0 driven). */
   scheduler_timer_tick();
@@ -2007,6 +2011,7 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
   ata_disk_available = ata_detect_disk();
 
   vfs_init();
+  profile_init();
 
   if (graphics_enabled) {
     /* Hardware graphics init */
