@@ -1,8 +1,10 @@
 #include "storage_manager.h"
 #include "disk.h"
 #include "klog.h"
+#include "vfs.h"
 
 typedef unsigned int uint32_t;
+typedef unsigned short uint16_t;
 
 typedef struct {
   int voltage;
@@ -43,14 +45,39 @@ typedef struct {
   int thresholds[5];
 } VirtualFile;
 
-extern volatile VirtualFile synapse_disk[4];
-extern TaskControlBlock task_list[2];
-extern NeuralPixel os_memory_map[2];
-extern void disk_write_sector(uint32_t lba, unsigned short *buffer);
-extern void disk_read_sector(uint32_t lba, unsigned short *buffer);
-
 #define SNAPSHOT_SLOTS 4
 #define SNAPSHOT_TAG_LEN 16
+#define MANIFEST_MAGIC 0x4D463838 /* MF88 */
+#define DATASET_MAGIC 0x44533838  /* DS88 */
+
+typedef struct {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t tick;
+  int zoom_level;
+  int zoom_offset;
+  int task_base_integration[2];
+  int task_fire_threshold[2];
+  int task_target_pixel[2];
+  int potentials[16];
+  uint32_t snapshot_used_mask;
+  char lineage_tags[SNAPSHOT_SLOTS][SNAPSHOT_TAG_LEN];
+} SessionManifest;
+
+typedef struct {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t slots;
+  VirtualFile files[SNAPSHOT_SLOTS];
+} DatasetBlob;
+
+extern volatile VirtualFile synapse_disk[SNAPSHOT_SLOTS];
+extern TaskControlBlock task_list[2];
+extern NeuralPixel os_memory_map[2];
+extern uint32_t tick;
+extern int zoom_level;
+extern int zoom_offset;
+extern int potentials[16];
 
 static void copy_bytes(void *dst, const void *src, int len) {
   unsigned char *d = (unsigned char *)dst;
@@ -76,8 +103,48 @@ static void copy_text(char *dst, const char *src, int max_len) {
   dst[i] = '\0';
 }
 
+static void append_text(char *out, int out_len, int *cursor, const char *text) {
+  int i = 0;
+  if (out == 0 || cursor == 0 || text == 0 || out_len <= 0)
+    return;
+  while (text[i] && *cursor < out_len - 1) {
+    out[*cursor] = text[i];
+    (*cursor)++;
+    i++;
+  }
+  out[*cursor] = '\0';
+}
+
+static void append_dec(char *out, int out_len, int *cursor, int value) {
+  char tmp[16];
+  int i = 0;
+  int neg = 0;
+
+  if (value == 0) {
+    append_text(out, out_len, cursor, "0");
+    return;
+  }
+  if (value < 0) {
+    neg = 1;
+    value = -value;
+  }
+  while (value > 0 && i < 15) {
+    tmp[i++] = (char)('0' + (value % 10));
+    value /= 10;
+  }
+  if (neg && i < 15) {
+    tmp[i++] = '-';
+  }
+  while (i > 0) {
+    char c[2];
+    c[0] = tmp[--i];
+    c[1] = '\0';
+    append_text(out, out_len, cursor, c);
+  }
+}
+
 void sys_save_task(int task_id, int slot) {
-  if (slot < 0 || slot >= SNAPSHOT_SLOTS)
+  if (slot < 0 || slot >= SNAPSHOT_SLOTS || task_id < 0 || task_id > 1)
     return;
 
   volatile VirtualFile *f = &synapse_disk[slot];
@@ -91,11 +158,13 @@ void sys_save_task(int task_id, int slot) {
     f->snapshot_tag[0] = '\0';
   }
 
-  int px = t->target_pixel;
-  for (int n = 0; n < 5; n++) {
-    f->voltages[n] = os_memory_map[px].neurons[n].voltage;
-    f->weights[n] = os_memory_map[px].neurons[n].synaptic_weight;
-    f->thresholds[n] = os_memory_map[px].neurons[n].dynamic_threshold;
+  {
+    int px = t->target_pixel;
+    for (int n = 0; n < 5; n++) {
+      f->voltages[n] = os_memory_map[px].neurons[n].voltage;
+      f->weights[n] = os_memory_map[px].neurons[n].synaptic_weight;
+      f->thresholds[n] = os_memory_map[px].neurons[n].dynamic_threshold;
+    }
   }
 
   __asm__ volatile("" ::: "memory");
@@ -114,7 +183,7 @@ void sys_save_task(int task_id, int slot) {
 }
 
 int sys_load_task(int task_id, int slot) {
-  if (slot < 0 || slot >= SNAPSHOT_SLOTS)
+  if (slot < 0 || slot >= SNAPSHOT_SLOTS || task_id < 0 || task_id > 1)
     return 0;
 
   if (ata_disk_available) {
@@ -129,18 +198,20 @@ int sys_load_task(int task_id, int slot) {
   if (!synapse_disk[slot].is_used)
     return 0;
 
-  volatile VirtualFile *f = &synapse_disk[slot];
-  TaskControlBlock *t = &task_list[task_id];
+  {
+    volatile VirtualFile *f = &synapse_disk[slot];
+    TaskControlBlock *t = &task_list[task_id];
+    int px = t->target_pixel;
 
-  int px = t->target_pixel;
-  for (int n = 0; n < 5; n++) {
-    os_memory_map[px].neurons[n].voltage = f->voltages[n];
-    os_memory_map[px].neurons[n].synaptic_weight = f->weights[n];
-    os_memory_map[px].neurons[n].dynamic_threshold = f->thresholds[n];
+    for (int n = 0; n < 5; n++) {
+      os_memory_map[px].neurons[n].voltage = f->voltages[n];
+      os_memory_map[px].neurons[n].synaptic_weight = f->weights[n];
+      os_memory_map[px].neurons[n].dynamic_threshold = f->thresholds[n];
 
-    t->saved_voltages[n] = f->voltages[n];
-    t->saved_weights[n] = f->weights[n];
-    t->saved_thresholds[n] = f->thresholds[n];
+      t->saved_voltages[n] = f->voltages[n];
+      t->saved_weights[n] = f->weights[n];
+      t->saved_thresholds[n] = f->thresholds[n];
+    }
   }
 
   klog_info("snapshot loaded");
@@ -157,9 +228,7 @@ int storage_snapshot_used_count(void) {
   return used;
 }
 
-int storage_snapshot_capacity(void) {
-  return SNAPSHOT_SLOTS;
-}
+int storage_snapshot_capacity(void) { return SNAPSHOT_SLOTS; }
 
 int storage_set_snapshot_tag(int slot, const char *tag) {
   if (slot < 0 || slot >= SNAPSHOT_SLOTS || tag == 0 || tag[0] == '\0') {
@@ -240,5 +309,170 @@ int storage_diff_snapshots(int slot_a, int slot_b, int *voltage_delta,
   *voltage_delta = av - bv;
   *weight_delta = aw - bw;
   *threshold_delta = at - bt;
+  return 1;
+}
+
+int storage_manifest_save(const char *path) {
+  SessionManifest mf;
+
+  if (path == 0 || path[0] == '\0')
+    return 0;
+
+  mf.magic = MANIFEST_MAGIC;
+  mf.version = 1;
+  mf.tick = tick;
+  mf.zoom_level = zoom_level;
+  mf.zoom_offset = zoom_offset;
+
+  for (int t = 0; t < 2; t++) {
+    mf.task_base_integration[t] = task_list[t].base_integration;
+    mf.task_fire_threshold[t] = task_list[t].fire_threshold;
+    mf.task_target_pixel[t] = task_list[t].target_pixel;
+  }
+
+  for (int i = 0; i < 16; i++) {
+    mf.potentials[i] = potentials[i];
+  }
+
+  mf.snapshot_used_mask = 0;
+  for (int s = 0; s < SNAPSHOT_SLOTS; s++) {
+    if (synapse_disk[s].is_used) {
+      mf.snapshot_used_mask |= (1u << s);
+    }
+    copy_text(mf.lineage_tags[s], (const char *)synapse_disk[s].snapshot_tag,
+              SNAPSHOT_TAG_LEN);
+  }
+
+  return vfs_write_file(path, &mf, sizeof(mf)) == (int)sizeof(mf);
+}
+
+int storage_manifest_load(const char *path) {
+  SessionManifest mf;
+  int n;
+
+  if (path == 0 || path[0] == '\0')
+    return 0;
+
+  n = vfs_read_file(path, &mf, sizeof(mf));
+  if (n < (int)sizeof(mf))
+    return 0;
+  if (mf.magic != MANIFEST_MAGIC || mf.version != 1)
+    return 0;
+
+  zoom_level = mf.zoom_level;
+  if (zoom_level < 1)
+    zoom_level = 1;
+  if (zoom_level > 4)
+    zoom_level = 4;
+
+  zoom_offset = mf.zoom_offset;
+  if (zoom_offset < 0)
+    zoom_offset = 0;
+  if (zoom_offset > 15)
+    zoom_offset = 15;
+
+  for (int t = 0; t < 2; t++) {
+    task_list[t].base_integration = mf.task_base_integration[t];
+    task_list[t].fire_threshold = mf.task_fire_threshold[t];
+    task_list[t].target_pixel = mf.task_target_pixel[t];
+  }
+
+  for (int i = 0; i < 16; i++) {
+    potentials[i] = mf.potentials[i];
+  }
+
+  for (int s = 0; s < SNAPSHOT_SLOTS; s++) {
+    copy_text((char *)synapse_disk[s].snapshot_tag, mf.lineage_tags[s],
+              SNAPSHOT_TAG_LEN);
+  }
+
+  return 1;
+}
+
+int storage_manifest_summary(char *out, int out_len) {
+  int cursor = 0;
+  int used = storage_snapshot_used_count();
+
+  if (out == 0 || out_len <= 0)
+    return 0;
+
+  out[0] = '\0';
+  append_text(out, out_len, &cursor, "tick=");
+  append_dec(out, out_len, &cursor, (int)tick);
+  append_text(out, out_len, &cursor, " zoom=");
+  append_dec(out, out_len, &cursor, zoom_level);
+  append_text(out, out_len, &cursor, "x@");
+  append_dec(out, out_len, &cursor, zoom_offset);
+  append_text(out, out_len, &cursor, " snaps=");
+  append_dec(out, out_len, &cursor, used);
+  append_text(out, out_len, &cursor, "/");
+  append_dec(out, out_len, &cursor, storage_snapshot_capacity());
+  append_text(out, out_len, &cursor, " lineage=");
+
+  for (int s = 0; s < SNAPSHOT_SLOTS; s++) {
+    if (!synapse_disk[s].is_used)
+      continue;
+    append_text(out, out_len, &cursor, "S");
+    append_dec(out, out_len, &cursor, s);
+    append_text(out, out_len, &cursor, "[");
+    if (synapse_disk[s].snapshot_tag[0]) {
+      append_text(out, out_len, &cursor,
+                  (const char *)synapse_disk[s].snapshot_tag);
+    } else {
+      append_text(out, out_len, &cursor, "-");
+    }
+    append_text(out, out_len, &cursor, "]");
+  }
+
+  return 1;
+}
+
+int storage_dataset_export(const char *path) {
+  DatasetBlob blob;
+
+  if (path == 0 || path[0] == '\0')
+    return 0;
+
+  blob.magic = DATASET_MAGIC;
+  blob.version = 1;
+  blob.slots = SNAPSHOT_SLOTS;
+
+  for (int s = 0; s < SNAPSHOT_SLOTS; s++) {
+    copy_bytes(&blob.files[s], (const void *)&synapse_disk[s],
+               (int)sizeof(VirtualFile));
+  }
+
+  return vfs_write_file(path, &blob, sizeof(blob)) == (int)sizeof(blob);
+}
+
+int storage_dataset_import(const char *path) {
+  DatasetBlob blob;
+  int n;
+
+  if (path == 0 || path[0] == '\0')
+    return 0;
+
+  n = vfs_read_file(path, &blob, sizeof(blob));
+  if (n < (int)sizeof(blob))
+    return 0;
+  if (blob.magic != DATASET_MAGIC || blob.version != 1 ||
+      blob.slots != SNAPSHOT_SLOTS) {
+    return 0;
+  }
+
+  for (int s = 0; s < SNAPSHOT_SLOTS; s++) {
+    copy_bytes((void *)&synapse_disk[s], &blob.files[s], (int)sizeof(VirtualFile));
+
+    if (ata_disk_available) {
+      uint16_t sector_buf[256];
+      for (int i = 0; i < 256; i++) {
+        sector_buf[i] = 0;
+      }
+      copy_bytes((void *)sector_buf, (const void *)&synapse_disk[s],
+                 (int)sizeof(VirtualFile));
+      disk_write_sector(DISK_DATA_OFFSET + s, sector_buf);
+    }
+  }
+
   return 1;
 }

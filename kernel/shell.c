@@ -66,6 +66,8 @@ extern void disk_read_sector(uint32_t lba, uint16_t *buffer);
 extern void pci_print_results(void);
 extern void set_cmd_output(const char *text);
 
+void process_command(char *cmd);
+
 static int str_eq(const char *a, const char *b) {
   int i = 0;
   while (a[i] && b[i]) {
@@ -164,6 +166,42 @@ static int abs_i32(int v) {
   return v;
 }
 
+#define REPLAY_MAX_CMDS 64
+static char replay_cmds[REPLAY_MAX_CMDS][32];
+static int replay_count = 0;
+static int replay_recording = 0;
+static int replay_running = 0;
+
+static void copy_cmd_text(char *dst, const char *src, int max_len) {
+  int i = 0;
+  if (dst == 0 || max_len <= 0) {
+    return;
+  }
+  if (src == 0) {
+    dst[0] = '\0';
+    return;
+  }
+  while (src[i] && i < max_len - 1) {
+    dst[i] = src[i];
+    i++;
+  }
+  dst[i] = '\0';
+}
+
+static void replay_record_command(const char *cmd) {
+  if (!replay_recording || replay_running || cmd == 0) {
+    return;
+  }
+  if (cmd[0] == 'r' && cmd[1] == 'e' && cmd[2] == 'p' && cmd[3] == 'l' &&
+      cmd[4] == 'a' && cmd[5] == 'y' && (cmd[6] == '\0' || cmd[6] == ' ')) {
+    return;
+  }
+  if (replay_count < REPLAY_MAX_CMDS) {
+    copy_cmd_text(replay_cmds[replay_count], cmd, 32);
+    replay_count++;
+  }
+}
+
 static int preset_profile(const char *preset, int *weight_delta, int *thr_delta,
                           int *base_integration, int *fire_threshold) {
   if (str_ieq(preset, "calm")) {
@@ -227,8 +265,149 @@ static void cmd_help(const char *args) {
   gprint("commands: help save load ls clear eval stim mall free map\n", 0xFFFFFF);
   gprint("          tsave tload pci pci bar zoom+ zoom- zpan+ zpan- wipe\n", 0xFFFFFF);
   gprint("          exec <path> mkdemo net net tx net export <slot>\n", 0xFFFFFF);
+  gprint("phase8:   manifest save|load|show  replay rec on|off|run|show|clear\n", 0x88E0FF);
+  gprint("          dataset export <path>  dataset import <path>\n", 0x88E0FF);
   gprint("phase6:   synview synset synrule synpreset syncmp\n", 0x77C8FF);
   gprint("          sbrowse spreview stag sdiff\n", 0x77C8FF);
+}
+
+static void cmd_manifest(const char *args) {
+  char sub[12];
+  char path[48];
+  args = next_token(args, sub, sizeof(sub));
+  next_token(args, path, sizeof(path));
+
+  if (sub[0] == '\0' || str_eq(sub, "show")) {
+    char summary[160];
+    if (storage_manifest_summary(summary, sizeof(summary))) {
+      gprint("MANIFEST: ", 0x99EEFF);
+      gprint(summary, 0xFFFFFF);
+      gprint("\n", 0x000000);
+    } else {
+      gprint("ERR: manifest summary unavailable\n", 0xFF5555);
+    }
+    return;
+  }
+
+  if (path[0] == '\0') {
+    copy_cmd_text(path, "/session.manifest", sizeof(path));
+  }
+
+  if (str_eq(sub, "save")) {
+    if (storage_manifest_save(path)) {
+      set_cmd_output("MANIFEST SAVED");
+    } else {
+      set_cmd_output("MANIFEST SAVE FAIL");
+    }
+    return;
+  }
+
+  if (str_eq(sub, "load")) {
+    if (storage_manifest_load(path)) {
+      set_cmd_output("MANIFEST LOADED");
+    } else {
+      set_cmd_output("MANIFEST LOAD FAIL");
+    }
+    return;
+  }
+
+  set_cmd_output("USAGE: manifest [show|save|load] [path]");
+}
+
+static void cmd_dataset(const char *args) {
+  char sub[12];
+  char path[48];
+  args = next_token(args, sub, sizeof(sub));
+  next_token(args, path, sizeof(path));
+
+  if (sub[0] == '\0') {
+    set_cmd_output("USAGE: dataset export|import <path>");
+    return;
+  }
+  if (path[0] == '\0') {
+    copy_cmd_text(path, "/snapshot.ds8", sizeof(path));
+  }
+
+  if (str_eq(sub, "export")) {
+    if (storage_dataset_export(path)) {
+      set_cmd_output("DATASET EXPORTED");
+    } else {
+      set_cmd_output("DATASET EXPORT FAIL");
+    }
+    return;
+  }
+
+  if (str_eq(sub, "import")) {
+    if (storage_dataset_import(path)) {
+      set_cmd_output("DATASET IMPORTED");
+    } else {
+      set_cmd_output("DATASET IMPORT FAIL");
+    }
+    return;
+  }
+
+  set_cmd_output("USAGE: dataset export|import <path>");
+}
+
+static void cmd_replay(const char *args) {
+  char sub[12];
+  args = next_token(args, sub, sizeof(sub));
+
+  if (sub[0] == '\0' || str_eq(sub, "show")) {
+    gprint("REPLAY ", 0x99EEFF);
+    gprint(replay_recording ? "REC-ON" : "REC-OFF", replay_recording ? 0x44FF88 : 0xFFAA66);
+    gprint(" COUNT:", 0x99EEFF);
+    gprint_dec(replay_count, 0xFFFFFF);
+    gprint("\n", 0x000000);
+    for (int i = 0; i < replay_count; i++) {
+      gprint("#", 0x666666);
+      gprint_dec(i, 0xFFFFFF);
+      gprint(": ", 0x666666);
+      gprint(replay_cmds[i], 0x77C8FF);
+      gprint("\n", 0x000000);
+    }
+    return;
+  }
+
+  if (str_eq(sub, "clear")) {
+    replay_count = 0;
+    set_cmd_output("REPLAY CLEARED");
+    return;
+  }
+
+  if (str_eq(sub, "rec")) {
+    char mode[8];
+    next_token(args, mode, sizeof(mode));
+    if (str_eq(mode, "on")) {
+      replay_recording = 1;
+      set_cmd_output("REPLAY REC ON");
+    } else if (str_eq(mode, "off")) {
+      replay_recording = 0;
+      set_cmd_output("REPLAY REC OFF");
+    } else {
+      set_cmd_output("USAGE: replay rec on|off");
+    }
+    return;
+  }
+
+  if (str_eq(sub, "run")) {
+    if (replay_count == 0) {
+      set_cmd_output("REPLAY EMPTY");
+      return;
+    }
+
+    replay_running = 1;
+    for (int i = 0; i < replay_count; i++) {
+      char cmd_copy[32];
+      copy_cmd_text(cmd_copy, replay_cmds[i], sizeof(cmd_copy));
+      process_command(cmd_copy);
+    }
+    replay_running = 0;
+    set_cmd_output("REPLAY COMPLETE");
+    return;
+  }
+
+  set_cmd_output("USAGE: replay rec on|off|run|show|clear");
 }
 
 static void cmd_net(const char *args) {
@@ -963,6 +1142,9 @@ static const CommandEntry command_table[] = {
     {"zpan-", cmd_zpanm},
     {"wipe", cmd_wipe},
     {"net", cmd_net},
+    {"manifest", cmd_manifest},
+    {"dataset", cmd_dataset},
+    {"replay", cmd_replay},
     {"exec", cmd_exec},
     {"mkdemo", cmd_mkdemo},
     {"synview", cmd_synview},
@@ -982,6 +1164,8 @@ void process_command(char *cmd) {
   while (cmd[i] == ' ') {
     i++;
   }
+
+  replay_record_command(cmd + i);
 
   int n = 0;
   while (cmd[i] && cmd[i] != ' ' && n < 15) {

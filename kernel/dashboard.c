@@ -250,11 +250,12 @@ static void draw_hud_telemetry(void) {
 }
 
 static void draw_command_overlay(void) {
-  clear_region(0, 346, 800, 404, 0x000A22);
+  clear_region(0, 346, 800, 420, 0x000A22);
   draw_hline(346, 0, 800, 0x223355);
   draw_hline(360, 0, 800, 0x112244);
   draw_hline(374, 0, 800, 0x112244);
   draw_hline(388, 0, 800, 0x112244);
+  draw_hline(402, 0, 800, 0x112244);
 
   cursor_x = 4;
   cursor_y = 349;
@@ -271,6 +272,10 @@ static void draw_command_overlay(void) {
   cursor_x = 4;
   cursor_y = 391;
   gprint("NET: net status | net tx | net export <slot>", 0x88E0FF);
+  cursor_x = 4;
+  cursor_y = 405;
+  gprint("PHASE8: manifest save|load|show  replay rec on|off|run  dataset export|import",
+         0xA0E0FF);
 }
 
 void draw_status_bar(void) {
