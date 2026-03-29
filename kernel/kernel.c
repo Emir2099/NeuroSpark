@@ -264,6 +264,7 @@ extern void draw_cursor(uint32_t tick);
 #include "vfs.h"
 #include "net.h"
 #include "profiling.h"
+#include "model_manager.h"
 
 volatile int current_shell_row = SHELL_START_ROW;
 
@@ -501,21 +502,24 @@ void timer_handler(void) {
       // If the pixel is RIGID (Phase 1), we still use a hardcoded dampener (10)
       // to ensure stability. If it is FLUID (Phase 0), we use the dynamic
       // 'base_integration' from the TCB.
-      int base_gain = (os_memory_map[p].current_phase == 1)
-                          ? 10
-                          : current_task->base_integration;
+        int base_gain = (os_memory_map[p].current_phase == 1)
+                  ? 10
+                  : current_task->base_integration;
+        int task_idx = current_task->task_id;
+        int adjusted_gain =
+          model_adjust_base_gain(task_idx, i, base_gain, tick);
 
       // --- CONSOLIDATED INTEGRATION LOGIC ---
       // We apply task-specific rhythms based on the TASK assigned to this pixel
       if (current_task->task_id == TASK_IO) {
         // I/O Pixel: Fires based on high-frequency external stimulus
         if (tick % (i + 2) == 0)
-          n->voltage += base_gain;
+          n->voltage += adjusted_gain;
       } else {
         // Compute Pixel: Fires in a slow, stable rhythmic pulse
         // if (tick % 20 == 0) n->voltage += (base_gain / 2);
         if (tick % 4 == 0)
-          n->voltage += 25;
+          n->voltage += (adjusted_gain / 2) + 10;
       }
 
       // 2. Leakage (Bio-decay)
@@ -532,21 +536,19 @@ void timer_handler(void) {
       if (n->voltage >= n->dynamic_threshold) {
         n->voltage = 0;
         n->spike_count++;
-        n->refractory_timer = REFRACTORY_TICKS; // Enter recovery
+        n->refractory_timer = model_get_refractory_ticks(task_idx, i);
 
         // ADAPTATION: Increase threshold on every spike (Heavier to fire again)
         if (n->dynamic_threshold < 5000) {
-          n->dynamic_threshold += 200;
+          n->dynamic_threshold += model_get_threshold_raise_step(task_idx, i);
         }
 
         // Propagate within the same pixel cluster
         int next = (i + 1) % NEURONS_PER_PIXEL;
         os_memory_map[p].neurons[next].voltage += n->synaptic_weight;
 
-        // Hebbian Learning: Strengthen the synapse (Plasticity)
-        if (n->synaptic_weight < 800) {
-          n->synaptic_weight += 10;
-        }
+        // Model-specific plasticity and optional STDP update.
+        model_on_spike(task_idx, p, i);
 
         unsigned char color = 0x1A; // Default Green on Blue
         if (n->synaptic_weight > 500)
@@ -559,7 +561,7 @@ void timer_handler(void) {
         // --- HOMEOSTASIS ---
         // Slowly lower the threshold back to base THRESHOLD over time
         if (tick % 50 == 0 && n->dynamic_threshold > THRESHOLD) {
-          n->dynamic_threshold -= 50;
+          n->dynamic_threshold -= model_get_threshold_decay_step(task_idx, i);
         }
 
         // Visualize potential levels
@@ -2001,6 +2003,9 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
       task_list[t].saved_thresholds[n] = THRESHOLD;
     }
   }
+
+  /* Model parameters must be initialized before IRQ0 starts firing. */
+  model_manager_init();
 
   /* Setup the NeuroCore pulse */
   init_timer(100); /* 100Hz frequency */

@@ -326,13 +326,14 @@ static void draw_hud_telemetry(void) {
 }
 
 static void draw_command_overlay(void) {
-  clear_region(0, 346, 800, 434, 0x000A22);
+  clear_region(0, 346, 800, 448, 0x000A22);
   draw_hline(346, 0, 800, 0x223355);
   draw_hline(360, 0, 800, 0x112244);
   draw_hline(374, 0, 800, 0x112244);
   draw_hline(388, 0, 800, 0x112244);
   draw_hline(402, 0, 800, 0x112244);
   draw_hline(416, 0, 800, 0x112244);
+  draw_hline(430, 0, 800, 0x112244);
 
   cursor_x = 4;
   cursor_y = 349;
@@ -356,6 +357,9 @@ static void draw_command_overlay(void) {
   cursor_x = 4;
   cursor_y = 419;
   gprint("PHASE9: profile on|off|show|reset|export <path>|hud compact|detail", 0x9AF0C8);
+  cursor_x = 4;
+  cursor_y = 433;
+  gprint("PHASE10: model show|select|param  stdp on|off", 0xC9F59A);
 }
 
 void draw_status_bar(void) {

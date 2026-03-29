@@ -2,6 +2,7 @@
 #include "disk.h"
 #include "klog.h"
 #include "vfs.h"
+#include "model_manager.h"
 
 typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
@@ -62,6 +63,21 @@ typedef struct {
   int potentials[16];
   uint32_t snapshot_used_mask;
   char lineage_tags[SNAPSHOT_SLOTS][SNAPSHOT_TAG_LEN];
+} SessionManifestV1;
+
+typedef struct {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t tick;
+  int zoom_level;
+  int zoom_offset;
+  int task_base_integration[2];
+  int task_fire_threshold[2];
+  int task_target_pixel[2];
+  int potentials[16];
+  uint32_t snapshot_used_mask;
+  char lineage_tags[SNAPSHOT_SLOTS][SNAPSHOT_TAG_LEN];
+  ModelManifestData model_data;
 } SessionManifest;
 
 typedef struct {
@@ -319,7 +335,7 @@ int storage_manifest_save(const char *path) {
     return 0;
 
   mf.magic = MANIFEST_MAGIC;
-  mf.version = 1;
+  mf.version = 2;
   mf.tick = tick;
   mf.zoom_level = zoom_level;
   mf.zoom_offset = zoom_offset;
@@ -343,47 +359,57 @@ int storage_manifest_save(const char *path) {
               SNAPSHOT_TAG_LEN);
   }
 
+  model_manifest_capture(&mf.model_data);
+
   return vfs_write_file(path, &mf, sizeof(mf)) == (int)sizeof(mf);
 }
 
 int storage_manifest_load(const char *path) {
   SessionManifest mf;
   int n;
+  SessionManifestV1 *mf_v1 = (SessionManifestV1 *)&mf;
 
   if (path == 0 || path[0] == '\0')
     return 0;
 
   n = vfs_read_file(path, &mf, sizeof(mf));
-  if (n < (int)sizeof(mf))
-    return 0;
-  if (mf.magic != MANIFEST_MAGIC || mf.version != 1)
+  if (n < (int)sizeof(SessionManifestV1))
     return 0;
 
-  zoom_level = mf.zoom_level;
+  if (mf_v1->magic != MANIFEST_MAGIC)
+    return 0;
+  if (mf_v1->version != 1 && mf_v1->version != 2)
+    return 0;
+
+  zoom_level = mf_v1->zoom_level;
   if (zoom_level < 1)
     zoom_level = 1;
   if (zoom_level > 4)
     zoom_level = 4;
 
-  zoom_offset = mf.zoom_offset;
+  zoom_offset = mf_v1->zoom_offset;
   if (zoom_offset < 0)
     zoom_offset = 0;
   if (zoom_offset > 15)
     zoom_offset = 15;
 
   for (int t = 0; t < 2; t++) {
-    task_list[t].base_integration = mf.task_base_integration[t];
-    task_list[t].fire_threshold = mf.task_fire_threshold[t];
-    task_list[t].target_pixel = mf.task_target_pixel[t];
+    task_list[t].base_integration = mf_v1->task_base_integration[t];
+    task_list[t].fire_threshold = mf_v1->task_fire_threshold[t];
+    task_list[t].target_pixel = mf_v1->task_target_pixel[t];
   }
 
   for (int i = 0; i < 16; i++) {
-    potentials[i] = mf.potentials[i];
+    potentials[i] = mf_v1->potentials[i];
   }
 
   for (int s = 0; s < SNAPSHOT_SLOTS; s++) {
-    copy_text((char *)synapse_disk[s].snapshot_tag, mf.lineage_tags[s],
+    copy_text((char *)synapse_disk[s].snapshot_tag, mf_v1->lineage_tags[s],
               SNAPSHOT_TAG_LEN);
+  }
+
+  if (mf_v1->version >= 2 && n >= (int)sizeof(SessionManifest)) {
+    model_manifest_apply(&mf.model_data);
   }
 
   return 1;
@@ -423,6 +449,13 @@ int storage_manifest_summary(char *out, int out_len) {
     }
     append_text(out, out_len, &cursor, "]");
   }
+
+  append_text(out, out_len, &cursor, " model=");
+  append_text(out, out_len, &cursor, model_name(0));
+  append_text(out, out_len, &cursor, "/");
+  append_text(out, out_len, &cursor, model_name(1));
+  append_text(out, out_len, &cursor, " stdp=");
+  append_text(out, out_len, &cursor, model_get_stdp() ? "on" : "off");
 
   return 1;
 }

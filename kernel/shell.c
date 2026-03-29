@@ -7,6 +7,7 @@
 #include "usermode.h"
 #include "net.h"
 #include "profiling.h"
+#include "model_manager.h"
 
 typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
@@ -87,6 +88,20 @@ static int parse_u32_dec(const char *s) {
     i++;
   }
   return v;
+}
+
+static int is_dec_number(const char *s) {
+  int i = 0;
+  if (s == 0 || s[0] == '\0') {
+    return 0;
+  }
+  while (s[i]) {
+    if (s[i] < '0' || s[i] > '9') {
+      return 0;
+    }
+    i++;
+  }
+  return 1;
 }
 
 static uint32_t parse_u32_hex(const char *s) {
@@ -269,8 +284,114 @@ static void cmd_help(const char *args) {
   gprint("phase8:   manifest save|load|show  replay rec on|off|run|show|clear\n", 0x88E0FF);
   gprint("          dataset export <path>  dataset import <path>\n", 0x88E0FF);
   gprint("phase9:   profile on|off|show|reset|export <path>|hud compact|detail\n", 0x88E0FF);
+  gprint("phase10:  model show|select|param ...  stdp on|off\n", 0x88E0FF);
   gprint("phase6:   synview synset synrule synpreset syncmp\n", 0x77C8FF);
   gprint("          sbrowse spreview stag sdiff\n", 0x77C8FF);
+}
+
+static void cmd_model(const char *args) {
+  char sub[12];
+  char a[16];
+  char b[16];
+  char c[16];
+  char d[16];
+
+  args = next_token(args, sub, sizeof(sub));
+  args = next_token(args, a, sizeof(a));
+  args = next_token(args, b, sizeof(b));
+  args = next_token(args, c, sizeof(c));
+  next_token(args, d, sizeof(d));
+
+  if (sub[0] == '\0' || str_eq(sub, "show")) {
+    gprint("MODEL T0:", 0x99EEFF);
+    gprint((char *)model_name(0), 0x77FFAA);
+    gprint(" T1:", 0x99EEFF);
+    gprint((char *)model_name(1), 0x77FFAA);
+    gprint(" STDP:", 0x99EEFF);
+    gprint(model_get_stdp() ? "ON" : "OFF", model_get_stdp() ? 0x44FF88 : 0xFFAA66);
+    gprint("\n", 0x000000);
+    return;
+  }
+
+  if (str_eq(sub, "select")) {
+    int task_id = -1;
+    const char *model = a;
+
+    if (is_dec_number(a)) {
+      task_id = parse_u32_dec(a);
+      model = b;
+    }
+
+    if (model == 0 || model[0] == '\0') {
+      set_cmd_output("USAGE: model select [task] <lif|adapt|stdp>");
+      return;
+    }
+
+    if (model_select(task_id, model)) {
+      set_cmd_output("MODEL SELECT OK");
+    } else {
+      set_cmd_output("MODEL SELECT FAIL");
+    }
+    return;
+  }
+
+  if (str_eq(sub, "param")) {
+    int task_id = -1;
+    int neuron_id = -1;
+    const char *key = 0;
+    int value = 0;
+
+    if (!is_dec_number(a) || b[0] == '\0' || c[0] == '\0' || d[0] == '\0') {
+      set_cmd_output("USAGE: model param <task> <neuron|all> <key> <value>");
+      return;
+    }
+
+    task_id = parse_u32_dec(a);
+    if (str_eq(b, "all")) {
+      neuron_id = -1;
+    } else if (is_dec_number(b)) {
+      neuron_id = parse_u32_dec(b);
+    } else {
+      set_cmd_output("USAGE: model param <task> <neuron|all> <key> <value>");
+      return;
+    }
+
+    key = c;
+    value = parse_u32_dec(d);
+
+    if (model_set_param(task_id, neuron_id, key, value)) {
+      set_cmd_output("MODEL PARAM OK");
+    } else {
+      set_cmd_output("MODEL PARAM FAIL");
+    }
+    return;
+  }
+
+  set_cmd_output("USAGE: model show|select|param ...");
+}
+
+static void cmd_stdp(const char *args) {
+  char sub[8];
+  next_token(args, sub, sizeof(sub));
+
+  if (sub[0] == '\0') {
+    set_cmd_output(model_get_stdp() ? "STDP ON" : "STDP OFF");
+    return;
+  }
+
+  if (str_eq(sub, "on")) {
+    model_set_stdp(1);
+    set_cmd_output("STDP ON");
+    return;
+  }
+
+  if (str_eq(sub, "off")) {
+    model_set_stdp(0);
+    set_cmd_output("STDP OFF");
+    return;
+  }
+
+  set_cmd_output("USAGE: stdp on|off");
 }
 
 static uint32_t metric_avg_cycles(const ProfileMetric *m) {
@@ -1306,6 +1427,8 @@ static const CommandEntry command_table[] = {
     {"wipe", cmd_wipe},
     {"net", cmd_net},
     {"profile", cmd_profile},
+    {"model", cmd_model},
+    {"stdp", cmd_stdp},
     {"manifest", cmd_manifest},
     {"dataset", cmd_dataset},
     {"replay", cmd_replay},
