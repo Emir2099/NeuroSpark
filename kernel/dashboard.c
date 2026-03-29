@@ -79,6 +79,10 @@ static uint32_t metric_avg_cycles(const ProfileMetric *m) {
   return m->total_cycles / m->count;
 }
 
+static uint32_t metric_roll_cycles(uint32_t slot) {
+  return profile_metric_rolling_avg(slot);
+}
+
 static char task_state_code(uint32_t state) {
   if (state == TASK_STATE_RUNNING) {
     return 'R';
@@ -100,7 +104,7 @@ static char task_state_code(uint32_t state) {
 
 static void draw_hud_telemetry(void) {
   const int y0 = 110;
-  const int y1 = 300;
+  const int y1 = 310;
   const int left_x0 = 0;
   const int left_x1 = 170;
   const int right_x0 = 630;
@@ -259,24 +263,65 @@ static void draw_hud_telemetry(void) {
   {
     ProfileSnapshot snap;
     uint32_t render_avg;
+    uint32_t render_roll;
     uint32_t sched_avg;
+    uint32_t sched_roll;
+    uint32_t spike_avg;
+    uint32_t spike_roll;
     uint32_t cmd_avg;
+    uint32_t cmd_roll;
+    int hud_mode = profile_get_hud_mode();
     profile_snapshot(&snap);
 
     render_avg = metric_avg_cycles(&snap.slots[PROFILE_SLOT_RENDER_PASS]);
+    render_roll = metric_roll_cycles(PROFILE_SLOT_RENDER_PASS);
     sched_avg = metric_avg_cycles(&snap.slots[PROFILE_SLOT_SCHED_TICK]);
+    sched_roll = metric_roll_cycles(PROFILE_SLOT_SCHED_TICK);
+    spike_avg = metric_avg_cycles(&snap.slots[PROFILE_SLOT_SPIKE_UPDATE]);
+    spike_roll = metric_roll_cycles(PROFILE_SLOT_SPIKE_UPDATE);
     cmd_avg = metric_avg_cycles(&snap.slots[PROFILE_SLOT_COMMAND]);
+    cmd_roll = metric_roll_cycles(PROFILE_SLOT_COMMAND);
 
     cursor_x = 638;
-    cursor_y = 290;
+    cursor_y = 286;
     gprint("PRF:", 0xAACCEE);
     gprint(snap.enabled ? "ON" : "OFF", snap.enabled ? 0x77FF77 : 0xFFAA66);
-    gprint(" R:", 0xAACCEE);
-    gprint_dec((int)render_avg, 0xFFFFFF);
-    gprint(" C:", 0xAACCEE);
-    gprint_dec((int)cmd_avg, 0xFFFFFF);
-    gprint(" S:", 0xAACCEE);
-    gprint_dec((int)sched_avg, 0xFFFFFF);
+    gprint(" ", 0x000000);
+    gprint(hud_mode == PROFILE_HUD_DETAILED ? "D" : "C", 0xFFFFFF);
+
+    cursor_x = 638;
+    cursor_y = 298;
+    if (hud_mode == PROFILE_HUD_DETAILED) {
+      gprint("R", 0xAACCEE);
+      gprint_dec((int)render_avg, 0xFFFFFF);
+      gprint("/", 0x666666);
+      gprint_dec((int)render_roll, 0xFFFFFF);
+      gprint(" S", 0xAACCEE);
+      gprint_dec((int)sched_avg, 0xFFFFFF);
+      gprint("/", 0x666666);
+      gprint_dec((int)sched_roll, 0xFFFFFF);
+
+      cursor_x = 728;
+      cursor_y = 286;
+      gprint("C", 0xAACCEE);
+      gprint_dec((int)cmd_avg, 0xFFFFFF);
+      gprint("/", 0x666666);
+      gprint_dec((int)cmd_roll, 0xFFFFFF);
+
+      cursor_x = 728;
+      cursor_y = 298;
+      gprint("P", 0xAACCEE);
+      gprint_dec((int)spike_avg, 0xFFFFFF);
+      gprint("/", 0x666666);
+      gprint_dec((int)spike_roll, 0xFFFFFF);
+    } else {
+      gprint("R:", 0xAACCEE);
+      gprint_dec((int)render_avg, 0xFFFFFF);
+      gprint(" C:", 0xAACCEE);
+      gprint_dec((int)cmd_avg, 0xFFFFFF);
+      gprint(" S:", 0xAACCEE);
+      gprint_dec((int)sched_avg, 0xFFFFFF);
+    }
   }
 }
 
@@ -310,7 +355,7 @@ static void draw_command_overlay(void) {
          0xA0E0FF);
   cursor_x = 4;
   cursor_y = 419;
-  gprint("PHASE9: profile on|off|show|reset|export <path>", 0x9AF0C8);
+  gprint("PHASE9: profile on|off|show|reset|export <path>|hud compact|detail", 0x9AF0C8);
 }
 
 void draw_status_bar(void) {
