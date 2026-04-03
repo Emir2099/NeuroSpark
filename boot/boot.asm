@@ -7,7 +7,7 @@ KERNEL_SEGMENT equ 0x1000
 ; Read in two passes to support kernels larger than 127 sectors while
 ; keeping each INT 13h request BIOS-safe.
 KERNEL_LOAD_SECTORS equ 127
-KERNEL_LOAD_EXTRA_SECTORS equ 64
+KERNEL_LOAD_EXTRA_SECTORS equ 128
 %define FORCE_TEXT_MODE 0
 
 ; Entry point - BIOS loads us at 0x7c00
@@ -144,6 +144,12 @@ load_kernel:
     mov dl, [BOOT_DRIVE]
     int 0x13
     jc disk_error
+
+    mov si, dap3             ; Pass 3: extra sectors from LBA 192 -> next segment
+    mov ah, 0x42
+    mov dl, [BOOT_DRIVE]
+    int 0x13
+    jc disk_error
     ret
 
 .try_chs:
@@ -163,7 +169,7 @@ load_kernel:
     mov ch, 0               ; Cylinder 0
     mov dh, 0               ; Head 0
     mov cl, 2               ; Start from sector 2
-    mov di, KERNEL_LOAD_SECTORS
+    mov di, 255
 
 .read_loop:
     push cx
@@ -258,6 +264,16 @@ dap2:
     ; Segment advance: 127 sectors * 512 bytes / 16 = 0x0FE0 paragraphs
     dw (KERNEL_SEGMENT + 0x0FE0)
     dq 128                    ; Continue loading from LBA 128
+
+; GDT Definition
+
+dap3:
+    db 0x10
+    db 0
+    dw 64
+    dw 0x0000
+    dw (0x1000 + 0x0FE0 + 0x0800)
+    dq 192
 
 ; GDT Definition
 gdt_start:
