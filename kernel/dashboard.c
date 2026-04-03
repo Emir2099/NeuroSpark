@@ -6,6 +6,7 @@
 #include "net.h"
 #include "profiling.h"
 #include "model_manager.h"
+#include "wm.h"
 
 typedef unsigned char uint8_t;
 
@@ -830,31 +831,363 @@ void shell_render(void) {
   shell_dirty = 0;
 }
 
+/* ================================================================
+ * Window Content Renderers – each draws inside (x,y,w,h) bounds
+ * ================================================================ */
+
+/* Console window: shell prompt + output + help text */
+void draw_win_console(int x, int y, int w, int h) {
+  extern char cmd_output[256];
+  extern int cmd_output_valid;
+  int lx = x + 4;
+  int ly = y + 2;
+
+  /* Help text (compact) */
+  cursor_x = lx; cursor_y = ly;
+  gprint("CMDS: help ls save load pci eval stim", 0x5588AA);
+  ly += 11;
+  cursor_x = lx; cursor_y = ly;
+  gprint("NET: net up|cfg|status  remote on|off", 0x5588AA);
+  ly += 11;
+  cursor_x = lx; cursor_y = ly;
+  gprint("VIZ: viz heatmap|raster|off  viz scrub", 0x5588AA);
+  ly += 14;
+
+  /* Separator */
+  draw_hline(ly, x + 2, x + w - 2, 0x1A3040);
+  ly += 4;
+
+  /* Command output */
+  if (cmd_output_valid) {
+    cursor_x = lx; cursor_y = ly;
+    gprint(cmd_output, 0x44FF88);
+    ly += 12;
+  }
+
+  /* Shell prompt at bottom of window */
+  int prompt_y = y + h - 18;
+  if (prompt_y < ly) prompt_y = ly;
+  draw_hline(prompt_y - 3, x + 2, x + w - 2, 0x1A3040);
+
+  cursor_x = lx; cursor_y = prompt_y;
+  gprint("> ", 0x00FFFF);
+  for (int i = 0; i < buffer_idx && i < 32; i++) {
+    char ch[2] = {input_buffer[i], '\0'};
+    gprint(ch, 0xFFFFFF);
+  }
+
+  /* Update shell cursor position for blinking cursor */
+  shell_cursor_x = lx + 16 + (buffer_idx * 8);
+  shell_cursor_y = prompt_y;
+
+  /* Draw blinking cursor only if console window (index 1) is focused */
+  if (wm_focused == 1) {
+    draw_cursor(tick);
+  }
+
+  shell_dirty = 0;
+}
+
+/* Neural Viz window: waveform + raster/heatmap */
+void draw_win_neural_viz(int x, int y, int w, int h) {
+  int lx = x + 4;
+  int ly = y + 2;
+  int bar_area_y0 = ly + 14;
+  int bar_area_y1 = y + h - 4;
+  int bar_area_h  = bar_area_y1 - bar_area_y0;
+  int base_y = bar_area_y1 - 4;
+  int safe_zoom = zoom_level;
+  if (safe_zoom < 1) safe_zoom = 1;
+
+  /* Title */
+  cursor_x = lx; cursor_y = ly;
+  gprint("NEURAL WAVEFORM", 0x3388BB);
+  gprint(" Z:", 0x557799);
+  gprint_dec(safe_zoom, 0x00FFFF);
+  gprint("x", 0x557799);
+
+  /* Bars */
+  int neurons_vis = 16 / safe_zoom;
+  if (neurons_vis < 1) neurons_vis = 1;
+  int start_n = zoom_offset;
+  if (start_n + neurons_vis > 16) start_n = 16 - neurons_vis;
+  if (start_n < 0) start_n = 0;
+
+  int spacing = (w - 8) / (neurons_vis + 1);
+  int bar_w = 3 * safe_zoom;
+  if (bar_w > 16) bar_w = 16;
+  int prev_px = -1, prev_py = -1;
+
+  for (int idx = 0; idx < neurons_vis; idx++) {
+    int i = start_n + idx;
+    int pot = potentials[i];
+    if (pot < 0) pot = 0;
+    if (pot > 1000) pot = 1000;
+    int bh = (pot * (bar_area_h - 14)) / 1000;
+    int px = x + 4 + spacing + idx * spacing;
+    int py = base_y - bh;
+
+    uint32_t color = pot < 333 ? 0x00CC44 : (pot < 666 ? 0xFFDD00 : 0xFF3300);
+    for (int dy = 0; dy < bh && dy < bar_area_h - 10; dy++)
+      for (int dx = 0; dx < bar_w; dx++)
+        put_pixel(px - bar_w/2 + dx, base_y - dy, color);
+
+    if (prev_px >= 0) {
+      int ddx = px - prev_px;
+      for (int xi = prev_px; xi != px; xi += (ddx > 0 ? 1 : -1)) {
+        int ty = prev_py + (py - prev_py) * (xi - prev_px) / (ddx ? ddx : 1);
+        put_pixel(xi, ty, 0x005588);
+      }
+    }
+    prev_px = px; prev_py = py;
+  }
+
+  /* Viz overlay (heatmap/raster) at bottom quarter if active */
+  if (viz_mode != VIZ_MODE_OFF) {
+    int vx = x + 4, vy = y + h - 50, vw = w - 8, vh = 46;
+    draw_hline(vy - 1, vx, vx + vw, 0x224466);
+    cursor_x = vx + 2; cursor_y = vy + 2;
+    if (viz_mode == VIZ_MODE_HEATMAP) {
+      gprint("HEATMAP", 0x9AF0C8);
+    } else if (viz_mode == VIZ_MODE_RASTER) {
+      gprint("RASTER scr:", 0xB6E8FF);
+      gprint_dec(viz_scrub, 0xFFFFFF);
+    } else if (viz_mode == VIZ_MODE_COMPARE) {
+      gprint("COMPARE", 0xFFD37A);
+    }
+  }
+}
+
+/* System Status window: tasks, memory, disk, net */
+void draw_win_sys_status(int x, int y, int w, int h) {
+  int lx = x + 4, ly = y + 2;
+  int safe_tc = os_task_count;
+  if (safe_tc < 0) safe_tc = 0;
+  if (safe_tc > MAX_TASKS) safe_tc = MAX_TASKS;
+
+  cursor_x = lx; cursor_y = ly;
+  gprint("PROCESSES", 0x66E0FF);
+  ly += 12;
+
+  cursor_x = lx; cursor_y = ly;
+  gprint("PID  State  Prio  Runtime", 0x99AABB);
+  ly += 10;
+
+  for (int i = 0; i < safe_tc && i < 4 && ly < y + h - 40; i++) {
+    cursor_x = lx; cursor_y = ly;
+    gprint_dec(i, 0xFFFFFF);
+    gprint("    ", 0x000000);
+    char sc[2] = {task_state_code(os_tasks[i].state), '\0'};
+    gprint(sc, 0x77FFAA);
+    gprint("      ", 0x000000);
+    gprint_dec((int)os_tasks[i].priority, 0xFFE066);
+    gprint("     ", 0x000000);
+    gprint_dec((int)os_tasks[i].runtime_ticks, 0xFFFFFF);
+    ly += 10;
+  }
+
+  ly += 4;
+  draw_hline(ly, lx, x + w - 4, 0x1A3040);
+  ly += 6;
+
+  /* Memory */
+  cursor_x = lx; cursor_y = ly;
+  gprint("MEM: ", 0xAACCEE);
+  gprint_dec(pmm_get_free_pages(), 0x77FF77);
+  gprint(" free", 0xAACCEE);
+  ly += 12;
+
+  /* Disk / Net */
+  cursor_x = lx; cursor_y = ly;
+  gprint("DISK:", 0xAACCEE);
+  gprint(ata_disk_available ? "ON " : "OFF",
+         ata_disk_available ? 0x77FF77 : 0xFF7777);
+  gprint(" NET:", 0xAACCEE);
+  gprint(net_is_ready() ? "ON" : "OFF",
+         net_is_ready() ? 0x77FF77 : 0xFF7777);
+  ly += 12;
+
+  /* Phase status */
+  cursor_x = lx; cursor_y = ly;
+  for (int p = 0; p < 2; p++) {
+    gprint((char *)task_list[p].task_name, 0xFFFF00);
+    gprint(":", 0x446666);
+    gprint((os_memory_map[p].current_phase == 1) ? "RIG " : "FLU ",
+           (os_memory_map[p].current_phase == 1) ? 0xFF4444 : 0x44FF44);
+  }
+}
+
+/* Profiler window: performance metrics */
+void draw_win_profiler(int x, int y, int w, int h) {
+  (void)w; (void)h;
+  int lx = x + 4, ly = y + 2;
+  static ProfileSnapshot snap;
+  profile_snapshot(&snap);
+
+  cursor_x = lx; cursor_y = ly;
+  gprint("KERNEL PROFILER", 0x66E0FF);
+  gprint(" ", 0);
+  gprint(snap.enabled ? "ON" : "OFF", snap.enabled ? 0x77FF77 : 0xFFAA66);
+  ly += 14;
+
+  /* Render pass */
+  cursor_x = lx; cursor_y = ly;
+  gprint("Render: ", 0xAACCEE);
+  gprint_dec((int)(snap.slots[PROFILE_SLOT_RENDER_PASS].count ?
+    snap.slots[PROFILE_SLOT_RENDER_PASS].total_cycles /
+    snap.slots[PROFILE_SLOT_RENDER_PASS].count : 0), 0xFFFFFF);
+  ly += 10;
+
+  /* Scheduler */
+  cursor_x = lx; cursor_y = ly;
+  gprint("Sched:  ", 0xAACCEE);
+  gprint_dec((int)(snap.slots[PROFILE_SLOT_SCHED_TICK].count ?
+    snap.slots[PROFILE_SLOT_SCHED_TICK].total_cycles /
+    snap.slots[PROFILE_SLOT_SCHED_TICK].count : 0), 0xFFFFFF);
+  ly += 10;
+
+  /* Spike update */
+  cursor_x = lx; cursor_y = ly;
+  gprint("Spike:  ", 0xAACCEE);
+  gprint_dec((int)(snap.slots[PROFILE_SLOT_SPIKE_UPDATE].count ?
+    snap.slots[PROFILE_SLOT_SPIKE_UPDATE].total_cycles /
+    snap.slots[PROFILE_SLOT_SPIKE_UPDATE].count : 0), 0xFFFFFF);
+  ly += 10;
+
+  /* Tick + SPS */
+  cursor_x = lx; cursor_y = ly + 4;
+  gprint("TICK:", 0xAACCEE);
+  gprint_dec((int)tick, 0xFF8800);
+  ly += 14;
+  cursor_x = lx; cursor_y = ly;
+  gprint("SPS[0]:", 0xAACCEE);
+  gprint_dec(task_list[0].spikes_per_second, 0xFF5500);
+  gprint(" [1]:", 0xAACCEE);
+  gprint_dec(task_list[1].spikes_per_second, 0xFF5500);
+}
+
+/* Settings window: snapshot count, zoom, model info */
+void draw_win_settings(int x, int y, int w, int h) {
+  (void)w; (void)h;
+  int lx = x + 4, ly = y + 2;
+
+  cursor_x = lx; cursor_y = ly;
+  gprint("SYSTEM SETTINGS", 0x66E0FF);
+  ly += 14;
+
+  cursor_x = lx; cursor_y = ly;
+  gprint("Zoom: ", 0xAACCEE);
+  gprint_dec(zoom_level, 0x00FFFF);
+  gprint("x", 0xAACCEE);
+  ly += 12;
+
+  cursor_x = lx; cursor_y = ly;
+  gprint("Snapshots: ", 0xAACCEE);
+  gprint_dec(storage_snapshot_used_count(), 0x88FFCC);
+  gprint("/", 0xAACCEE);
+  gprint_dec(storage_snapshot_capacity(), 0x88FFCC);
+  ly += 12;
+
+  cursor_x = lx; cursor_y = ly;
+  gprint("PCI: ", 0xAACCEE);
+  gprint_dec(pci_found_count, 0xFFFFFF);
+  gprint(" devices", 0xAACCEE);
+  ly += 12;
+
+  cursor_x = lx; cursor_y = ly;
+  gprint("Model T0:", 0xAACCEE);
+  gprint((char *)model_name(0), 0x77FFAA);
+  ly += 10;
+  cursor_x = lx; cursor_y = ly;
+  gprint("Model T1:", 0xAACCEE);
+  gprint((char *)model_name(1), 0x77FFAA);
+  ly += 10;
+  cursor_x = lx; cursor_y = ly;
+  gprint("STDP:", 0xAACCEE);
+  gprint(model_get_stdp() ? "ON" : "OFF",
+         model_get_stdp() ? 0x44FF88 : 0xFFAA66);
+}
+
+/* ================================================================
+ * Desktop setup – register all windows with the WM
+ * ================================================================ */
+static int desktop_initialized = 0;
+
+static void setup_desktop_windows(void) {
+  wm_init();
+  /* icon_slot: 2=NeuralViz, 3=Console, 4=Profiler, 5=Settings */
+  wm_add_window(30,  30,  440, 260, "NEURO-VIZ - SNN LIVE FEED",
+                (wm_draw_fn)draw_win_neural_viz, 0, 2);
+  wm_add_window(30,  310, 440, 220, "ARDENT CONSOLE >_",
+                (wm_draw_fn)draw_win_console, 1, 3);
+  wm_add_window(490, 30,  280, 220, "SYS_STATUS - PROCESSES",
+                (wm_draw_fn)draw_win_sys_status, 0, 4);
+  wm_add_window(490, 270, 280, 200, "KERNEL PROFILER - SUBSYSTEM",
+                (wm_draw_fn)draw_win_profiler, 0, 4);
+  wm_add_window(490, 310, 280, 200, "SYSTEM SETTINGS",
+                (wm_draw_fn)draw_win_settings, 0, 5);
+  desktop_initialized = 1;
+}
+
+/* ================================================================
+ * neuro_task_entry – main render loop (WM-driven)
+ * ================================================================ */
 void neuro_task_entry(void) {
+  static int prev_btns = 0;
+
+  if (!desktop_initialized) {
+    setup_desktop_windows();
+  }
+
   while (1) {
     uint32_t render_profile_stamp = profile_begin();
 
+    /* Neural simulation (unchanged) */
     pulse_neurons();
     record_raster_sample();
     if (viz_mode == VIZ_MODE_RASTER && viz_autoplay) {
       viz_step_scrub(1);
     }
 
-    clear_region(0, 102, 800, 310, 0x000033);
-    draw_status_bar();
-    draw_hud_telemetry();
-    draw_waveform();
-    draw_phase13_viz();
+    /* Phase transition auto-save (unchanged) */
+    for (int p = 0; p < 2; p++) {
+      if (prev_phase[p] == 0 && os_memory_map[p].current_phase == 1) {
+        if (ata_disk_available) {
+          disk_read_sector(TFS_DIR_LBA, (uint16_t *)root_directory);
+          int slot = find_free_slot(root_directory);
+          if (slot != -1) {
+            root_directory[slot].lba = TFS_DATA_START + slot;
+            root_directory[slot].flags = 1;
+            root_directory[slot].size = sizeof(potentials);
+            root_directory[slot].name[0] = 'a';
+            root_directory[slot].name[1] = 'u';
+            root_directory[slot].name[2] = 't';
+            root_directory[slot].name[3] = 'o';
+            root_directory[slot].name[4] = '_';
+            root_directory[slot].name[5] = (char)('0' + p);
+            root_directory[slot].name[6] = '\0';
+            disk_write_sector(root_directory[slot].lba, (uint16_t *)potentials);
+            disk_write_sector(TFS_DIR_LBA, (uint16_t *)root_directory);
+          }
+        }
+      }
+      prev_phase[p] = os_memory_map[p].current_phase;
+    }
 
-    shell_render();
-    draw_command_overlay();
-    draw_cursor(tick);
-    draw_mouse_cursor();
+    /* Handle mouse input */
+    {
+      extern volatile int mouse_x;
+      extern volatile int mouse_y;
+      extern volatile int mouse_buttons;
+      int mx = mouse_x, my = mouse_y, mb = mouse_buttons;
+      wm_handle_mouse(mx, my, mb, prev_btns);
+      prev_btns = mb;
+    }
 
-    cursor_x = 0;
-    cursor_y = 312;
+    /* Render desktop + windows + taskbar + cursor */
+    wm_render();
 
-    /* Kernel dashboard task flips directly to avoid syscall privilege ambiguity. */
+    /* Flip backbuffer to VRAM */
     __asm__ volatile("cli");
     flip_mutex = 1;
     flip_buffer();

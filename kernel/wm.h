@@ -1,0 +1,55 @@
+#ifndef WM_H
+#define WM_H
+
+#ifndef _UINT32_T_DEFINED
+#define _UINT32_T_DEFINED
+typedef unsigned int uint32_t;
+#endif
+#ifndef _UINT8_T_DEFINED
+#define _UINT8_T_DEFINED
+typedef unsigned char uint8_t;
+#endif
+
+#define WM_MAX_WINDOWS    8
+#define WM_STATE_NORMAL   0
+#define WM_STATE_MINIMIZED 1
+#define WM_STATE_MAXIMIZED 2
+
+#define WM_TITLEBAR_H    22
+#define WM_BORDER         2
+#define WM_TASKBAR_H     54
+#define WM_TASKBAR_Y     (600 - WM_TASKBAR_H)
+
+#define WM_BTN_W         16
+#define WM_BTN_H         16
+#define WM_BTN_PAD        3
+
+#define WM_ICON_SLOTS     6
+
+typedef void (*wm_draw_fn)(int x, int y, int w, int h);
+
+typedef struct {
+    int x, y, w, h;
+    int ox, oy, ow, oh;
+    char title[48];
+    int state;
+    int visible;
+    int dragging;
+    int drag_ox, drag_oy;
+    wm_draw_fn draw_fn;
+    int needs_keyboard;
+    int icon_slot;
+} WmWindow;
+
+extern WmWindow wm_windows[WM_MAX_WINDOWS];
+extern int wm_window_count;
+extern int wm_focused;
+
+void wm_init(void);
+int  wm_add_window(int x, int y, int w, int h, const char *title,
+                    wm_draw_fn fn, int needs_kb, int icon_slot);
+void wm_render(void);
+void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons);
+int  wm_focused_needs_keyboard(void);
+
+#endif

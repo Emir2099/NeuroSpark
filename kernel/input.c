@@ -1,4 +1,5 @@
 #include "input.h"
+#include "wm.h"
 
 typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
@@ -64,6 +65,7 @@ static int wait_input_empty(void) {
     if ((inb(0x64) & 0x02) == 0) {
       return 1;
     }
+    outb(0x80, 0);
   }
   return 0;
 }
@@ -73,6 +75,7 @@ static int wait_output_full(void) {
     if (inb(0x64) & 0x01) {
       return 1;
     }
+    outb(0x80, 0);
   }
   return 0;
 }
@@ -178,33 +181,25 @@ void init_input_stack(void) {
   mouse_buttons = 0;
 
   /* Enable auxiliary PS/2 mouse device and streaming packets (IRQ12). */
-  if (!wait_input_empty())
-    return;
+  wait_input_empty();
   outb(0x64, 0xA8);
 
-  if (!wait_input_empty())
-    return;
+  wait_input_empty();
   outb(0x64, 0x20);
-  if (!wait_output_full())
-    return;
+  wait_output_full();
   uint8_t status = inb(0x60);
 
   status |= 0x02;
-  if (!wait_input_empty())
-    return;
+  wait_input_empty();
   outb(0x64, 0x60);
-  if (!wait_input_empty())
-    return;
+  wait_input_empty();
   outb(0x60, status);
 
-  if (!wait_input_empty())
-    return;
+  wait_input_empty();
   outb(0x64, 0xD4);
-  if (!wait_input_empty())
-    return;
+  wait_input_empty();
   outb(0x60, 0xF4); /* Enable streaming */
-  if (!wait_output_full())
-    return;
+  wait_output_full();
   (void)inb(0x60); /* ACK (or controller response) */
   mouse_enabled = 1;
 }
@@ -223,24 +218,7 @@ void keyboard_handler(void) {
 
   char c = get_ascii(code);
 
-  if (code == 0x1C) {
-    input_buffer[buffer_idx] = '\0';
-    char cmd_copy[32];
-    for (int i = 0; i <= buffer_idx && i < 32; i++)
-      cmd_copy[i] = input_buffer[i];
-    cmd_copy[31] = '\0';
-    process_command(cmd_copy);
-    buffer_idx = 0;
-    shell_dirty = 1;
-    return;
-  }
-
-  if (code == 0x0E && buffer_idx > 0) {
-    buffer_idx--;
-    shell_dirty = 1;
-    return;
-  }
-
+  /* Function keys always work (neural probe / system) */
   if (code == 0x3B) {
     for (int n = 0; n < 5; n++)
       os_memory_map[0].neurons[n].voltage += 300;
@@ -268,6 +246,28 @@ void keyboard_handler(void) {
     return;
   }
 
+  /* Regular input only processed if focused window needs keyboard */
+  if (!wm_focused_needs_keyboard())
+    return;
+
+  if (code == 0x1C) {
+    input_buffer[buffer_idx] = '\0';
+    char cmd_copy[32];
+    for (int i = 0; i <= buffer_idx && i < 32; i++)
+      cmd_copy[i] = input_buffer[i];
+    cmd_copy[31] = '\0';
+    process_command(cmd_copy);
+    buffer_idx = 0;
+    shell_dirty = 1;
+    return;
+  }
+
+  if (code == 0x0E && buffer_idx > 0) {
+    buffer_idx--;
+    shell_dirty = 1;
+    return;
+  }
+
   if (c && buffer_idx < 31) {
     input_buffer[buffer_idx++] = c;
     int next_head = (kb_head + 1) % 32;
@@ -276,8 +276,6 @@ void keyboard_handler(void) {
       kb_head = next_head;
     }
     shell_dirty = 1;
-  } else if (!c) {
-    os_memory_map[0].neurons[0].voltage += 500;
   }
 }
 
@@ -290,7 +288,7 @@ void mouse_handler(void) {
   uint8_t data = inb(0x60);
 
   if (mouse_packet_idx == 0 && (data & 0x08) == 0) {
-    return;
+    /* Some emulators don't set bit 3. simply ignore the check for now */
   }
 
   mouse_packet[mouse_packet_idx++] = data;
