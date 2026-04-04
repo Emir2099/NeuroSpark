@@ -12,6 +12,7 @@ uint32_t backbuffer[SCREEN_SIZE];
 
 /* External dependency */
 #include "font.h"
+#include "../assets/ui/font12x18.h"
 extern uint32_t vbe_framebuffer; // Defined in kernel.c
 extern uint32_t vbe_pitch;
 extern uint32_t vbe_bpp;
@@ -161,6 +162,36 @@ void gprint(char* str, uint32_t color) {
 
         /* Scroll when cursor runs off the bottom */
         if (cursor_y >= 590) {
+            vga_scroll();
+        }
+    }
+}
+
+void gprint_12(char *str, uint32_t color) {
+    for (int i = 0; str[i] != '\0'; i++) {
+        if (str[i] == '\n') {
+            cursor_x = 0;
+            cursor_y += 18;
+            continue;
+        }
+
+        unsigned char glyph = (unsigned char)str[i];
+        for (int row = 0; row < UI_FONT12X18_ROWS; row++) {
+            unsigned short row_data = ui_font12x18[glyph][row];
+            for (int col = 0; col < 12; col++) {
+                if (row_data & (1 << (11 - col))) {
+                    put_pixel(cursor_x + col, cursor_y + row, color);
+                }
+            }
+        }
+
+        cursor_x += 12;
+        if (cursor_x > 788) {
+            cursor_x = 0;
+            cursor_y += 18;
+        }
+
+        if (cursor_y >= 582) {
             vga_scroll();
         }
     }

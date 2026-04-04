@@ -14,6 +14,8 @@ extern void *pmm_alloc_page();
 extern void pmm_free_page(uint32_t page_addr);
 extern void pmm_print_map();
 extern void init_paging();
+extern void wm_init(void);
+extern void wm_render(void);
 
 extern void enablePaging();
 extern uint32_t page_directory[1024];
@@ -1343,19 +1345,8 @@ void neuro_task_entry() {
     render_frame++;
     pulse_neurons();
 
-    /* Wipe only the waveform viewport - status bar and shell persist */
-    clear_region(0, 102, 800, 310, 0x000033);
-
-    draw_status_bar();
-    draw_waveform();
-
-    /* Render the shell input line + blinking cursor */
-    shell_render();
-    draw_cursor(tick);
-
-    /* Restore gprint cursor below the dashboard */
-    cursor_x = 0;
-    cursor_y = 312;
+    /* Render the glass desktop shell and taskbar. */
+    wm_render();
 
     /* SYS_FLIP: blit backbuffer -> VRAM (CLI+STI guarded in syscall.c) */
     asm volatile("mov $10, %%eax; int $0x80" : : : "eax");
@@ -2050,6 +2041,9 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
     /* Flush the backbuffer to VRAM so the boot splash is visible immediately.
        At this point paging is NOT yet enabled, so direct VRAM access works. */
     flip_buffer();
+
+    /* the WM desktop layer instead of the old dashboard renderer. */
+    wm_init();
   } else {
     kprint("TEXT MODE BOOT (NO VBE)", 0, 0, 0x0F);
   }

@@ -71,6 +71,7 @@ extern void clear_region(int x0, int y0, int x1, int y1, uint32_t color);
 extern void draw_hline(int y, int x0, int x1, uint32_t color);
 extern void put_pixel(int x, int y, uint32_t color);
 extern void flip_buffer(void);
+extern void wm_render(void);
 extern volatile int flip_mutex;
 extern uint32_t backbuffer[];
 
@@ -1045,58 +1046,10 @@ void draw_status_bar(void) {
 }
 
 void draw_waveform(void) {
-  if (!win_viz.visible || wm_active != 1) {
-    return;
-  }
-  const int WIN_Y0 = win_viz.y + 30;
-  const int WIN_Y1 = win_viz.y + win_viz.h - 14;
-  const int WIN_X0 = win_viz.x + 14;
-  const int WIN_X1 = win_viz.x + win_viz.w - 16;
-  int safe_zoom = zoom_level;
-  if (safe_zoom < 1) {
-    safe_zoom = 1;
-  }
-
-  clear_region(WIN_X0, WIN_Y0, WIN_X1, WIN_Y1, 0xF3F6F9);
-  draw_hline(WIN_Y0 - 1, WIN_X0, WIN_X1, 0xCAD4DE);
-  draw_hline(WIN_Y1, WIN_X0, WIN_X1, 0xCAD4DE);
-
-  cursor_x = WIN_X0 + 4;
-  cursor_y = WIN_Y0 - 12;
-  gprint("+40mV", 0x4E6478);
-  cursor_x = WIN_X0 + 4;
-  cursor_y = WIN_Y0 + 10;
-  gprint("0", 0x4E6478);
-  cursor_x = WIN_X0 + 4;
-  cursor_y = WIN_Y0 + 28;
-  gprint("-40mV", 0x4E6478);
-
-  int neurons_visible = 16 / safe_zoom;
-  if (neurons_visible < 1)
-    neurons_visible = 1;
-  int start_n = zoom_offset;
-  if (start_n + neurons_visible > 16)
-    start_n = 16 - neurons_visible;
-  if (start_n < 0)
-    start_n = 0;
-
-  for (int t = 0; t < 6; t++) {
-    int prev_x = -1;
-    int prev_y = -1;
-    uint32_t c = (t == 1) ? 0x2D8CB5 : 0x5C788E;
-    for (int x = WIN_X0 + 48; x < WIN_X1 - 8; x++) {
-      int idx = start_n + ((x - WIN_X0) / 18) % neurons_visible;
-      int p = potentials[idx];
-      int wave = ((p + (int)tick + (t * 37) + (x * (t + 3))) & 63) - 31;
-      int amp = (t == 1) ? 24 : (10 + t);
-      int y = WIN_Y0 + 18 + (t * 16) + (wave * amp) / 64;
-      if (prev_x >= 0) {
-        draw_line_segment(prev_x, prev_y, x, y, c);
-      }
-      prev_x = x;
-      prev_y = y;
-    }
-  }
+  (void)tick;
+  (void)zoom_level;
+  (void)zoom_offset;
+  (void)potentials;
 }
 
 void shell_render(void) {
@@ -1141,29 +1094,7 @@ void shell_render(void) {
 
 void neuro_task_entry(void) {
   while (1) {
-    uint32_t render_profile_stamp = profile_begin();
-
-    wm_handle_clicks();
-
-    pulse_neurons();
-    record_raster_sample();
-    if (viz_mode == VIZ_MODE_RASTER && viz_autoplay) {
-      viz_step_scrub(1);
-    }
-
-    clear_region(0, 102, 800, 310, 0x000033);
-    draw_status_bar();
-    /* Keep desktop clean; optional viz windows render only when explicitly used. */
-
-    shell_render();
-    draw_command_overlay();
-    if (win_shell.visible && wm_active == 0) {
-      draw_cursor(tick);
-    }
-    draw_mouse_cursor();
-
-    cursor_x = 0;
-    cursor_y = 312;
+    wm_render();
 
     /* Kernel dashboard task flips directly to avoid syscall privilege ambiguity. */
     __asm__ volatile("cli");
@@ -1171,8 +1102,6 @@ void neuro_task_entry(void) {
     flip_buffer();
     flip_mutex = 0;
     __asm__ volatile("sti");
-
-    profile_end(PROFILE_SLOT_RENDER_PASS, render_profile_stamp);
 
     for (volatile int d = 0; d < 400000; d++)
       ;

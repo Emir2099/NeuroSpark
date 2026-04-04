@@ -15,6 +15,7 @@ extern void process_command(char *cmd);
 extern void switch_tasks(void);
 extern void sys_save_task(int task_id, int slot);
 extern int sys_load_task(int task_id, int slot);
+extern void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons);
 
 typedef struct {
   int voltage;
@@ -39,6 +40,7 @@ extern NeuralPixel os_memory_map[2];
 volatile int mouse_x = SCREEN_WIDTH / 2;
 volatile int mouse_y = SCREEN_HEIGHT / 2;
 volatile int mouse_buttons = 0;
+static int prev_mouse_buttons = 0;
 static int mouse_enabled = 0;
 
 static int key_shift = 0;
@@ -176,6 +178,7 @@ void init_input_stack(void) {
   mouse_x = SCREEN_WIDTH / 2;
   mouse_y = SCREEN_HEIGHT / 2;
   mouse_buttons = 0;
+  prev_mouse_buttons = 0;
 
   /* Enable auxiliary PS/2 mouse device and streaming packets (IRQ12). */
   (void)wait_input_empty();
@@ -323,4 +326,6 @@ void mouse_handler(void) {
     mouse_y = SCREEN_HEIGHT - 1;
 
   mouse_buttons = mouse_packet[0] & 0x07;
+  wm_handle_mouse(mouse_x, mouse_y, mouse_buttons, prev_mouse_buttons);
+  prev_mouse_buttons = mouse_buttons;
 }
