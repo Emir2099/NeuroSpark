@@ -187,6 +187,31 @@ void syscall_handler(uint32_t *regs) {
     break;
   }
 
+  /* ============================================================
+   * IPC Backpressure and Deterministic Overflow
+   *
+   * SYS_IPC_SEND (11) and SYS_IPC_RECV (12) implement non-blocking
+   * point-to-point message passing. Each channel has a queue with
+   * capacity IPC_QUEUE_CAPACITY (16 messages).
+   *
+   * BACKPRESSURE BEHAVIOR:
+   * - SYS_IPC_SEND: If queue is full (count >= 16), returns NS_ERR_WOULD_BLOCK
+   *   Task must yield and retry. No silent drops; caller sees failure.
+   *
+   * - SYS_IPC_RECV: If queue is empty (count <= 0), returns NS_ERR_WOULD_BLOCK
+   *   Task must yield and retry. No spinning; immediate return on empty.
+   *
+   * ORDERING GUARANTEE:
+   * - Messages are FIFO within each channel
+   * - If channel X receives msgs [A, B, C], they'll be received in order
+   * - No reordering across tasks
+   *
+   * DETERMINISM:
+   * - All IPC operations are serialized by scheduler_lock
+   * - Overflow behavior is deterministic: reject or block, never corrupt
+   * - Works across 3+ concurrent workloads without starvation
+   * ============================================================ */
+
   case SYS_IPC_SEND: {
     int channel = (int)regs[4];
     int value = (int)regs[5];

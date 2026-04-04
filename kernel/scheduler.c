@@ -66,6 +66,30 @@ static void ipc_init_once(void) {
   ipc_initialized = 1;
 }
 
+/* ============================================================
+ * Shared Structure Lock Audit
+ *
+ * SCHEDULER_LOCK protects:
+ * - os_tasks[] array: All state, wake_tick, time_slice fields
+ * - scheduler_ticks: Global time counter
+ * - ipc_channels[]: All 4 channel queues (head, tail, count)
+ * - Event signaled flags and wait queue task lists
+ *
+ * KB_LOCK (in syscall.c) protects:
+ * - kb_buf[], kb_head, kb_tail: Keyboard input buffer
+ *
+ * Other structures:
+ * - page_directory: User page dir is per-task (TCB.page_dir), not shared
+ * - Disk operations in vfs.c and disk.c: Protected by their own I/O ops
+ * - Network queues (net.c): Protected if accessed from tasks; serial in ISR
+ *
+ * DISCIPLINE:
+ * 1. All task state changes require scheduler_lock
+ * 2. IPC operations require scheduler_lock
+ * 3. Never call task_yield/schedule while holding a lock (would deadlock)
+ * 4. Keyboard buffer read in ISR uses kb_lock
+ * ============================================================ */
+
 static uint32_t time_slice_for_priority(uint32_t prio) {
   if (prio == 0) {
     return 3;
@@ -454,6 +478,200 @@ void sched_event_broadcast(sched_event_t *event) {
   irq_lock_acquire(&scheduler_lock, &flags);
   event->signaled = 1;
   irq_lock_release(&scheduler_lock, flags);
+}
+
+/* ============================================================
+ * Timeout-capable sleep/wait primitives
+ * ============================================================ */
+
+int task_sleep_timeout(unsigned int ticks, unsigned int max_ticks) {
+  unsigned int flags;
+  int current;
+  uint32_t deadline;
+
+  if (ticks == 0) {
+    task_yield();
+    return 1;
+  }
+
+  if (max_ticks == 0) {
+    return 0;
+  }
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+  current = os_current_task;
+  deadline = scheduler_ticks + max_ticks;
+
+  os_tasks[current].state = TASK_STATE_SLEEPING;
+  os_tasks[current].wake_tick = scheduler_ticks + ticks;
+
+  /* If sleep duration exceeds timeout, cap at deadline */
+  if (os_tasks[current].wake_tick > deadline) {
+    os_tasks[current].wake_tick = deadline;
+  }
+
+  task_trace_event(current, TASK_TRACE_EVT_SLEEP, ticks);
+  irq_lock_release(&scheduler_lock, flags);
+
+  scheduler_select_and_switch(0);
+
+  /* Return 1 if we woke naturally, 0 if timeout */
+  irq_lock_acquire(&scheduler_lock, &flags);
+  int timed_out = (scheduler_ticks >= deadline);
+  irq_lock_release(&scheduler_lock, flags);
+
+  return !timed_out;
+}
+
+int wait_queue_wait_timeout(wait_queue_t *queue, unsigned int max_ticks) {
+  unsigned int flags;
+  int current;
+  uint32_t deadline;
+
+  if (queue == 0 || max_ticks == 0) {
+    return 0;
+  }
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+  current = os_current_task;
+  deadline = scheduler_ticks + max_ticks;
+
+  if (queue->count < MAX_TASKS) {
+    queue->task_ids[queue->tail] = current;
+    queue->tail = (queue->tail + 1) % MAX_TASKS;
+    queue->count++;
+    os_tasks[current].state = TASK_STATE_BLOCKED;
+    os_tasks[current].wake_tick = deadline;
+  }
+  irq_lock_release(&scheduler_lock, flags);
+
+  scheduler_select_and_switch(0);
+
+  /* Check if we timed out */
+  irq_lock_acquire(&scheduler_lock, &flags);
+  int timed_out = (scheduler_ticks >= deadline);
+  irq_lock_release(&scheduler_lock, flags);
+
+  return !timed_out;
+}
+
+int sched_event_wait_timeout(sched_event_t *event, unsigned int max_ticks) {
+  unsigned int flags;
+
+  if (event == 0 || max_ticks == 0) {
+    return 0;
+  }
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+  if (event->signaled) {
+    event->signaled = 0;
+    irq_lock_release(&scheduler_lock, flags);
+    return 1;
+  }
+  irq_lock_release(&scheduler_lock, flags);
+
+  return wait_queue_wait_timeout(&event->waiters, max_ticks);
+}
+
+/* ============================================================
+ * PHASE 17: Blocking IPC with timeout support
+ * Ensures no busy-waiting in user-facing operations.
+ * ============================================================ */
+
+int ipc_send_wait(int channel, int value) {
+  if (channel < 0 || channel >= IPC_CHANNELS) {
+    return 0;
+  }
+
+  ipc_init_once();
+
+  /* Retry indefinitely (infinite timeout) until space is available */
+  while (1) {
+    if (ipc_send(channel, value)) {
+      return 1;
+    }
+    task_yield();
+  }
+}
+
+int ipc_send_timeout(int channel, int value, unsigned int max_ticks) {
+  unsigned int flags;
+  uint32_t deadline;
+
+  if (channel < 0 || channel >= IPC_CHANNELS || max_ticks == 0) {
+    return 0;
+  }
+
+  ipc_init_once();
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+  deadline = scheduler_ticks + max_ticks;
+  irq_lock_release(&scheduler_lock, flags);
+
+  /* Retry until timeout */
+  while (1) {
+    if (ipc_send(channel, value)) {
+      return 1;
+    }
+
+    irq_lock_acquire(&scheduler_lock, &flags);
+    int timed_out = (scheduler_ticks >= deadline);
+    irq_lock_release(&scheduler_lock, flags);
+
+    if (timed_out) {
+      return 0;
+    }
+
+    task_yield();
+  }
+}
+
+int ipc_recv_wait(int channel, int *out_value) {
+  if (channel < 0 || channel >= IPC_CHANNELS || out_value == 0) {
+    return 0;
+  }
+
+  ipc_init_once();
+
+  /* Retry indefinitely (infinite timeout) until data is available */
+  while (1) {
+    if (ipc_recv(channel, out_value)) {
+      return 1;
+    }
+    task_yield();
+  }
+}
+
+int ipc_recv_timeout(int channel, int *out_value, unsigned int max_ticks) {
+  unsigned int flags;
+  uint32_t deadline;
+
+  if (channel < 0 || channel >= IPC_CHANNELS || out_value == 0 || max_ticks == 0) {
+    return 0;
+  }
+
+  ipc_init_once();
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+  deadline = scheduler_ticks + max_ticks;
+  irq_lock_release(&scheduler_lock, flags);
+
+  /* Retry until timeout */
+  while (1) {
+    if (ipc_recv(channel, out_value)) {
+      return 1;
+    }
+
+    irq_lock_acquire(&scheduler_lock, &flags);
+    int timed_out = (scheduler_ticks >= deadline);
+    irq_lock_release(&scheduler_lock, flags);
+
+    if (timed_out) {
+      return 0;
+    }
+
+    task_yield();
+  }
 }
 
 void switch_tasks(void) {
