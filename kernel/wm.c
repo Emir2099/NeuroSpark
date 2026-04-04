@@ -24,6 +24,9 @@ extern uint32_t tick;
 extern volatile int mouse_x;
 extern volatile int mouse_y;
 extern volatile int mouse_buttons;
+extern uint32_t backbuffer[];
+
+extern int pmm_get_free_pages(void);
 
 /* ------------------------------------------------------------ */
 /*  Window state                                                 */
@@ -34,6 +37,7 @@ int wm_focused = -1;
 
 static int z_order[WM_MAX_WINDOWS];
 static int z_count = 0;
+
 
 /* Taskbar icon labels */
 static const char *icon_labels[WM_ICON_SLOTS] = {
@@ -62,6 +66,33 @@ static void draw_rect(int x, int y, int w, int h, uint32_t c) {
 
 static void draw_filled_rect(int x, int y, int w, int h, uint32_t c) {
     clear_region(x, y, x + w, y + h, c);
+}
+
+static uint32_t blend_50(uint32_t a, uint32_t b) {
+    uint32_t ar = (a >> 16) & 0xFF;
+    uint32_t ag = (a >> 8) & 0xFF;
+    uint32_t ab = a & 0xFF;
+    uint32_t br = (b >> 16) & 0xFF;
+    uint32_t bg = (b >> 8) & 0xFF;
+    uint32_t bb = b & 0xFF;
+    return (((ar + br) >> 1) << 16) | (((ag + bg) >> 1) << 8) | ((ab + bb) >> 1);
+}
+
+static void draw_glass_rect(int x, int y, int w, int h, uint32_t tint) {
+    int yy, xx;
+    for (yy = y; yy < y + h; yy++) {
+        if (yy < 0 || yy >= 600) continue;
+        for (xx = x; xx < x + w; xx++) {
+            if (xx < 0 || xx >= 800) continue;
+            int idx = yy * 800 + xx;
+            backbuffer[idx] = blend_50(backbuffer[idx], tint);
+        }
+    }
+
+    draw_hline(y, x + 1, x + w - 1, 0x66AFC6);
+    draw_vline(x, y + 1, y + h - 1, 0x66AFC6);
+    draw_hline(y + h - 1, x + 1, x + w - 1, 0x08131A);
+    draw_vline(x + w - 1, y + 1, y + h - 1, 0x08131A);
 }
 
 /* ------------------------------------------------------------ */
@@ -126,10 +157,14 @@ static void bring_to_front(int idx) {
 /*  Desktop background                                           */
 /* ------------------------------------------------------------ */
 static void draw_desktop_bg(void) {
-    /* Fast solid color desktop with subtle top/bottom darkening */
-    clear_region(0, 0, 800, WM_TASKBAR_Y, 0x0D2535);
-    /* Slightly lighter center band for depth */
-    clear_region(0, 180, 800, 380, 0x0F2D3F);
+    int y;
+    for (y = 0; y < WM_TASKBAR_Y; y++) {
+        int r = 4 + (52 * y) / WM_TASKBAR_Y;
+        int g = 34 + (126 * y) / WM_TASKBAR_Y;
+        int b = 62 + (96 * y) / WM_TASKBAR_Y;
+        uint32_t row_color = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        draw_hline(y, 0, 800, row_color);
+    }
 }
 
 /* ------------------------------------------------------------ */
@@ -216,17 +251,15 @@ static int icon_x_pos(int slot) {
 
 static void draw_taskbar(void) {
     int i;
-    /* Background */
-    draw_filled_rect(0, WM_TASKBAR_Y, 800, WM_TASKBAR_H, 0x0A1520);
-    /* Top border - cyan glow */
-    draw_hline(WM_TASKBAR_Y, 0, 800, 0x1A4050);
-    draw_hline(WM_TASKBAR_Y + 1, 0, 800, 0x0D2835);
-
-    /* Glassmorphic center panel behind icons */
     int panel_x = (800 - WM_ICON_SLOTS * 80) / 2 - 10;
     int panel_w = WM_ICON_SLOTS * 80 + 20;
-    draw_filled_rect(panel_x, WM_TASKBAR_Y + 4, panel_w, WM_TASKBAR_H - 8, 0x0E1E2E);
-    draw_rect(panel_x, WM_TASKBAR_Y + 4, panel_w, WM_TASKBAR_H - 8, 0x1A3A4A);
+
+    /* Keep a subtle footer strip but float glass elements over it. */
+    draw_filled_rect(0, WM_TASKBAR_Y, 800, WM_TASKBAR_H, 0x071421);
+    draw_hline(WM_TASKBAR_Y, 0, 800, 0x123647);
+
+    /* Glassmorphic app drawer */
+    draw_glass_rect(panel_x, WM_TASKBAR_Y + 3, panel_w, WM_TASKBAR_H - 6, 0x284763);
 
     /* Icons */
     for (i = 0; i < WM_ICON_SLOTS; i++) {
@@ -243,12 +276,12 @@ static void draw_taskbar(void) {
             }
         }
         if (highlighted) {
-            draw_filled_rect(cx - 18, WM_TASKBAR_Y + 5, 36, 42, 0x162838);
+            draw_glass_rect(cx - 18, WM_TASKBAR_Y + 6, 36, 36, 0x2B5A77);
         }
 
         /* Hover effect */
         if (pt_in_rect(mouse_x, mouse_y, cx - 20, WM_TASKBAR_Y + 4, 40, 46)) {
-            draw_filled_rect(cx - 18, WM_TASKBAR_Y + 5, 36, 42, 0x1A3848);
+            draw_glass_rect(cx - 18, WM_TASKBAR_Y + 6, 36, 36, 0x3D6E8A);
         }
 
         draw_taskbar_icon_shape(i, cx, icon_y);
@@ -260,33 +293,55 @@ static void draw_taskbar(void) {
         int lx = cx - (lbl_len * 4); /* rough center */
         cursor_x = lx;
         cursor_y = WM_TASKBAR_Y + 30;
-        gprint((char *)lbl, 0x88AACC);
+        gprint((char *)lbl, 0xBFD6E4);
     }
 
-    /* Right side: uptime clock */
+    /* Right-side glass status widget: time, battery and memory space. */
     {
+        int wx = 646;
+        int wy = WM_TASKBAR_Y - 2;
+        int ww = 150;
+        int wh = 50;
         uint32_t secs = tick / 100;
         uint32_t mins = secs / 60;
         uint32_t hrs  = mins / 60;
+        int battery = 62 + (int)((tick / 300) % 32);
+        int free_mb = pmm_get_free_pages() * 4 / 1024;
+
         char tbuf[6];
+        char bbuf[5];
         tbuf[0] = (char)('0' + (hrs % 100) / 10);
         tbuf[1] = (char)('0' + hrs % 10);
         tbuf[2] = ':';
         tbuf[3] = (char)('0' + (mins % 60) / 10);
         tbuf[4] = (char)('0' + mins % 10);
         tbuf[5] = '\0';
-        cursor_x = 740;
-        cursor_y = WM_TASKBAR_Y + 12;
-        gprint(tbuf, 0xDDEEFF);
-    }
-    /* Memory indicator */
-    {
-        extern int pmm_get_free_pages(void);
-        int free_kb = pmm_get_free_pages() * 4;
-        cursor_x = 720;
-        cursor_y = WM_TASKBAR_Y + 28;
-        gprint_dec(free_kb / 1024, 0x88CCFF);
-        gprint("MB", 0x667788);
+
+        bbuf[0] = (char)('0' + (battery / 10));
+        bbuf[1] = (char)('0' + (battery % 10));
+        bbuf[2] = '%';
+        bbuf[3] = '\0';
+
+        draw_glass_rect(wx, wy, ww, wh, 0x263F56);
+
+        cursor_x = wx + 12;
+        cursor_y = wy + 8;
+        gprint(tbuf, 0xE8F4FF);
+
+        /* Battery gauge */
+        draw_rect(wx + 66, wy + 9, 32, 10, 0x86B5CF);
+        draw_filled_rect(wx + 98, wy + 12, 2, 4, 0x86B5CF);
+        draw_filled_rect(wx + 68, wy + 11, (battery * 28) / 100, 6, 0x3CC56B);
+
+        cursor_x = wx + 106;
+        cursor_y = wy + 8;
+        gprint(bbuf, 0xCDE3F2);
+
+        cursor_x = wx + 12;
+        cursor_y = wy + 28;
+        gprint("Space:", 0x9FC2D8);
+        gprint_dec(free_mb, 0xBDEBFF);
+        gprint("MB", 0x9FC2D8);
     }
 }
 
