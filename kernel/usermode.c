@@ -169,6 +169,19 @@ static int load_elf32_image(const uint8_t *image, uint32_t size, uint32_t pd,
       continue;  /* Skip non-loadable segments */
     }
 
+    if (ph->p_align != 0 && (ph->p_align & (ph->p_align - 1)) != 0) {
+      return 0;  /* Alignment must be power-of-two or zero */
+    }
+
+    if (ph->p_align > 1 && ((ph->p_offset & (ph->p_align - 1)) !=
+                            (ph->p_vaddr & (ph->p_align - 1)))) {
+      return 0;  /* File/virtual alignment mismatch */
+    }
+
+    if (ph->p_vaddr + ph->p_memsz < ph->p_vaddr) {
+      return 0;  /* Wraparound */
+    }
+
     /* Validate segment is in user virtual address space */
     if (!is_user_range((const void *)ph->p_vaddr, ph->p_memsz)) {
       return 0;  /* Segment outside user address range */
@@ -203,6 +216,10 @@ static int load_elf32_image(const uint8_t *image, uint32_t size, uint32_t pd,
   /* Validate entry point is in user address range */
   if (!is_user_range((const void *)*entry_out, 1)) {
     return 0;  /* Entry point outside user space */
+  }
+
+  if (resolve_user_phys(pd, *entry_out) == 0) {
+    return 0;  /* Entry point not mapped */
   }
 
   return 1;
@@ -294,6 +311,7 @@ int launch_user_process_task(void) {
 
 int exec_user_program(const char *path) {
   int image_size;
+  VfsFileStat stat_buf;
   uint32_t pd;
   uint32_t entry = USER_VA_CODE;
 
@@ -301,8 +319,13 @@ int exec_user_program(const char *path) {
     return 0;
   }
 
+  if (vfs_stat(path, &stat_buf) != VFS_OK || stat_buf.flags == 0 ||
+      stat_buf.size == 0 || stat_buf.size > sizeof(exec_buffer)) {
+    return 0;
+  }
+
   image_size = vfs_read_file(path, exec_buffer, sizeof(exec_buffer));
-  if (image_size <= 0) {
+  if (image_size <= 0 || (uint32_t)image_size != stat_buf.size) {
     return 0;
   }
 

@@ -71,6 +71,7 @@ extern void disk_write_sector(uint32_t lba, uint16_t *buffer);
 extern void disk_read_sector(uint32_t lba, uint16_t *buffer);
 extern void pci_print_results(void);
 extern void set_cmd_output(const char *text);
+extern int vfs_delete(const char *path);
 extern int wm_set_timezone_offset_minutes(int minutes);
 extern int wm_get_timezone_offset_minutes(void);
 
@@ -486,7 +487,7 @@ void list_files_gfx(void) { list_files(); }
 
 static void cmd_help(const char *args) {
   (void)args;
-  gprint("commands: help save load ls clear eval stim mall free map\n", 0xFFFFFF);
+  gprint("commands: help save load ls clear delete eval stim mall free map\n", 0xFFFFFF);
   gprint("          tsave tload pci pci bar zoom+ zoom- zpan+ zpan- wipe\n", 0xFFFFFF);
   gprint("          exec <path> mkdemo net up|cfg|status|tx|export|profile remote ...\n", 0xFFFFFF);
   gprint("phase8:   manifest save|load|show  replay rec on|off|run|show|clear\n", 0x88E0FF);
@@ -1827,6 +1828,19 @@ static void cmd_exec(const char *args) {
   }
 }
 
+static void cmd_delete(const char *args) {
+  if (args == 0 || args[0] == '\0') {
+    set_cmd_output("USAGE: DELETE <PATH>");
+    return;
+  }
+
+  if (vfs_delete(args) == 0) {
+    set_cmd_output("DELETE OK");
+  } else {
+    set_cmd_output("DELETE FAIL");
+  }
+}
+
 static void cmd_mkdemo(const char *args) {
   (void)args;
 
@@ -2158,6 +2172,7 @@ static const CommandEntry command_table[] = {
     {"manifest", cmd_manifest},
     {"dataset", cmd_dataset},
     {"replay", cmd_replay},
+    {"delete", cmd_delete},
     {"exec", cmd_exec},
     {"mkdemo", cmd_mkdemo},
     {"synview", cmd_synview},

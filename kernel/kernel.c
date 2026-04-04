@@ -16,6 +16,7 @@ extern void pmm_print_map();
 extern void init_paging();
 extern void wm_init(void);
 extern void wm_render(void);
+extern int storage_manifest_load(const char *path);
 extern int wm_focused_needs_keyboard(void);
 
 extern void enablePaging();
@@ -2169,6 +2170,7 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
 
   vfs_init();
   profile_init();
+  storage_manifest_load("/session.manifest");
 
   if (graphics_enabled) {
     /* Hardware graphics init */

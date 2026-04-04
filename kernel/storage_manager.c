@@ -69,6 +69,7 @@ typedef struct {
   uint32_t magic;
   uint32_t version;
   uint32_t tick;
+  uint32_t checksum;
   int zoom_level;
   int zoom_offset;
   int task_base_integration[2];
@@ -94,6 +95,66 @@ extern uint32_t tick;
 extern int zoom_level;
 extern int zoom_offset;
 extern int potentials[16];
+
+static uint32_t manifest_checksum(const void *data, int len) {
+  const uint8_t *bytes = (const uint8_t *)data;
+  uint32_t sum = 0;
+
+  for (int i = 0; i < len; i++) {
+    sum = (sum << 5) | (sum >> 27);
+    sum ^= bytes[i];
+  }
+
+  return sum;
+}
+
+static void build_backup_path(const char *path, char *out, int out_len) {
+  int i = 0;
+
+  if (out == 0 || out_len <= 0) {
+    return;
+  }
+  if (path == 0 || path[0] == '\0') {
+    out[0] = '\0';
+    return;
+  }
+
+  while (path[i] && i < out_len - 5) {
+    out[i] = path[i];
+    i++;
+  }
+  out[i++] = '.';
+  out[i++] = 'b';
+  out[i++] = 'a';
+  out[i++] = 'k';
+  out[i] = '\0';
+}
+
+static int manifest_blob_valid(const SessionManifest *mf, int bytes_read) {
+  const SessionManifestV1 *mf_v1 = (const SessionManifestV1 *)mf;
+
+  if (bytes_read < (int)sizeof(SessionManifestV1)) {
+    return 0;
+  }
+  if (mf_v1->magic != MANIFEST_MAGIC) {
+    return 0;
+  }
+  if (mf_v1->version != 1 && mf_v1->version != 2 && mf_v1->version != 3) {
+    return 0;
+  }
+  if (mf_v1->version == 3) {
+    if (bytes_read < (int)sizeof(SessionManifest)) {
+      return 0;
+    }
+    SessionManifest tmp = *mf;
+    uint32_t expected = tmp.checksum;
+    tmp.checksum = 0;
+    if (expected != manifest_checksum(&tmp, (int)sizeof(tmp))) {
+      return 0;
+    }
+  }
+  return 1;
+}
 
 static void copy_bytes(void *dst, const void *src, int len) {
   unsigned char *d = (unsigned char *)dst;
@@ -352,6 +413,7 @@ int storage_diff_snapshots_vector(int slot_a, int slot_b, int *voltage_delta_vec
 
 int storage_manifest_save(const char *path) {
   SessionManifest mf;
+  char backup_path[80];
 
   if (path == 0 || path[0] == '\0')
     return 0;
@@ -382,25 +444,41 @@ int storage_manifest_save(const char *path) {
   }
 
   model_manifest_capture(&mf.model_data);
+  mf.version = 3;
+  mf.checksum = 0;
+  mf.checksum = manifest_checksum(&mf, (int)sizeof(mf));
+
+  build_backup_path(path, backup_path, sizeof(backup_path));
+  if (backup_path[0] != '\0' && vfs_write_file(backup_path, &mf, sizeof(mf)) != (int)sizeof(mf)) {
+    return 0;
+  }
 
   return vfs_write_file(path, &mf, sizeof(mf)) == (int)sizeof(mf);
 }
 
 int storage_manifest_load(const char *path) {
   SessionManifest mf;
+  SessionManifest mf_bak;
   int n;
+  int n_bak = 0;
   SessionManifestV1 *mf_v1 = (SessionManifestV1 *)&mf;
+  char backup_path[80];
 
   if (path == 0 || path[0] == '\0')
     return 0;
 
-  n = vfs_read_file(path, &mf, sizeof(mf));
-  if (n < (int)sizeof(SessionManifestV1))
-    return 0;
+  build_backup_path(path, backup_path, sizeof(backup_path));
 
-  if (mf_v1->magic != MANIFEST_MAGIC)
-    return 0;
-  if (mf_v1->version != 1 && mf_v1->version != 2)
+  n = vfs_read_file(path, &mf, sizeof(mf));
+  if (!manifest_blob_valid(&mf, n) && backup_path[0] != '\0') {
+    n_bak = vfs_read_file(backup_path, &mf_bak, sizeof(mf_bak));
+    if (manifest_blob_valid(&mf_bak, n_bak)) {
+      mf = mf_bak;
+      n = n_bak;
+    }
+  }
+
+  if (!manifest_blob_valid(&mf, n))
     return 0;
 
   zoom_level = mf_v1->zoom_level;
@@ -430,7 +508,7 @@ int storage_manifest_load(const char *path) {
               SNAPSHOT_TAG_LEN);
   }
 
-  if (mf_v1->version >= 2 && n >= (int)sizeof(SessionManifest)) {
+  if (mf_v1->version >= 2 && n >= (int)sizeof(SessionManifestV1)) {
     model_manifest_apply(&mf.model_data);
   }
 

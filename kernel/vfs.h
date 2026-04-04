@@ -24,6 +24,7 @@ typedef struct {
   int (*read)(int handle, void *buf, uint32_t size);
   int (*write)(int handle, const void *buf, uint32_t size);
   int (*close)(int handle);
+  int (*delete)(const char *path);
 } VfsBackendOps;
 
 /* Initialize VFS and mount default filesystems */
@@ -41,6 +42,7 @@ int vfs_close(int fd);
 /* Convenience functions: single-call file I/O */
 int vfs_read_file(const char *path, void *buf, uint32_t max_size);
 int vfs_write_file(const char *path, const void *buf, uint32_t size);
+int vfs_delete(const char *path);
 
 /* File metadata query */
 typedef struct {

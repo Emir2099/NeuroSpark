@@ -34,6 +34,19 @@ static VfsMount mounts[VFS_MAX_MOUNTS];
 static VfsFd fd_table[VFS_MAX_FDS];
 static TfsHandle tfs_handles[TFS_MAX_HANDLES];
 
+static void clear_file_entry(FileEntry *entry) {
+  int i;
+  if (entry == 0) {
+    return;
+  }
+  for (i = 0; i < 12; i++) {
+    entry->name[i] = 0;
+  }
+  entry->lba = 0;
+  entry->size = 0;
+  entry->flags = 0;
+}
+
 static int str_eq(const char *a, const char *b) {
   int i = 0;
   while (a[i] && b[i]) {
@@ -127,11 +140,11 @@ static int tfs_open(const char *path, int flags) {
   int handle;
 
   if (!ata_disk_available) {
-    return -1;
+    return VFS_ERR_IO;
   }
 
   if (!normalize_tfs_name(path, name)) {
-    return -1;
+    return VFS_ERR_INVALID_ARG;
   }
 
   disk_read_sector(TFS_DIR_LBA, (uint16_t *)root_directory);
@@ -139,11 +152,11 @@ static int tfs_open(const char *path, int flags) {
 
   if (entry_idx < 0) {
     if ((flags & VFS_O_CREAT) == 0) {
-      return -1;
+      return VFS_ERR_NOT_FOUND;
     }
     entry_idx = find_free_slot(root_directory);
     if (entry_idx < 0) {
-      return -1;
+      return VFS_ERR_NO_SPACE;
     }
 
     for (int i = 0; i < 12; i++) {
@@ -165,7 +178,7 @@ static int tfs_open(const char *path, int flags) {
 
   handle = tfs_alloc_handle();
   if (handle < 0) {
-    return -1;
+    return VFS_ERR_NO_SPACE;
   }
 
   tfs_handles[handle].entry_idx = entry_idx;
@@ -185,7 +198,7 @@ static int tfs_read(int handle, void *buf, uint32_t size) {
 
   if (handle < 0 || handle >= TFS_MAX_HANDLES || !tfs_handles[handle].used ||
       buf == 0 || size == 0) {
-    return -1;
+    return VFS_ERR_INVALID_ARG;
   }
 
   h = &tfs_handles[handle];
@@ -229,14 +242,14 @@ static int tfs_write(int handle, const void *buf, uint32_t size) {
 
   if (handle < 0 || handle >= TFS_MAX_HANDLES || !tfs_handles[handle].used ||
       buf == 0 || size == 0) {
-    return -1;
+    return VFS_ERR_INVALID_ARG;
   }
 
   h = &tfs_handles[handle];
   entry = &root_directory[h->entry_idx];
 
   if (!(h->flags & VFS_O_WRONLY) && !(h->flags & VFS_O_RDWR)) {
-    return -1;
+    return VFS_ERR_PERM;
   }
 
   while (total < size) {
@@ -272,10 +285,32 @@ static int tfs_write(int handle, const void *buf, uint32_t size) {
 
 static int tfs_close(int handle) {
   if (handle < 0 || handle >= TFS_MAX_HANDLES || !tfs_handles[handle].used) {
-    return -1;
+    return VFS_ERR_INVALID_FD;
   }
   tfs_handles[handle].used = 0;
-  return 0;
+  return VFS_OK;
+}
+
+static int tfs_delete(const char *path) {
+  char name[12];
+  int entry_idx;
+
+  if (!ata_disk_available) {
+    return VFS_ERR_IO;
+  }
+  if (!normalize_tfs_name(path, name)) {
+    return VFS_ERR_INVALID_ARG;
+  }
+
+  disk_read_sector(TFS_DIR_LBA, (uint16_t *)root_directory);
+  entry_idx = tfs_find_entry_by_name(name);
+  if (entry_idx < 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+
+  clear_file_entry(&root_directory[entry_idx]);
+  disk_write_sector(TFS_DIR_LBA, (uint16_t *)root_directory);
+  return VFS_OK;
 }
 
 static const VfsBackendOps tfs_backend_ops = {
@@ -283,6 +318,7 @@ static const VfsBackendOps tfs_backend_ops = {
     tfs_read,
     tfs_write,
     tfs_close,
+    tfs_delete,
 };
 
 void vfs_init(void) {
@@ -349,17 +385,17 @@ int vfs_open(const char *path, int flags) {
   int backend_handle;
 
   if (path == 0 || path[0] == '\0') {
-    return -1;
+    return VFS_ERR_INVALID_ARG;
   }
 
   ops = vfs_find_backend(path);
   if (ops == 0 || ops->open == 0) {
-    return -1;
+    return VFS_ERR_NOT_FOUND;
   }
 
   backend_handle = ops->open(path, flags);
   if (backend_handle < 0) {
-    return -1;
+    return backend_handle;
   }
 
   for (int i = 0; i < VFS_MAX_FDS; i++) {
@@ -372,13 +408,13 @@ int vfs_open(const char *path, int flags) {
   }
 
   ops->close(backend_handle);
-  return -1;
+  return VFS_ERR_NO_SPACE;
 }
 
 int vfs_read(int fd, void *buf, uint32_t size) {
   if (fd < 0 || fd >= VFS_MAX_FDS || !fd_table[fd].used || fd_table[fd].ops == 0 ||
       fd_table[fd].ops->read == 0) {
-    return -1;
+    return VFS_ERR_INVALID_FD;
   }
   return fd_table[fd].ops->read(fd_table[fd].backend_handle, buf, size);
 }
@@ -386,7 +422,7 @@ int vfs_read(int fd, void *buf, uint32_t size) {
 int vfs_write(int fd, const void *buf, uint32_t size) {
   if (fd < 0 || fd >= VFS_MAX_FDS || !fd_table[fd].used || fd_table[fd].ops == 0 ||
       fd_table[fd].ops->write == 0) {
-    return -1;
+    return VFS_ERR_INVALID_FD;
   }
   return fd_table[fd].ops->write(fd_table[fd].backend_handle, buf, size);
 }
@@ -395,7 +431,7 @@ int vfs_close(int fd) {
   int rc;
   if (fd < 0 || fd >= VFS_MAX_FDS || !fd_table[fd].used || fd_table[fd].ops == 0 ||
       fd_table[fd].ops->close == 0) {
-    return -1;
+    return VFS_ERR_INVALID_FD;
   }
 
   rc = fd_table[fd].ops->close(fd_table[fd].backend_handle);
@@ -410,14 +446,14 @@ int vfs_read_file(const char *path, void *buf, uint32_t max_size) {
   int total = 0;
 
   if (fd < 0) {
-    return -1;
+    return fd;
   }
 
   while ((uint32_t)total < max_size) {
     int n = vfs_read(fd, (uint8_t *)buf + total, max_size - (uint32_t)total);
     if (n < 0) {
       vfs_close(fd);
-      return -1;
+      return n;
     }
     if (n == 0) {
       break;
@@ -434,7 +470,7 @@ int vfs_write_file(const char *path, const void *buf, uint32_t size) {
   int total = 0;
 
   if (fd < 0) {
-    return VFS_ERR_NOT_FOUND;
+    return fd;
   }
 
   while ((uint32_t)total < size) {
@@ -448,6 +484,21 @@ int vfs_write_file(const char *path, const void *buf, uint32_t size) {
 
   vfs_close(fd);
   return total;
+}
+
+int vfs_delete(const char *path) {
+  const VfsBackendOps *ops;
+
+  if (path == 0 || path[0] == '\0') {
+    return VFS_ERR_INVALID_ARG;
+  }
+
+  ops = vfs_find_backend(path);
+  if (ops == 0 || ops->delete == 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+
+  return ops->delete(path);
 }
 
 int vfs_stat(const char *path, VfsFileStat *stat_out) {
