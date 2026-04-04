@@ -16,6 +16,7 @@ extern void switch_tasks(void);
 extern void sys_save_task(int task_id, int slot);
 extern int sys_load_task(int task_id, int slot);
 extern void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons);
+extern int wm_focused_needs_keyboard(void);
 
 typedef struct {
   int voltage;
@@ -217,6 +218,15 @@ void keyboard_handler(void) {
     return;
 
   char c = get_ascii(code);
+
+  if (!wm_focused_needs_keyboard()) {
+    if (code == 0x3B || code == 0x3C || code == 0x3D || code == 0x3E ||
+        code == 0x3F) {
+      /* Keep global function-key controls live even when no text target is focused. */
+    } else {
+      return;
+    }
+  }
 
   if (code == 0x1C) {
     input_buffer[buffer_idx] = '\0';

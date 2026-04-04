@@ -16,6 +16,7 @@ extern void pmm_print_map();
 extern void init_paging();
 extern void wm_init(void);
 extern void wm_render(void);
+extern int wm_focused_needs_keyboard(void);
 
 extern void enablePaging();
 extern uint32_t page_directory[1024];
@@ -247,6 +248,9 @@ void list_files_gfx(); // Forward declaration
 extern int shell_cursor_x;
 extern int shell_cursor_y;
 extern void draw_cursor(uint32_t tick);
+extern int cursor_x;
+extern int cursor_y;
+extern void gprint_hex(uint32_t val, int digits, uint32_t color);
 
 /* Neuromorphic Globals */
 #define NEURON_COUNT 16
@@ -393,18 +397,143 @@ void set_idt_gate(int n, uint32_t handler, uint16_t sel, uint8_t flags) {
   idt[n].base_hi = (handler >> 16) & 0xFFFF;
 }
 
-extern void exception_wrapper();
-void exception_handler(uint32_t *stack_frame) {
+extern void exception0_wrapper(void);
+extern void exception1_wrapper(void);
+extern void exception2_wrapper(void);
+extern void exception3_wrapper(void);
+extern void exception4_wrapper(void);
+extern void exception5_wrapper(void);
+extern void exception6_wrapper(void);
+extern void exception7_wrapper(void);
+extern void exception8_wrapper(void);
+extern void exception9_wrapper(void);
+extern void exception10_wrapper(void);
+extern void exception11_wrapper(void);
+extern void exception12_wrapper(void);
+extern void exception13_wrapper(void);
+extern void exception14_wrapper(void);
+extern void exception15_wrapper(void);
+extern void exception16_wrapper(void);
+extern void exception17_wrapper(void);
+extern void exception18_wrapper(void);
+extern void exception19_wrapper(void);
+extern void exception20_wrapper(void);
+extern void exception21_wrapper(void);
+extern void exception22_wrapper(void);
+extern void exception23_wrapper(void);
+extern void exception24_wrapper(void);
+extern void exception25_wrapper(void);
+extern void exception26_wrapper(void);
+extern void exception27_wrapper(void);
+extern void exception28_wrapper(void);
+extern void exception29_wrapper(void);
+extern void exception30_wrapper(void);
+extern void exception31_wrapper(void);
+
+static const uint32_t exception_wrappers[32] = {
+    (uint32_t)exception0_wrapper,  (uint32_t)exception1_wrapper,
+    (uint32_t)exception2_wrapper,  (uint32_t)exception3_wrapper,
+    (uint32_t)exception4_wrapper,  (uint32_t)exception5_wrapper,
+    (uint32_t)exception6_wrapper,  (uint32_t)exception7_wrapper,
+    (uint32_t)exception8_wrapper,  (uint32_t)exception9_wrapper,
+    (uint32_t)exception10_wrapper, (uint32_t)exception11_wrapper,
+    (uint32_t)exception12_wrapper, (uint32_t)exception13_wrapper,
+    (uint32_t)exception14_wrapper, (uint32_t)exception15_wrapper,
+    (uint32_t)exception16_wrapper, (uint32_t)exception17_wrapper,
+    (uint32_t)exception18_wrapper, (uint32_t)exception19_wrapper,
+    (uint32_t)exception20_wrapper, (uint32_t)exception21_wrapper,
+    (uint32_t)exception22_wrapper, (uint32_t)exception23_wrapper,
+    (uint32_t)exception24_wrapper, (uint32_t)exception25_wrapper,
+    (uint32_t)exception26_wrapper, (uint32_t)exception27_wrapper,
+    (uint32_t)exception28_wrapper, (uint32_t)exception29_wrapper,
+    (uint32_t)exception30_wrapper, (uint32_t)exception31_wrapper,
+};
+
+static const char *exception_name(uint32_t vector) {
+  switch (vector) {
+  case 0: return "#DE Divide Error";
+  case 1: return "#DB Debug";
+  case 2: return "NMI";
+  case 3: return "#BP Breakpoint";
+  case 4: return "#OF Overflow";
+  case 5: return "#BR Bound Range";
+  case 6: return "#UD Invalid Opcode";
+  case 7: return "#NM Device Not Available";
+  case 8: return "#DF Double Fault";
+  case 9: return "Coprocessor Segment";
+  case 10: return "#TS Invalid TSS";
+  case 11: return "#NP Segment Not Present";
+  case 12: return "#SS Stack Fault";
+  case 13: return "#GP General Protection";
+  case 14: return "#PF Page Fault";
+  case 16: return "#MF x87 FP";
+  case 17: return "#AC Alignment Check";
+  case 18: return "#MC Machine Check";
+  case 19: return "#XM SIMD FP";
+  default: return "#EXC Unknown";
+  }
+}
+
+static int exception_has_error_code(uint32_t vector) {
+  return vector == 8 || vector == 10 || vector == 11 || vector == 12 ||
+         vector == 13 || vector == 14 || vector == 17;
+}
+
+static void exception_report(uint32_t vector, uint32_t err, uint32_t eip,
+                             uint32_t cs, uint32_t eflags, uint32_t cr2) {
+  unsigned short *video = (unsigned short *)0xB8000;
+  const char *name = exception_name(vector);
+
+  for (int i = 0; i < 80 * 6; i++) {
+    video[i] = 0x1F00 | ' ';
+  }
+
+  cursor_x = 0;
+  cursor_y = 0;
+  gprint("EXCEPTION ", 0x4F00);
+  gprint((char *)name, 0x4F00);
+  gprint(" VEC:", 0x4F00);
+  gprint_hex(vector, 2, 0x4F00);
+
+  cursor_x = 0;
+  cursor_y = 16;
+  gprint("EIP:", 0xFFFFFF);
+  gprint_hex(eip, 8, 0x88FFAA);
+  gprint(" CS:", 0xFFFFFF);
+  gprint_hex(cs, 4, 0x88FFAA);
+  gprint(" EFL:", 0xFFFFFF);
+  gprint_hex(eflags, 8, 0x88FFAA);
+
+  cursor_x = 0;
+  cursor_y = 32;
+  gprint("ERR:", 0xFFFFFF);
+  gprint_hex(err, 8, 0xFFCC66);
+  if (vector == 14) {
+    gprint(" CR2:", 0xFFFFFF);
+    gprint_hex(cr2, 8, 0xFFCC66);
+  }
+
+  if (lfb != 0) {
+    for (int y = 240; y < 360; y++) {
+      for (int x = 180; x < 620; x++) {
+        lfb[y * 800 + x] = 0x441111;
+      }
+    }
+  }
+}
+
+void exception_handler(uint32_t vector, uint32_t err, uint32_t *stack_frame) {
   uint32_t cr2 = 0;
-  uint32_t err = 0;
   uint32_t eip = 0;
   uint32_t cs = 0;
+  uint32_t eflags = 0;
+  uint32_t frame_index = exception_has_error_code(vector) ? 1 : 0;
 
   __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
   if (stack_frame != 0) {
-    err = stack_frame[0];
-    eip = stack_frame[1];
-    cs = stack_frame[2];
+    eip = stack_frame[frame_index + 0];
+    cs = stack_frame[frame_index + 1];
+    eflags = stack_frame[frame_index + 2];
   }
 
   /* Ring 3 faults should kill only the current user task, not the kernel. */
@@ -413,24 +542,12 @@ void exception_handler(uint32_t *stack_frame) {
     os_tasks[os_current_task].fault_addr = cr2;
     os_tasks[os_current_task].fault_eip = eip;
     task_trace_event(os_current_task, TASK_TRACE_EVT_FAULT, err);
+    exception_report(vector, err, eip, cs, eflags, cr2);
     task_terminate_current();
     return;
   }
 
-  unsigned short *video = (unsigned short *)0xB8000;
-  video[0] = 0x4F00 | 'E';
-  video[1] = 0x4F00 | 'X';
-  video[2] = 0x4F00 | 'C';
-  video[3] = 0x4F00 | '!';
-
-  // Also emit a visible marker in the VESA framebuffer if graphics is active.
-  if (lfb != 0) {
-    for (int y = 260; y < 340; y++) {
-      for (int x = 200; x < 600; x++) {
-        lfb[y * 800 + x] = 0x660000;
-      }
-    }
-  }
+  exception_report(vector, err, eip, cs, eflags, cr2);
 
   while (1) {
     __asm__ volatile("hlt");
@@ -447,7 +564,7 @@ void init_idt() {
   idtp.base = (uint32_t)&idt;
 
   for (int i = 0; i < 32; i++) {
-    set_idt_gate(i, (uint32_t)exception_wrapper, 0x08, 0x8E);
+    set_idt_gate(i, exception_wrappers[i], 0x08, 0x8E);
   }
 
   /* Remap the PIC (Programmable Interrupt Controller) */
@@ -994,6 +1111,13 @@ void keyboard_handler(void) {
 
   if (scancode < 0x80) {
     char c = get_ascii(scancode);
+
+    if (!wm_focused_needs_keyboard()) {
+      if (scancode != 0x3B && scancode != 0x3C && scancode != 0x3D &&
+          scancode != 0x3E && scancode != 0x3F) {
+        return;
+      }
+    }
 
     /* --- 1. Control Keys (High Priority) --- */
     if (scancode == 0x1C) { /* ENTER */

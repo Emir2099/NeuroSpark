@@ -3,6 +3,7 @@
 typedef unsigned int uint32_t;
 typedef unsigned char uint8_t;
 
+#include "paging.h"
 #include "task.h"
 #include "scheduler.h"
 
@@ -54,6 +55,13 @@ extern int ipc_recv(int channel, int *out_value);
 static irq_lock_t kb_lock = {0};
 extern int os_current_task;
 
+static uint32_t current_task_page_dir(void) {
+  if (os_current_task < 0 || os_current_task >= MAX_TASKS) {
+    return 0;
+  }
+  return os_tasks[os_current_task].page_dir;
+}
+
 static uint32_t syscall_caller_cpl(uint32_t *regs) {
   uint32_t *iret_frame = (uint32_t *)((uint8_t *)regs + (8 * sizeof(uint32_t)));
   uint32_t saved_cs = iret_frame[1];
@@ -62,7 +70,7 @@ static uint32_t syscall_caller_cpl(uint32_t *regs) {
 
 static int validate_user_string(const char *s) {
   for (uint32_t i = 0; i < MAX_USER_STRING_LEN; i++) {
-    if (!is_user_range((const void *)(s + i), 1)) {
+    if (!is_user_range_accessible(current_task_page_dir(), (const void *)(s + i), 1)) {
       return 0;
     }
     if (s[i] == '\0') {
@@ -76,11 +84,22 @@ static int validate_user_ptr(const void *ptr, uint32_t size) {
   if (ptr == (const void *)0 || size == 0) {
     return 0;
   }
-  return is_user_range(ptr, size);
+  return is_user_range_accessible(current_task_page_dir(), ptr, size);
 }
 
 static int validate_user_int_ptr(const int *p) {
   return validate_user_ptr((const void *)p, sizeof(int));
+}
+
+static void syscall_complete(uint32_t *regs, uint32_t syscall_num, uint32_t result) {
+  regs[7] = result;
+  task_trace_syscall(os_current_task, syscall_num, result);
+}
+
+static void syscall_complete_value(uint32_t *regs, uint32_t syscall_num,
+                                   uint32_t result, uint32_t value) {
+  regs[5] = value; /* EDX carries the normalized payload. */
+  syscall_complete(regs, syscall_num, result);
 }
 
 /* ============================================================
@@ -101,16 +120,21 @@ void syscall_handler(uint32_t *regs) {
 
   switch (syscall_num) {
 
+  case SYS_FORK:
+  case SYS_READ:
+  case SYS_CLOSE:
+    syscall_complete(regs, syscall_num, NS_ERR_INVALID_SYSCALL);
+    break;
+
   /* ---- SYS_WRITE (4): write a NUL-terminated string via gprint ---- */
   case SYS_WRITE: {
     char *msg = (char *)regs[4]; /* EBX */
     if (cpl == 3 && (!validate_user_ptr(msg, 1) || !validate_user_string(msg))) {
-      regs[7] = NS_ERR_BAD_POINTER;
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
       break;
     }
     gprint(msg, 0x00FF00);       /* Green */
-    regs[7] = NS_OK;
-    task_trace_syscall(os_current_task, syscall_num, regs[7]);
+    syscall_complete(regs, syscall_num, NS_OK);
     break;
   }
 
@@ -118,12 +142,10 @@ void syscall_handler(uint32_t *regs) {
   case SYS_EXIT: {
     extern void task_terminate_current(void);
     if (cpl != 3) {
-      regs[7] = NS_ERR_PERMISSION;
-      task_trace_syscall(os_current_task, syscall_num, regs[7]);
+      syscall_complete(regs, syscall_num, NS_ERR_PERMISSION);
       break;
     }
-    regs[7] = NS_OK;
-    task_trace_syscall(os_current_task, syscall_num, regs[7]);
+    syscall_complete(regs, syscall_num, NS_OK);
     task_terminate_current();
     break;
   }
@@ -137,22 +159,20 @@ void syscall_handler(uint32_t *regs) {
       irq_lock_release(&kb_lock, flags);
       /* Buffer empty – cooperatively yield, caller must retry */
       task_yield();
-      regs[7] = NS_ERR_WOULD_BLOCK;
+      syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
     } else {
       char c = kb_buf[kb_tail];
       kb_tail = (kb_tail + 1) % KB_BUF_SIZE;
       irq_lock_release(&kb_lock, flags);
-      regs[7] = (uint32_t)(unsigned char)c; /* Return ASCII code */
+      syscall_complete_value(regs, syscall_num, NS_OK, (uint32_t)(unsigned char)c);
     }
-    task_trace_syscall(os_current_task, syscall_num, regs[7]);
     break;
   }
 
   /* ---- SYS_FLIP (10): blit backbuffer → VRAM, mutex-guarded ---- */
   case SYS_FLIP: {
     if (cpl == 3) {
-      regs[7] = NS_ERR_PERMISSION;
-      task_trace_syscall(os_current_task, syscall_num, regs[7]);
+      syscall_complete(regs, syscall_num, NS_ERR_PERMISSION);
       break;
     }
 
@@ -163,8 +183,7 @@ void syscall_handler(uint32_t *regs) {
     flip_buffer();
     flip_mutex = 0;
     __asm__ volatile("sti");
-    regs[7] = NS_OK;
-    task_trace_syscall(os_current_task, syscall_num, regs[7]);
+    syscall_complete(regs, syscall_num, NS_OK);
     break;
   }
 
@@ -172,13 +191,12 @@ void syscall_handler(uint32_t *regs) {
     int channel = (int)regs[4];
     int value = (int)regs[5];
     if (channel < 0 || channel >= IPC_CHANNELS) {
-      regs[7] = NS_ERR_BAD_POINTER;
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
     } else if (ipc_send(channel, value)) {
-      regs[7] = NS_OK;
+      syscall_complete(regs, syscall_num, NS_OK);
     } else {
-      regs[7] = NS_ERR_WOULD_BLOCK;
+      syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
     }
-    task_trace_syscall(os_current_task, syscall_num, regs[7]);
     break;
   }
 
@@ -187,26 +205,24 @@ void syscall_handler(uint32_t *regs) {
     int out = 0;
     int *user_out = (int *)regs[5];
     if (channel < 0 || channel >= IPC_CHANNELS) {
-      regs[7] = NS_ERR_BAD_POINTER;
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
     } else if (cpl == 3 && !validate_user_int_ptr(user_out)) {
-      regs[7] = NS_ERR_BAD_POINTER;
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
     } else if (ipc_recv(channel, &out)) {
       if (user_out != 0 && cpl == 3) {
         *user_out = out;
-        regs[7] = NS_OK;
       } else {
-        regs[7] = (uint32_t)out;
+        regs[5] = (uint32_t)out;
       }
+      syscall_complete(regs, syscall_num, NS_OK);
     } else {
-      regs[7] = NS_ERR_WOULD_BLOCK;
+      syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
     }
-    task_trace_syscall(os_current_task, syscall_num, regs[7]);
     break;
   }
 
   default:
-    regs[7] = NS_ERR_INVALID_SYSCALL;
-    task_trace_syscall(os_current_task, syscall_num, regs[7]);
+    syscall_complete(regs, syscall_num, NS_ERR_INVALID_SYSCALL);
     break;
   }
 }

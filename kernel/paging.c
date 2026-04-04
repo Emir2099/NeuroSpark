@@ -26,6 +26,31 @@ extern uint32_t vbe_framebuffer;
 
 void map_page_flags(uint32_t phys_addr, uint32_t virt_addr, uint32_t flags);
 
+static int page_is_user_accessible(uint32_t *pd, uint32_t virt_addr) {
+  uint32_t pd_index = virt_addr >> 22;
+  uint32_t pt_index = (virt_addr >> 12) & 0x03FF;
+  uint32_t pde;
+  uint32_t *pt;
+  uint32_t pte;
+
+  if (pd == (uint32_t *)0) {
+    return 0;
+  }
+
+  pde = pd[pd_index];
+  if ((pde & PAGE_PRESENT) == 0 || (pde & PAGE_USER) == 0) {
+    return 0;
+  }
+
+  pt = (uint32_t *)(pde & PAGE_MASK);
+  pte = pt[pt_index];
+  if ((pte & PAGE_PRESENT) == 0 || (pte & PAGE_USER) == 0) {
+    return 0;
+  }
+
+  return 1;
+}
+
 // Helper to map a physical address to a virtual address
 void map_page(uint32_t phys_addr, uint32_t virt_addr) {
   map_page_flags(phys_addr, virt_addr, PAGE_PRESENT | PAGE_RW);
@@ -112,6 +137,31 @@ int is_user_range(const void *ptr, uint32_t size) {
 
   if (start < USER_VADDR_MIN || end > USER_VADDR_MAX) {
     return 0;
+  }
+
+  return 1;
+}
+
+int is_user_range_accessible(uint32_t pd_phys, const void *ptr, uint32_t size) {
+  uint32_t *pd = (uint32_t *)(pd_phys & PAGE_MASK);
+  uint32_t start;
+  uint32_t end;
+
+  if (!is_user_range(ptr, size) || pd == (uint32_t *)0) {
+    return 0;
+  }
+
+  start = (uint32_t)ptr;
+  end = start + size - 1;
+  start &= PAGE_MASK;
+
+  for (uint32_t addr = start;; addr += 4096) {
+    if (!page_is_user_accessible(pd, addr)) {
+      return 0;
+    }
+    if (addr >= end || addr + 4096 < addr) {
+      break;
+    }
   }
 
   return 1;
