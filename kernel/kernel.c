@@ -394,7 +394,29 @@ void set_idt_gate(int n, uint32_t handler, uint16_t sel, uint8_t flags) {
 }
 
 extern void exception_wrapper();
-void exception_handler() {
+void exception_handler(uint32_t *stack_frame) {
+  uint32_t cr2 = 0;
+  uint32_t err = 0;
+  uint32_t eip = 0;
+  uint32_t cs = 0;
+
+  __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+  if (stack_frame != 0) {
+    err = stack_frame[0];
+    eip = stack_frame[1];
+    cs = stack_frame[2];
+  }
+
+  /* Ring 3 faults should kill only the current user task, not the kernel. */
+  if ((cs & 0x3) == 0x3 && os_current_task > 0 && os_current_task < os_task_count) {
+    os_tasks[os_current_task].fault_code = err;
+    os_tasks[os_current_task].fault_addr = cr2;
+    os_tasks[os_current_task].fault_eip = eip;
+    task_trace_event(os_current_task, TASK_TRACE_EVT_FAULT, err);
+    task_terminate_current();
+    return;
+  }
+
   unsigned short *video = (unsigned short *)0xB8000;
   video[0] = 0x4F00 | 'E';
   video[1] = 0x4F00 | 'X';

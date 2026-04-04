@@ -28,6 +28,7 @@ enum {
   TASK_TRACE_EVT_TERMINATE = 6,
   TASK_TRACE_EVT_PRIORITY = 7,
   TASK_TRACE_EVT_KILL = 8,
+  TASK_TRACE_EVT_FAULT = 9,
 };
 
 typedef struct {
@@ -46,6 +47,9 @@ typedef struct {
   uint32_t trace_last_event;
   uint32_t trace_last_arg;
   uint32_t trace_event_count;
+  uint32_t fault_code;
+  uint32_t fault_addr;
+  uint32_t fault_eip;
   int wait_reason;
   int task_id;
 } TCB;

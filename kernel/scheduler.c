@@ -1,5 +1,6 @@
 #include "scheduler.h"
 #include "profiling.h"
+#include "paging.h"
 
 typedef unsigned int uint32_t;
 
@@ -204,11 +205,23 @@ void task_sleep(unsigned int ticks) {
 
 void task_terminate_current(void) {
   unsigned int flags;
+  uint32_t task_pd = 0;
+  int current = 0;
 
   irq_lock_acquire(&scheduler_lock, &flags);
+  current = os_current_task;
+  task_pd = os_tasks[current].page_dir;
   task_trace_event(os_current_task, TASK_TRACE_EVT_TERMINATE, 0);
   os_tasks[os_current_task].state = TASK_STATE_TERMINATED;
+  os_tasks[os_current_task].fault_code = 0;
+  os_tasks[os_current_task].fault_addr = 0;
+  os_tasks[os_current_task].fault_eip = 0;
   irq_lock_release(&scheduler_lock, flags);
+
+  if (task_pd != 0 && task_pd != (uint32_t)page_directory) {
+    destroy_user_address_space(task_pd);
+    os_tasks[current].page_dir = 0;
+  }
 
   scheduler_select_and_switch(0);
   while (1) {

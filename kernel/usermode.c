@@ -210,6 +210,7 @@ static int load_elf32_image(const uint8_t *image, uint32_t size, uint32_t pd,
 
 static int setup_user_stack(uint32_t pd) {
   uint32_t stack_phys = (uint32_t)pmm_alloc_page();
+  uint32_t guard_page_va = USER_VA_STACK_TOP - 8192;
   if (stack_phys == 0) {
     return 0;
   }
@@ -218,6 +219,11 @@ static int setup_user_stack(uint32_t pd) {
   mem_zero((uint8_t *)stack_phys, 4096);
 
   if (!map_user_page(pd, stack_phys, USER_VA_STACK_TOP - 4096)) {
+    return 0;
+  }
+
+  /* Keep one page below the stack unmapped to catch stack overflow. */
+  if (resolve_user_phys(pd, guard_page_va) != 0) {
     return 0;
   }
   return 1;
@@ -306,16 +312,19 @@ int exec_user_program(const char *path) {
   }
 
   if (!setup_user_stack(pd)) {
+    destroy_user_address_space(pd);
     return 0;
   }
 
   if (exec_buffer[0] == 0x7F && exec_buffer[1] == 'E' && exec_buffer[2] == 'L' &&
       exec_buffer[3] == 'F') {
     if (!load_elf32_image(exec_buffer, (uint32_t)image_size, pd, &entry)) {
+      destroy_user_address_space(pd);
       return 0;
     }
   } else {
     if (!load_flat_image(exec_buffer, (uint32_t)image_size, pd, &entry)) {
+      destroy_user_address_space(pd);
       return 0;
     }
   }

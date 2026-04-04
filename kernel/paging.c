@@ -16,6 +16,7 @@ uint32_t second_page_table[1024] __attribute__((aligned(4096)));
 
 /* Assembly function references */
 extern void *pmm_alloc_page();
+extern void pmm_free_page(uint32_t page_addr);
 extern void loadPageDirectory(unsigned int *);
 extern void enablePaging();
 
@@ -141,6 +142,34 @@ uint32_t resolve_user_phys(uint32_t pd_phys, uint32_t virt_addr) {
   }
 
   return (pte & PAGE_MASK) | (virt_addr & 0xFFF);
+}
+
+void destroy_user_address_space(uint32_t pd_phys) {
+  uint32_t *pd = (uint32_t *)(pd_phys & PAGE_MASK);
+  if (pd == (uint32_t *)0 || pd == page_directory) {
+    return;
+  }
+
+  for (uint32_t pdi = (USER_VADDR_MIN >> 22); pdi <= (USER_VADDR_MAX >> 22); pdi++) {
+    uint32_t pde = pd[pdi];
+    if ((pde & PAGE_PRESENT) == 0 || (pde & PAGE_USER) == 0) {
+      continue;
+    }
+
+    uint32_t *pt = (uint32_t *)(pde & PAGE_MASK);
+    for (uint32_t pti = 0; pti < 1024; pti++) {
+      uint32_t pte = pt[pti];
+      if ((pte & PAGE_PRESENT) && (pte & PAGE_USER)) {
+        pmm_free_page(pte & PAGE_MASK);
+        pt[pti] = 0;
+      }
+    }
+
+    pmm_free_page((uint32_t)pt);
+    pd[pdi] = 0;
+  }
+
+  pmm_free_page((uint32_t)pd);
 }
 
 void init_paging() {

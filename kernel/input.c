@@ -218,13 +218,6 @@ void keyboard_handler(void) {
 
   char c = get_ascii(code);
 
-    uint8_t status = inb(0x64);
-    if ((status & 0x01) == 0) {
-      return;
-    }
-    if ((status & 0x20) == 0) {
-      return;
-    }
   if (code == 0x1C) {
     input_buffer[buffer_idx] = '\0';
     char cmd_copy[32];

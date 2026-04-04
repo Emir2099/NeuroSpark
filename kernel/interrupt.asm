@@ -75,7 +75,9 @@ extern exception_handler
 
 exception_wrapper:
     cli
+    push esp
     call exception_handler
+    add esp, 4
 .halt:
     hlt
     jmp .halt

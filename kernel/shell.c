@@ -328,6 +328,9 @@ static const char *trace_event_name(uint32_t evt) {
   if (evt == TASK_TRACE_EVT_KILL) {
     return "KILL";
   }
+  if (evt == TASK_TRACE_EVT_FAULT) {
+    return "FAULT";
+  }
   return "NONE";
 }
 
@@ -705,7 +708,7 @@ static void cmd_viz(const char *args) {
 static void cmd_ps(const char *args) {
   (void)args;
 
-  gprint("PID ST   PR CLS RT CSW TRACE EVT ARG\n", 0x99EEFF);
+  gprint("PID ST   PR CLS RT CSW TRACE EVT ARG FADDR FEIP\n", 0x99EEFF);
   for (int i = 0; i < os_task_count; i++) {
     gprint_dec(i, 0xFFFFFF);
     gprint("   ", 0x000000);
@@ -724,6 +727,10 @@ static void cmd_ps(const char *args) {
     gprint((char *)trace_event_name(os_tasks[i].trace_last_event), 0x77C8FF);
     gprint(" ", 0x000000);
     gprint_dec((int)os_tasks[i].trace_last_arg, 0xFFFFFF);
+    gprint(" ", 0x000000);
+    gprint_hex(os_tasks[i].fault_addr, 8, 0xFFAA66);
+    gprint(" ", 0x000000);
+    gprint_hex(os_tasks[i].fault_eip, 8, 0x77C8FF);
     gprint("\n", 0x000000);
   }
 }

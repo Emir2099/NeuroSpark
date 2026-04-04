@@ -21,6 +21,11 @@ extern int cursor_x;
 extern int cursor_y;
 
 extern uint32_t tick;
+extern int potentials[16];
+extern volatile char input_buffer[32];
+extern volatile int buffer_idx;
+extern char cmd_output[256];
+extern int cmd_output_valid;
 extern volatile int mouse_x;
 extern volatile int mouse_y;
 extern volatile int mouse_buttons;
@@ -32,6 +37,39 @@ extern int storage_snapshot_capacity(void);
 
 typedef unsigned short uint16_t;
 typedef unsigned char uint8_t;
+
+typedef struct {
+    int voltage;
+    int spike_count;
+    int id;
+    int synaptic_weight;
+    int refractory_timer;
+    int dynamic_threshold;
+} WmNeuron;
+
+typedef struct {
+    WmNeuron neurons[5];
+    uint8_t current_phase;
+    int pixel_recent_spikes;
+} WmNeuralPixel;
+
+typedef struct {
+    int task_id;
+    int priority;
+    int target_pixel;
+    int base_integration;
+    int fire_threshold;
+    const char *task_name;
+    int saved_voltages[5];
+    int saved_weights[5];
+    int saved_thresholds[5];
+    int last_spike_count;
+    int spikes_per_second;
+    int state;
+} WmTaskControlBlock;
+
+extern WmTaskControlBlock task_list[2];
+extern WmNeuralPixel os_memory_map[2];
 
 /* Runtime timezone offset from UTC in minutes; configurable via shell. */
 static int wm_tz_offset_minutes = 0;
@@ -82,6 +120,32 @@ static void draw_rect(int x, int y, int w, int h, uint32_t c) {
 
 static void draw_filled_rect(int x, int y, int w, int h, uint32_t c) {
     clear_region(x, y, x + w, y + h, c);
+}
+
+static void draw_line_segment(int x0, int y0, int x1, int y1, uint32_t color) {
+    int dx = (x1 > x0) ? (x1 - x0) : (x0 - x1);
+    int sx = (x0 < x1) ? 1 : -1;
+    int dy = -((y1 > y0) ? (y1 - y0) : (y0 - y1));
+    int sy = (y0 < y1) ? 1 : -1;
+    int err = dx + dy;
+
+    for (;;) {
+        put_pixel(x0, y0, color);
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        {
+            int e2 = err << 1;
+            if (e2 >= dy) {
+                err += dy;
+                x0 += sx;
+            }
+            if (e2 <= dx) {
+                err += dx;
+                y0 += sy;
+            }
+        }
+    }
 }
 
 static uint32_t blend_50(uint32_t a, uint32_t b) {
@@ -275,6 +339,293 @@ static void draw_glass_rect(int x, int y, int w, int h, uint32_t tint) {
     draw_vline(x + w - 1, y + 1, y + h - 1, 0x08131A);
 }
 
+static void draw_content_launcher(int x, int y, int w, int h) {
+    draw_filled_rect(x + 8, y + 8, w - 16, h - 16, 0x102232);
+    draw_rect(x + 8, y + 8, w - 16, h - 16, 0x3A627B);
+    cursor_x = x + 12;
+    cursor_y = y + 12;
+    gprint("Launcher", 0xAEDDFF);
+    cursor_x = x + 12;
+    cursor_y = y + 28;
+    gprint("Neural Viz: live spike raster", 0x8FB8CC);
+    cursor_x = x + 12;
+    cursor_y = y + 42;
+    gprint("Console: interactive shell input", 0x8FB8CC);
+    cursor_x = x + 12;
+    cursor_y = y + 56;
+    gprint("Profiler: spike intensity bars", 0x8FB8CC);
+    cursor_x = x + 12;
+    cursor_y = y + 70;
+    gprint("Settings: timezone and storage", 0x8FB8CC);
+}
+
+static void draw_content_neuroviz(int x, int y, int w, int h) {
+    int px = x + 6;
+    int py = y + 6;
+    int pw = w - 12;
+    int ph = h - 12;
+    int hud_w = pw / 3;
+    int graph_x = px + hud_w + 8;
+    int graph_w = pw - hud_w - 14;
+    int graph_y = py + 26;
+    int graph_h = ph - 36;
+    int i;
+    int recent_spike = 0;
+    int prev_x = 0;
+    int prev_y = 0;
+
+    if (pw < 180 || ph < 110) {
+        draw_filled_rect(px, py, pw, ph, 0x071726);
+        cursor_x = px + 8;
+        cursor_y = py + 8;
+        gprint("Neural Viz", 0xAEDDFF);
+        return;
+    }
+
+    draw_filled_rect(px, py, pw, ph, 0x061425);
+    draw_rect(px, py, pw, ph, 0x2A526D);
+    draw_hline(py + 18, px + 1, px + pw - 1, 0x1F4962);
+
+    cursor_x = px + 8;
+    cursor_y = py + 4;
+    gprint("NEURAL WAVEFORM HUD CORE", 0x84D8FF);
+
+    /* Left HUD panel */
+    draw_filled_rect(px + 6, py + 26, hud_w - 8, graph_h, 0x01233D);
+    draw_rect(px + 6, py + 26, hud_w - 8, graph_h, 0x1E4F6A);
+    cursor_x = px + 12;
+    cursor_y = py + 30;
+    gprint("SPIKE HUD", 0x88D8FF);
+    cursor_x = px + 12;
+    cursor_y = py + 46;
+    gprint("P0 SPS:", 0xA8C8DC);
+    gprint_dec(task_list[0].spikes_per_second, 0x6CFFA4);
+    cursor_x = px + 12;
+    cursor_y = py + 60;
+    gprint("P1 SPS:", 0xA8C8DC);
+    gprint_dec(task_list[1].spikes_per_second, 0x6CFFA4);
+
+    for (i = 0; i < 16; i++) {
+        if (potentials[i] >= 900) {
+            recent_spike++;
+        }
+    }
+    cursor_x = px + 12;
+    cursor_y = py + 74;
+    gprint("RECENT:", 0xA8C8DC);
+    gprint_dec(recent_spike, 0xFFD766);
+    gprint("/16", 0xA8C8DC);
+
+    cursor_x = px + 12;
+    cursor_y = py + 92;
+    gprint("PH0:", 0xA8C8DC);
+    gprint(os_memory_map[0].current_phase ? "RIGID" : "FLUID",
+           os_memory_map[0].current_phase ? 0xFF8F7D : 0x74FFAE);
+    cursor_x = px + 12;
+    cursor_y = py + 106;
+    gprint("PH1:", 0xA8C8DC);
+    gprint(os_memory_map[1].current_phase ? "RIGID" : "FLUID",
+           os_memory_map[1].current_phase ? 0xFF8F7D : 0x74FFAE);
+
+    /* Main waveform panel */
+    draw_filled_rect(graph_x, graph_y, graph_w, graph_h, 0x000A33);
+    draw_rect(graph_x, graph_y, graph_w, graph_h, 0x204A63);
+    for (i = 1; i < 4; i++) {
+        int gy = graph_y + (i * graph_h) / 4;
+        draw_hline(gy, graph_x + 1, graph_x + graph_w - 1, 0x102B46);
+    }
+    draw_hline(graph_y + graph_h - 10, graph_x + 1, graph_x + graph_w - 1, 0x2D5E7A);
+
+    for (i = 0; i < 16; i++) {
+        int x0 = graph_x + 10 + (i * (graph_w - 20)) / 15;
+        int pot = potentials[i];
+        int pulse = ((((int)tick >> 1) + (i * 11)) & 15);
+        int hgt = 10 + (pot / 32) + (pulse * 5);
+        int max_h = graph_h - 26;
+        uint32_t c;
+        int y0;
+
+        if (hgt > max_h) {
+            hgt = max_h;
+        }
+        y0 = graph_y + graph_h - 10 - hgt;
+        c = (pot > 850) ? 0xFFDD55 : ((i & 1) ? 0x58E6FF : 0x59FFC1);
+
+        draw_filled_rect(x0 - 2, y0, 5, hgt, c);
+        draw_line_segment(x0, graph_y + graph_h - 10, x0, y0, c);
+
+        if (i == 0) {
+            prev_x = x0;
+            prev_y = y0;
+        } else {
+            draw_line_segment(prev_x, prev_y, x0, y0, 0x7CC8FF);
+            prev_x = x0;
+            prev_y = y0;
+        }
+
+        if ((i & 3) == 0) {
+            cursor_x = x0 - 4;
+            cursor_y = graph_y + graph_h - 6;
+            gprint_dec(i, 0x8FB8CC);
+        }
+    }
+}
+
+static void draw_console_line_clipped(int x, int y, int max_chars, const char *text, uint32_t color) {
+    int i = 0;
+    cursor_x = x;
+    cursor_y = y;
+    while (text[i] && i < max_chars) {
+        char ch[2];
+        ch[0] = text[i];
+        ch[1] = '\0';
+        gprint(ch, color);
+        i++;
+    }
+}
+
+static void draw_content_console(int x, int y, int w, int h) {
+    int tx = x + 8;
+    int ty = y + 8;
+    int tw = w - 16;
+    int th = h - 16;
+    int chars = (tw - 14) / 8;
+    int i;
+
+    draw_filled_rect(tx, ty, tw, th, 0x071621);
+    draw_rect(tx, ty, tw, th, 0x3A627B);
+
+    cursor_x = tx + 6;
+    cursor_y = ty + 6;
+    gprint("Axiom Console", 0xAEDDFF);
+
+    if (cmd_output_valid) {
+        draw_console_line_clipped(tx + 6, ty + 24, chars, cmd_output, 0x68E8A3);
+    }
+
+    cursor_x = tx + 6;
+    cursor_y = ty + th - 22;
+    gprint("> ", 0x55FF88);
+    for (i = 0; i < buffer_idx && i < 31 && i < chars - 3; i++) {
+        char ch[2];
+        ch[0] = (char)input_buffer[i];
+        ch[1] = '\0';
+        gprint(ch, 0xEAF2F8);
+    }
+
+    if ((tick / 20) % 2 == 0) {
+        int cx = tx + 22 + (buffer_idx * 8);
+        if (cx < tx + tw - 8) {
+            draw_filled_rect(cx, ty + th - 22, 6, 10, 0x8FD3FF);
+        }
+    }
+}
+
+static void draw_content_profiler(int x, int y, int w, int h) {
+    int i;
+    int tx = x + 8;
+    int ty = y + 8;
+    int tw = w - 16;
+    int th = h - 16;
+    int peak = 0;
+    int total = 0;
+    int bars_x = tx + 10;
+    int bars_h = th - 54;
+
+    draw_filled_rect(tx, ty, tw, th, 0x101E2A);
+    draw_rect(tx, ty, tw, th, 0x3A627B);
+    draw_hline(ty + 18, tx + 1, tx + tw - 1, 0x294E67);
+
+    cursor_x = x + 10;
+    cursor_y = y + 10;
+    gprint("Neural Spike Profiler", 0xAEDDFF);
+
+    if (tw < 180 || th < 90) {
+        return;
+    }
+
+    for (i = 0; i < 16; i++) {
+        if (potentials[i] > peak) {
+            peak = potentials[i];
+        }
+        total += potentials[i];
+    }
+
+    cursor_x = tx + 10;
+    cursor_y = ty + 24;
+    gprint("Peak:", 0x9BC7DF);
+    gprint_dec(peak, 0xFFFFFF);
+    gprint(" Avg:", 0x9BC7DF);
+    gprint_dec(total / 16, 0xFFFFFF);
+
+    draw_hline(ty + th - 10, tx + 10, tx + tw - 10, 0x2A4255);
+    for (i = 0; i < 6; i++) {
+        int src = (i * 2) % 16;
+        int base = potentials[src] + potentials[src + 1];
+        int pulse = ((((int)tick / 2) + i * 17) & 31) * 12;
+        int v = base + pulse;
+        int bar_h = (v > 2000 ? bars_h : (v * bars_h) / 2000);
+        int bx = bars_x + 8 + i * ((tw - 26) / 6);
+        if (bar_h < 4) bar_h = 4;
+        draw_filled_rect(bx, ty + th - 10 - bar_h, 20, bar_h,
+                         (i & 1) ? 0x4AA7DF : 0x56D8B2);
+        cursor_x = bx + 4;
+        cursor_y = ty + th - 8;
+        gprint_dec(src / 2, 0x8FB8CC);
+
+        cursor_x = bx + 1;
+        cursor_y = ty + th - 20 - bar_h;
+        gprint_dec(v / 20, 0xA8CDE2);
+    }
+
+    cursor_x = tx + 10;
+    cursor_y = ty + th - 14;
+    gprint("Group spike load", 0x8FB8CC);
+}
+
+static void draw_content_settings(int x, int y, int w, int h) {
+    int tz = wm_get_timezone_offset_minutes();
+    int abs_tz = tz < 0 ? -tz : tz;
+    int hh = abs_tz / 60;
+    int mm = abs_tz % 60;
+    int used = storage_snapshot_used_count();
+    int cap = storage_snapshot_capacity();
+    int free_pages = pmm_get_free_pages();
+
+    draw_filled_rect(x + 8, y + 8, w - 16, h - 16, 0x111E2A);
+    draw_rect(x + 8, y + 8, w - 16, h - 16, 0x3A627B);
+
+    cursor_x = x + 10;
+    cursor_y = y + 10;
+    gprint("Settings", 0xAEDDFF);
+
+    cursor_x = x + 10;
+    cursor_y = y + 28;
+    gprint("TZ: ", 0x9EC4D8);
+    gprint(tz < 0 ? "-" : "+", 0xEAF2F8);
+    if (hh < 10) gprint("0", 0xEAF2F8);
+    gprint_dec(hh, 0xEAF2F8);
+    gprint(":", 0xEAF2F8);
+    if (mm < 10) gprint("0", 0xEAF2F8);
+    gprint_dec(mm, 0xEAF2F8);
+
+    cursor_x = x + 10;
+    cursor_y = y + 44;
+    gprint("Snapshots: ", 0x9EC4D8);
+    gprint_dec(used, 0xEAF2F8);
+    gprint("/", 0x9EC4D8);
+    gprint_dec(cap, 0xEAF2F8);
+
+    cursor_x = x + 10;
+    cursor_y = y + 60;
+    gprint("Free pages: ", 0x9EC4D8);
+    gprint_dec(free_pages, 0xEAF2F8);
+
+    cursor_x = x + 10;
+    cursor_y = y + 76;
+    gprint("Use: tz show | tz set +/-HH:MM", 0x8FB8CC);
+}
+
 /* ------------------------------------------------------------ */
 /*  Initialisation                                               */
 /* ------------------------------------------------------------ */
@@ -293,6 +644,13 @@ void wm_init(void) {
     z_count = 0;
     wm_focused = -1;
     wm_load_timezone_from_cmos();
+
+    /* Register default desktop windows bound to dock icon slots. */
+    wm_add_window(62, 78, 300, 170, "Launcher", draw_content_launcher, 0, 1);
+    wm_add_window(110, 120, 430, 240, "Neural Viz", draw_content_neuroviz, 0, 2);
+    wm_add_window(156, 92, 360, 180, "Console", draw_content_console, 1, 3);
+    wm_add_window(450, 110, 280, 210, "Profiler", draw_content_profiler, 0, 4);
+    wm_add_window(480, 150, 250, 150, "Settings", draw_content_settings, 0, 5);
 }
 
 int wm_add_window(int x, int y, int w, int h, const char *title,

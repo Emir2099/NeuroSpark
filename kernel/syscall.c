@@ -72,6 +72,17 @@ static int validate_user_string(const char *s) {
   return 0;
 }
 
+static int validate_user_ptr(const void *ptr, uint32_t size) {
+  if (ptr == (const void *)0 || size == 0) {
+    return 0;
+  }
+  return is_user_range(ptr, size);
+}
+
+static int validate_user_int_ptr(const int *p) {
+  return validate_user_ptr((const void *)p, sizeof(int));
+}
+
 /* ============================================================
  * Flip mutex (defined in kernel.c)
  * Prevents the keyboard ISR from calling gprint while
@@ -93,7 +104,7 @@ void syscall_handler(uint32_t *regs) {
   /* ---- SYS_WRITE (4): write a NUL-terminated string via gprint ---- */
   case SYS_WRITE: {
     char *msg = (char *)regs[4]; /* EBX */
-    if (cpl == 3 && !validate_user_string(msg)) {
+    if (cpl == 3 && (!validate_user_ptr(msg, 1) || !validate_user_string(msg))) {
       regs[7] = NS_ERR_BAD_POINTER;
       break;
     }
@@ -174,10 +185,18 @@ void syscall_handler(uint32_t *regs) {
   case SYS_IPC_RECV: {
     int channel = (int)regs[4];
     int out = 0;
+    int *user_out = (int *)regs[5];
     if (channel < 0 || channel >= IPC_CHANNELS) {
       regs[7] = NS_ERR_BAD_POINTER;
+    } else if (cpl == 3 && !validate_user_int_ptr(user_out)) {
+      regs[7] = NS_ERR_BAD_POINTER;
     } else if (ipc_recv(channel, &out)) {
-      regs[7] = (uint32_t)out;
+      if (user_out != 0 && cpl == 3) {
+        *user_out = out;
+        regs[7] = NS_OK;
+      } else {
+        regs[7] = (uint32_t)out;
+      }
     } else {
       regs[7] = NS_ERR_WOULD_BLOCK;
     }
