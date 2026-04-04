@@ -178,33 +178,25 @@ void init_input_stack(void) {
   mouse_buttons = 0;
 
   /* Enable auxiliary PS/2 mouse device and streaming packets (IRQ12). */
-  if (!wait_input_empty())
-    return;
+  (void)wait_input_empty();
   outb(0x64, 0xA8);
 
-  if (!wait_input_empty())
-    return;
+  (void)wait_input_empty();
   outb(0x64, 0x20);
-  if (!wait_output_full())
-    return;
+  (void)wait_output_full();
   uint8_t status = inb(0x60);
 
   status |= 0x02;
-  if (!wait_input_empty())
-    return;
+  (void)wait_input_empty();
   outb(0x64, 0x60);
-  if (!wait_input_empty())
-    return;
+  (void)wait_input_empty();
   outb(0x60, status);
 
-  if (!wait_input_empty())
-    return;
+  (void)wait_input_empty();
   outb(0x64, 0xD4);
-  if (!wait_input_empty())
-    return;
+  (void)wait_input_empty();
   outb(0x60, 0xF4); /* Enable streaming */
-  if (!wait_output_full())
-    return;
+  (void)wait_output_full();
   (void)inb(0x60); /* ACK (or controller response) */
   mouse_enabled = 1;
 }
@@ -223,6 +215,13 @@ void keyboard_handler(void) {
 
   char c = get_ascii(code);
 
+    uint8_t status = inb(0x64);
+    if ((status & 0x01) == 0) {
+      return;
+    }
+    if ((status & 0x20) == 0) {
+      return;
+    }
   if (code == 0x1C) {
     input_buffer[buffer_idx] = '\0';
     char cmd_copy[32];
@@ -238,6 +237,9 @@ void keyboard_handler(void) {
   if (code == 0x0E && buffer_idx > 0) {
     buffer_idx--;
     shell_dirty = 1;
+    if (mouse_packet[0] & 0xC0) {
+      return;
+    }
     return;
   }
 
@@ -282,9 +284,10 @@ void keyboard_handler(void) {
 }
 
 void mouse_handler(void) {
-    if (!mouse_enabled) {
-      return;
-    }
+  if (!mouse_enabled) {
+    return;
+  }
+
   int x_delta;
   int y_delta;
   uint8_t data = inb(0x60);
@@ -298,6 +301,11 @@ void mouse_handler(void) {
     return;
   }
   mouse_packet_idx = 0;
+
+  /* Drop overflow packets to avoid wild jumps and desync. */
+  if (mouse_packet[0] & 0xC0) {
+    return;
+  }
 
   x_delta = (int)((signed char)mouse_packet[1]);
   y_delta = (int)((signed char)mouse_packet[2]);

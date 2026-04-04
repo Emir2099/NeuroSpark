@@ -7,7 +7,8 @@ KERNEL_SEGMENT equ 0x1000
 ; Read in two passes to support kernels larger than 127 sectors while
 ; keeping each INT 13h request BIOS-safe.
 KERNEL_LOAD_SECTORS equ 127
-KERNEL_LOAD_EXTRA_SECTORS equ 64
+KERNEL_LOAD_EXTRA_SECTORS equ 127
+KERNEL_LOAD_THIRD_SECTORS equ 127
 %define FORCE_TEXT_MODE 0
 
 ; Entry point - BIOS loads us at 0x7c00
@@ -35,18 +36,16 @@ start:
 %if FORCE_TEXT_MODE
     ; Keep VGA text mode for maximum compatibility.
     mov dword [vbe_framebuffer], 0
-    mov dword [0x500], 0
-    mov dword [0x504], 0
-    mov dword [0x508], 0
+    mov dword [vbe_pitch], 0
+    mov dword [vbe_bpp], 0
     jmp .vesa_done
 %endif
 
     ; --- VESA GATEWAY TO GRAPHICS START ---
     ; Default to "no framebuffer"; kernel may fallback safely.
     mov dword [vbe_framebuffer], 0
-    mov dword [0x500], 0
-    mov dword [0x504], 0
-    mov dword [0x508], 0
+    mov dword [vbe_pitch], 0
+    mov dword [vbe_bpp], 0
 
     ; 1. Get VBE Mode Information
     mov ax, 0x4F01          ; VBE Get Mode Info function
@@ -61,18 +60,16 @@ start:
     ; Offset 16: BytesPerScanLine (pitch)
     xor eax, eax
     mov ax, [0x8000 + 16]
-    mov [0x504], eax
+    mov [vbe_pitch], eax
 
     ; Offset 25: BitsPerPixel
     xor eax, eax
     mov al, [0x8000 + 25]
-    mov [0x508], eax
+    mov [vbe_bpp], eax
 
     ; Offset 40: PhysBasePtr
     mov eax, [0x8000 + 40]
     mov [vbe_framebuffer], eax
-    ; Store at 0x500 (BDA free area, safe from kernel load at 0x1000+)
-    mov [0x500], eax
 
     ; 3. Set the VBE Mode
     mov ax, 0x4F02          ; VBE Set Mode function
@@ -86,6 +83,14 @@ start:
 
     ; Load kernel from disk using LBA
     call load_kernel
+
+    ; Copy VBE handoff values AFTER BIOS disk I/O to avoid scratch-memory clobber.
+    mov eax, [vbe_framebuffer]
+    mov [0x500], eax
+    mov eax, [vbe_pitch]
+    mov [0x504], eax
+    mov eax, [vbe_bpp]
+    mov [0x508], eax
     
     ; Enter protected mode
     cli
@@ -140,6 +145,12 @@ load_kernel:
     jc disk_error
 
     mov si, dap2             ; Pass 2: extra sectors from LBA 128 -> next segment
+    mov ah, 0x42
+    mov dl, [BOOT_DRIVE]
+    int 0x13
+    jc disk_error
+
+    mov si, dap3             ; Pass 3: extra sectors from LBA 255 -> next segment
     mov ah, 0x42
     mov dl, [BOOT_DRIVE]
     int 0x13
@@ -259,6 +270,15 @@ dap2:
     dw (KERNEL_SEGMENT + 0x0FE0)
     dq 128                    ; Continue loading from LBA 128
 
+dap3:
+    db 0x10
+    db 0
+    dw KERNEL_LOAD_THIRD_SECTORS
+    dw 0x0000
+    ; Segment advance: 2 * 0x0FE0 paragraphs from first load
+    dw (KERNEL_SEGMENT + 0x1FC0)
+    dq 255                    ; Continue loading from LBA 255
+
 ; GDT Definition
 gdt_start:
     ; Null descriptor
@@ -290,6 +310,8 @@ gdt_descriptor:
 
 BOOT_DRIVE: db 0
 vbe_framebuffer: dd 0       ; Variable to store LFB address for Kernel access
+vbe_pitch: dd 0
+vbe_bpp: dd 0
 
 ; Pad to 510 bytes and add boot signature
 times 510-($-$$) db 0
