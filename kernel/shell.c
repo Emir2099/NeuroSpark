@@ -11,6 +11,7 @@
 #include "task.h"
 #include "scheduler.h"
 #include "dashboard.h"
+#include "wm.h"
 
 typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
@@ -70,6 +71,8 @@ extern void disk_write_sector(uint32_t lba, uint16_t *buffer);
 extern void disk_read_sector(uint32_t lba, uint16_t *buffer);
 extern void pci_print_results(void);
 extern void set_cmd_output(const char *text);
+extern int wm_set_timezone_offset_minutes(int minutes);
+extern int wm_get_timezone_offset_minutes(void);
 
 void process_command(char *cmd);
 
@@ -372,6 +375,54 @@ static void replay_record_command(const char *cmd) {
   }
 }
 
+static int parse_tz_offset_minutes(const char *s, int *out_minutes) {
+  int i = 0;
+  int sign = 1;
+  int hours = 0;
+  int mins = 0;
+  int saw_digit = 0;
+
+  if (s == 0 || out_minutes == 0 || s[0] == '\0') {
+    return 0;
+  }
+
+  if (s[i] == '+') {
+    i++;
+  } else if (s[i] == '-') {
+    sign = -1;
+    i++;
+  }
+
+  while (s[i] >= '0' && s[i] <= '9') {
+    saw_digit = 1;
+    hours = (hours * 10) + (s[i] - '0');
+    i++;
+  }
+
+  if (!saw_digit) {
+    return 0;
+  }
+
+  if (s[i] == ':') {
+    i++;
+    if (!(s[i] >= '0' && s[i] <= '9' && s[i + 1] >= '0' && s[i + 1] <= '9')) {
+      return 0;
+    }
+    mins = ((s[i] - '0') * 10) + (s[i + 1] - '0');
+    i += 2;
+    if (mins < 0 || mins > 59) {
+      return 0;
+    }
+  }
+
+  if (s[i] != '\0') {
+    return 0;
+  }
+
+  *out_minutes = sign * ((hours * 60) + mins);
+  return 1;
+}
+
 static int preset_profile(const char *preset, int *weight_delta, int *thr_delta,
                           int *base_integration, int *fire_threshold) {
   if (str_ieq(preset, "calm")) {
@@ -446,6 +497,54 @@ static void cmd_help(const char *args) {
   gprint("          viz compare <a> <b>  viz export <path>\n", 0x88E0FF);
   gprint("phase6:   synview synset synrule synpreset syncmp\n", 0x77C8FF);
   gprint("          sbrowse spreview stag sdiff\n", 0x77C8FF);
+  gprint("system:   tz show | tz set <+HH[:MM]|-HH[:MM]>\n", 0x77C8FF);
+}
+
+static void cmd_tz(const char *args) {
+  char sub[16];
+  char val[16];
+  int minutes = 0;
+  int abs_minutes = 0;
+  int hh = 0;
+  int mm = 0;
+
+  args = next_token(args, sub, sizeof(sub));
+  next_token(args, val, sizeof(val));
+
+  if (sub[0] == '\0' || str_ieq(sub, "show")) {
+    minutes = wm_get_timezone_offset_minutes();
+    abs_minutes = minutes < 0 ? -minutes : minutes;
+    hh = abs_minutes / 60;
+    mm = abs_minutes % 60;
+
+    gprint("TZ OFFSET: ", 0x99EEFF);
+    gprint(minutes < 0 ? "-" : "+", minutes < 0 ? 0xFFAA66 : 0x77FFAA);
+    if (hh < 10) gprint("0", 0xFFFFFF);
+    gprint_dec(hh, 0xFFFFFF);
+    gprint(":", 0x99EEFF);
+    if (mm < 10) gprint("0", 0xFFFFFF);
+    gprint_dec(mm, 0xFFFFFF);
+    gprint("\n", 0x000000);
+    set_cmd_output("TZ SHOW");
+    return;
+  }
+
+  if (!str_ieq(sub, "set") || val[0] == '\0') {
+    set_cmd_output("USAGE: tz show | tz set <+HH[:MM]|-HH[:MM]>");
+    return;
+  }
+
+  if (!parse_tz_offset_minutes(val, &minutes)) {
+    set_cmd_output("TZ FORMAT ERR");
+    return;
+  }
+
+  if (!wm_set_timezone_offset_minutes(minutes)) {
+    set_cmd_output("TZ RANGE ERR (-12:00..+14:00)");
+    return;
+  }
+
+  set_cmd_output("TZ SET+SAVED");
 }
 
 static void cmd_viz(const char *args) {
@@ -2063,6 +2162,7 @@ static const CommandEntry command_table[] = {
     {"spreview", cmd_spreview},
     {"stag", cmd_stag},
     {"sdiff", cmd_sdiff},
+    {"tz", cmd_tz},
 };
 
 void process_command(char *cmd) {

@@ -60,6 +60,6 @@ clean:
 
 # Run in QEMU
 run: NeuroSpark.bin
-	qemu-system-i386 -vga std -drive file=$<,format=raw,index=0,media=disk
+	qemu-system-i386 -vga std -rtc base=localtime,clock=host -drive file=$<,format=raw,index=0,media=disk
 
 .PHONY: all clean run

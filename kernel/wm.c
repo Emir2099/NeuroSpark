@@ -27,6 +27,21 @@ extern volatile int mouse_buttons;
 extern uint32_t backbuffer[];
 
 extern int pmm_get_free_pages(void);
+extern int storage_snapshot_used_count(void);
+extern int storage_snapshot_capacity(void);
+
+typedef unsigned short uint16_t;
+typedef unsigned char uint8_t;
+
+/* Runtime timezone offset from UTC in minutes; configurable via shell. */
+static int wm_tz_offset_minutes = 0;
+
+#define WM_TZ_CMOS_SIG_A_REG 0x38
+#define WM_TZ_CMOS_SIG_B_REG 0x39
+#define WM_TZ_CMOS_LO_REG    0x3A
+#define WM_TZ_CMOS_HI_REG    0x3B
+#define WM_TZ_CMOS_SIG_A     0x54  /* 'T' */
+#define WM_TZ_CMOS_SIG_B     0x5A  /* 'Z' */
 
 /* ------------------------------------------------------------ */
 /*  Window state                                                 */
@@ -37,6 +52,7 @@ int wm_focused = -1;
 
 static int z_order[WM_MAX_WINDOWS];
 static int z_count = 0;
+static int power_menu_open = 0;
 
 
 /* Taskbar icon labels */
@@ -78,6 +94,170 @@ static uint32_t blend_50(uint32_t a, uint32_t b) {
     return (((ar + br) >> 1) << 16) | (((ag + bg) >> 1) << 8) | ((ab + bb) >> 1);
 }
 
+static inline uint8_t inb(uint16_t port) {
+    uint8_t ret;
+    __asm__ volatile("inb %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
+static inline void outb(uint16_t port, uint8_t val) {
+    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline void outw(uint16_t port, uint16_t val) {
+    __asm__ volatile("outw %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static uint8_t cmos_read(uint8_t reg) {
+    outb(0x70, (uint8_t)(reg & 0x7F));
+    return inb(0x71);
+}
+
+static void cmos_write(uint8_t reg, uint8_t value) {
+    outb(0x70, (uint8_t)(reg & 0x7F));
+    outb(0x71, value);
+}
+
+static void wm_load_timezone_from_cmos(void) {
+    uint8_t sig_a = cmos_read(WM_TZ_CMOS_SIG_A_REG);
+    uint8_t sig_b = cmos_read(WM_TZ_CMOS_SIG_B_REG);
+    int minutes;
+
+    if (sig_a != WM_TZ_CMOS_SIG_A || sig_b != WM_TZ_CMOS_SIG_B) {
+        return;
+    }
+
+    minutes = (int)(short)((unsigned short)cmos_read(WM_TZ_CMOS_LO_REG) |
+                           ((unsigned short)cmos_read(WM_TZ_CMOS_HI_REG) << 8));
+    if (minutes < -720 || minutes > 840) {
+        return;
+    }
+    wm_tz_offset_minutes = minutes;
+}
+
+static void wm_save_timezone_to_cmos(void) {
+    unsigned short raw = (unsigned short)(short)wm_tz_offset_minutes;
+    cmos_write(WM_TZ_CMOS_SIG_A_REG, WM_TZ_CMOS_SIG_A);
+    cmos_write(WM_TZ_CMOS_SIG_B_REG, WM_TZ_CMOS_SIG_B);
+    cmos_write(WM_TZ_CMOS_LO_REG, (uint8_t)(raw & 0xFF));
+    cmos_write(WM_TZ_CMOS_HI_REG, (uint8_t)((raw >> 8) & 0xFF));
+}
+
+static int bcd_to_bin(int v) {
+    return ((v >> 4) * 10) + (v & 0x0F);
+}
+
+static void system_reboot(void) {
+    __asm__ volatile("cli");
+
+    /* 8042 keyboard controller reset (common legacy path). */
+    outb(0x64, 0xFE);
+
+    /* PCI reset control fallback (QEMU/real chipsets). */
+    outb(0xCF9, 0x02);
+    outb(0xCF9, 0x06);
+
+    /* Last resort: force triple fault reset. */
+    {
+        struct {
+            uint16_t limit;
+            uint32_t base;
+        } __attribute__((packed)) null_idt = {0, 0};
+        __asm__ volatile("lidt %0" : : "m"(null_idt));
+        __asm__ volatile("int3");
+    }
+
+    for (;;) {
+        __asm__ volatile("hlt");
+    }
+}
+
+static void system_shutdown(void) {
+    __asm__ volatile("cli");
+    /* QEMU/Bochs/ISA debug shutdown fallbacks. */
+    outw(0x604, 0x2000);   /* QEMU ACPI poweroff */
+    outw(0xB004, 0x2000);  /* Bochs/QEMU legacy */
+    outw(0x4004, 0x3400);  /* VirtualBox/others */
+    for (;;) {
+        __asm__ volatile("hlt");
+    }
+}
+
+static void read_rtc_hm(int *out_h, int *out_m) {
+    int h = 0, h2 = 0;
+    int m = 0, m2 = 0;
+    int s = 0, s2 = 0;
+    int reg_b = 0;
+    int tries = 0;
+
+    do {
+        tries = 0;
+        while ((cmos_read(0x0A) & 0x80) && tries < 100000) {
+            tries++;
+        }
+        s = cmos_read(0x00);
+        m = cmos_read(0x02);
+        h = cmos_read(0x04);
+
+        tries = 0;
+        while ((cmos_read(0x0A) & 0x80) && tries < 100000) {
+            tries++;
+        }
+        s2 = cmos_read(0x00);
+        m2 = cmos_read(0x02);
+        h2 = cmos_read(0x04);
+    } while (s != s2 || m != m2 || h != h2);
+
+    reg_b = cmos_read(0x0B);
+
+    if ((reg_b & 0x04) == 0) {
+        s = bcd_to_bin(s);
+        m = bcd_to_bin(m);
+        h = bcd_to_bin(h & 0x7F) | (h & 0x80);
+    }
+
+    if ((reg_b & 0x02) == 0) {
+        int pm = h & 0x80;
+        h &= 0x7F;
+        if (pm && h < 12) h += 12;
+        if (!pm && h == 12) h = 0;
+    }
+
+    if (h < 0 || h > 23) h = 0;
+    if (m < 0 || m > 59) m = 0;
+
+    /* Apply timezone offset and wrap to local wall-clock time. */
+    {
+        int total = (h * 60) + m + wm_tz_offset_minutes;
+        while (total < 0) total += 24 * 60;
+        while (total >= 24 * 60) total -= 24 * 60;
+        h = total / 60;
+        m = total % 60;
+    }
+
+    (void)s;
+    *out_h = h;
+    *out_m = m;
+}
+
+/* ACPI/APM battery backend is not present yet; return -1 when unavailable. */
+static int read_battery_percent(void) {
+    return -1;
+}
+
+int wm_set_timezone_offset_minutes(int minutes) {
+    if (minutes < -720 || minutes > 840) {
+        return 0;
+    }
+    wm_tz_offset_minutes = minutes;
+    wm_save_timezone_to_cmos();
+    return 1;
+}
+
+int wm_get_timezone_offset_minutes(void) {
+    return wm_tz_offset_minutes;
+}
+
 static void draw_glass_rect(int x, int y, int w, int h, uint32_t tint) {
     int yy, xx;
     for (yy = y; yy < y + h; yy++) {
@@ -112,6 +292,7 @@ void wm_init(void) {
     wm_window_count = 0;
     z_count = 0;
     wm_focused = -1;
+    wm_load_timezone_from_cmos();
 }
 
 int wm_add_window(int x, int y, int w, int h, const char *title,
@@ -296,31 +477,46 @@ static void draw_taskbar(void) {
         gprint((char *)lbl, 0xBFD6E4);
     }
 
-    /* Right-side glass status widget: time, battery and memory space. */
+    /* Right-side glass status widget: real RTC time + real snapshot space. */
     {
         int wx = 646;
         int wy = WM_TASKBAR_Y - 2;
         int ww = 150;
         int wh = 50;
-        uint32_t secs = tick / 100;
-        uint32_t mins = secs / 60;
-        uint32_t hrs  = mins / 60;
-        int battery = 62 + (int)((tick / 300) % 32);
-        int free_mb = pmm_get_free_pages() * 4 / 1024;
+        int hrs = 0;
+        int mins = 0;
+        int battery = read_battery_percent();
+        int on_ac = 0;
+        int used = storage_snapshot_used_count();
+        int cap = storage_snapshot_capacity();
+        int space_pct = (cap > 0) ? ((used * 100) / cap) : 0;
 
         char tbuf[6];
-        char bbuf[5];
+        char bbuf[8];
+        read_rtc_hm(&hrs, &mins);
+
         tbuf[0] = (char)('0' + (hrs % 100) / 10);
         tbuf[1] = (char)('0' + hrs % 10);
         tbuf[2] = ':';
-        tbuf[3] = (char)('0' + (mins % 60) / 10);
+        tbuf[3] = (char)('0' + (mins / 10));
         tbuf[4] = (char)('0' + mins % 10);
         tbuf[5] = '\0';
 
-        bbuf[0] = (char)('0' + (battery / 10));
-        bbuf[1] = (char)('0' + (battery % 10));
-        bbuf[2] = '%';
-        bbuf[3] = '\0';
+        if (battery >= 0 && battery <= 100) {
+            bbuf[0] = (char)('0' + (battery / 10));
+            bbuf[1] = (char)('0' + (battery % 10));
+            bbuf[2] = '%';
+            bbuf[3] = '\0';
+        } else {
+            /* No battery telemetry exposed: treat as line-powered desktop. */
+            battery = 100;
+            on_ac = 1;
+            bbuf[0] = '1';
+            bbuf[1] = '0';
+            bbuf[2] = '0';
+            bbuf[3] = '%';
+            bbuf[4] = '\0';
+        }
 
         draw_glass_rect(wx, wy, ww, wh, 0x263F56);
 
@@ -336,12 +532,42 @@ static void draw_taskbar(void) {
         cursor_x = wx + 106;
         cursor_y = wy + 8;
         gprint(bbuf, 0xCDE3F2);
+        if (on_ac) {
+            cursor_x = wx + 130;
+            cursor_y = wy + 8;
+            gprint("AC", 0xA9C7D9);
+        }
 
         cursor_x = wx + 12;
         cursor_y = wy + 28;
         gprint("Space:", 0x9FC2D8);
-        gprint_dec(free_mb, 0xBDEBFF);
-        gprint("MB", 0x9FC2D8);
+        gprint_dec(used, 0xBDEBFF);
+        gprint("/", 0x9FC2D8);
+        gprint_dec(cap, 0xBDEBFF);
+        gprint(" ", 0x9FC2D8);
+        gprint_dec(space_pct, 0xBDEBFF);
+        gprint("%", 0x9FC2D8);
+
+        if (power_menu_open) {
+            int pmx = wx;
+            int pmy = wy - 54;
+            draw_glass_rect(pmx, pmy, ww, 50, 0x223749);
+            cursor_x = pmx + 10;
+            cursor_y = pmy + 7;
+            gprint("Power", 0xE8F4FF);
+
+            clear_region(pmx + 8, pmy + 22, pmx + 68, pmy + 38, 0x2B3E51);
+            draw_rect(pmx + 8, pmy + 22, 60, 16, 0x7AA7BF);
+            cursor_x = pmx + 12;
+            cursor_y = pmy + 25;
+            gprint("Reboot", 0xDDEEFF);
+
+            clear_region(pmx + 76, pmy + 22, pmx + 142, pmy + 38, 0x5A2830);
+            draw_rect(pmx + 76, pmy + 22, 66, 16, 0xC56A72);
+            cursor_x = pmx + 98;
+            cursor_y = pmy + 25;
+            gprint("Off", 0xFFD6D6);
+        }
     }
 }
 
@@ -436,8 +662,26 @@ void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons) {
 
     if (!clicked) return;
 
+    if (power_menu_open) {
+        int pmx = 646;
+        int pmy = WM_TASKBAR_Y - 56;
+        if (pt_in_rect(mx, my, pmx + 8, pmy + 20, 60, 16)) {
+            system_reboot();
+            return;
+        }
+        if (pt_in_rect(mx, my, pmx + 76, pmy + 20, 66, 16)) {
+            system_shutdown();
+            return;
+        }
+        power_menu_open = 0;
+    }
+
     /* 1. Check taskbar clicks */
     if (my >= WM_TASKBAR_Y) {
+        if (pt_in_rect(mx, my, 646, WM_TASKBAR_Y - 2, 150, 50)) {
+            power_menu_open = !power_menu_open;
+            return;
+        }
         for (i = 0; i < WM_ICON_SLOTS; i++) {
             int cx = icon_x_pos(i);
             if (pt_in_rect(mx, my, cx - 20, WM_TASKBAR_Y + 4, 40, 46)) {
@@ -539,6 +783,7 @@ void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons) {
     }
 
     /* Click on desktop - unfocus */
+    power_menu_open = 0;
     wm_focused = -1;
 }
 

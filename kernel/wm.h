@@ -51,5 +51,7 @@ int  wm_add_window(int x, int y, int w, int h, const char *title,
 void wm_render(void);
 void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons);
 int  wm_focused_needs_keyboard(void);
+int  wm_set_timezone_offset_minutes(int minutes);
+int  wm_get_timezone_offset_minutes(void);
 
 #endif

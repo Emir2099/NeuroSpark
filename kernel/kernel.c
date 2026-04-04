@@ -1916,6 +1916,17 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
   /* Bootloader may leave IF enabled; block IRQs until IDT is ready. */
   __asm__ volatile("cli");
 
+  /* Deterministic startup: clear BSS even if firmware/loader doesn't. */
+  extern uint32_t __bss_start;
+  extern uint32_t __bss_end;
+  {
+    uint8_t *bss = (uint8_t *)&__bss_start;
+    uint32_t bss_size = (uint32_t)&__bss_end - (uint32_t)&__bss_start;
+    for (uint32_t i = 0; i < bss_size; i++) {
+      bss[i] = 0;
+    }
+  }
+
   /* Set segments - already established as safe */
   __asm__ volatile("mov $0x10, %%ax\n"
                    "mov %%ax, %%ds\n"
