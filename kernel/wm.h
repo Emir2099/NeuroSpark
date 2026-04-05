@@ -77,5 +77,7 @@ void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons);
 int  wm_focused_needs_keyboard(void);
 int  wm_set_timezone_offset_minutes(int minutes);
 int  wm_get_timezone_offset_minutes(void);
+void wm_get_taskbar_icon_center(int slot, int *out_x, int *out_y);
+void wm_launch_icon_slot(int slot);
 
 #endif

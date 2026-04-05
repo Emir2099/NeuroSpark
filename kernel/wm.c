@@ -8,6 +8,7 @@
  *   • Z-order management and focus tracking
  * ================================================================ */
 #include "wm.h"
+#include "launcher.h"
 
 /* External graphics primitives (graphics.c) */
 extern void put_pixel(int x, int y, uint32_t color);
@@ -644,6 +645,7 @@ void wm_init(void) {
     z_count = 0;
     wm_focused = -1;
     wm_load_timezone_from_cmos();
+    launcher_init();
 
     /* Register default desktop windows bound to dock icon slots. */
     wm_add_window(62, 78, 300, 170, "Launcher", draw_content_launcher, 0, 1);
@@ -786,6 +788,25 @@ static int icon_x_pos(int slot) {
     /* 6 icons, 80px each, centered in 800px */
     int start_x = (800 - WM_ICON_SLOTS * 80) / 2;
     return start_x + slot * 80 + 40; /* center of slot */
+}
+
+void wm_launch_icon_slot(int slot) {
+    int j;
+    for (j = 0; j < wm_window_count; j++) {
+        if (wm_windows[j].icon_slot == slot) {
+            wm_windows[j].visible = 1;
+            wm_windows[j].state = WM_STATE_NORMAL;
+            bring_to_front(j);
+            return;
+        }
+    }
+}
+
+void wm_get_taskbar_icon_center(int slot, int *out_x, int *out_y) {
+    if (slot < 0) slot = 0;
+    if (slot >= WM_ICON_SLOTS) slot = WM_ICON_SLOTS - 1;
+    if (out_x) *out_x = icon_x_pos(slot);
+    if (out_y) *out_y = WM_TASKBAR_Y + 14;
 }
 
 static void draw_taskbar(void) {
@@ -998,6 +1019,12 @@ void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons) {
     int released  = !(buttons & 1) && (prev_buttons & 1);
     int i;
 
+    /* Route to launcher if it's open or animating */
+    if (launcher_state.is_open || launcher_state.animation_state > 0) {
+        launcher_handle_mouse(mx, my, buttons, prev_buttons);
+        return;
+    }
+
     /* Handle active drag */
     for (i = 0; i < wm_window_count; i++) {
         WmWindow *w = &wm_windows[i];
@@ -1044,7 +1071,8 @@ void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons) {
             int cx = icon_x_pos(i);
             if (pt_in_rect(mx, my, cx - 20, WM_TASKBAR_Y + 4, 40, 46)) {
                 if (i == 0) {
-                    /* OS logo - decorative, do nothing */
+                    /* OS logo - launch NeuroDock launcher */
+                    launcher_toggle();
                     return;
                 }
                 if (i == 1) {
@@ -1212,6 +1240,9 @@ void wm_render(void) {
     /* 3. Taskbar on top */
     draw_taskbar();
 
-    /* 4. Mouse cursor on very top */
+    /* 4. NeuroDock launcher overlay */
+    launcher_render();
+
+    /* 5. Mouse cursor on very top */
     wm_draw_cursor();
 }
