@@ -1,6 +1,30 @@
 #ifndef WM_H
 #define WM_H
 
+/* Power and Time Correctness - RTC/Timezone Persistence
+ *
+ * TIMEZONE STORAGE:
+ *   - Stored in CMOS registers with magic signature validation
+ *   - Registers: 0x38 (sig_a='T'), 0x39 (sig_b='Z'), 0x3A-0x3B (offset)
+ *   - Range: -720 to +840 minutes (UTC-12 to UTC+14 coverage)
+ *   - Boot-time load: wm_init() calls wm_load_timezone_from_cmos()
+ *   - Runtime save: wm_set_timezone_offset_minutes() via shell "tz" command
+ *
+ * RTC TIME SOURCE:
+ *   - CMOS registers: 0x00 (sec), 0x02 (min), 0x04 (hour), 0x0A (status)
+ *   - BCD format conversion via bcd_to_bin()
+ *   - read_rtc_hm() fetches current HH:MM for WM clock display
+ *
+ * UTC vs LOCAL TIME:
+ *   - QEMU RTC defaults to UTC (BIOS CLOCK=utc)
+ *   - wm_tz_offset_minutes applied at display time (not stored on disk)
+ *   - Session snapshots preserve offset via CMOS persistence across reboot
+ *
+ * POWER CONTROL:
+ *   - Reboot via 8042 keyboard controller (0x64:0xFE) + PCI fallbacks
+ *   - Shutdown via QEMU ACPI port (0x604, 0xB004) + Bochs/VBox variants
+ */
+
 #ifndef _UINT32_T_DEFINED
 #define _UINT32_T_DEFINED
 typedef unsigned int uint32_t;

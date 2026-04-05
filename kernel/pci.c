@@ -1,4 +1,14 @@
+
 #include "pci.h"
+
+/* Storage Controller Detection & MMIO Prep
+ * 
+ * Class 0x01 storage controllers detected:
+ *   Subclass 0x06 (AHCI): BAR5 MMIO, 0x2000 bytes
+ *   Subclass 0x08 (NVMe): BAR0 MMIO, 0x4000 bytes
+ *
+ * Current: Legacy ATA PIO. Both AHCI and NVMe detected for future drivers.
+ */
 
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA 0xCFC

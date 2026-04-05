@@ -1,6 +1,21 @@
 #ifndef DISK_H
 #define DISK_H
 
+/* Driver and Platform Completion - Storage Controllers
+ *
+ * PRIMARY (In-Use): ATA PIO via legacy ports (0x1F0-0x1F7, 0x3F6)
+ *   - Compatible with all QEMU variants
+ *   - Used by VFS and storage_manager via disk_read/write_sector
+ *
+ * SECONDARY (Detection Ready, No Driver Yet):
+ *   - AHCI (class 0x01, subclass 0x06): BAR5 MMIO
+ *   - NVMe (class 0x01, subclass 0x08): BAR0 MMIO
+ *
+ * Architecture: All I/O uses disk_read/write_sector abstraction.
+ * Future AHCI/NVMe drivers will use same interface without changing VFS.
+ */
+
+
 typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
