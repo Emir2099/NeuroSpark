@@ -63,4 +63,7 @@ clean:
 run: NeuroSpark.bin
 	qemu-system-i386 -vga std -rtc base=localtime,clock=host -drive file=$<,format=raw,index=0,media=disk
 
-.PHONY: all clean run
+validate-phase15-17:
+	bash tools/validate_phase15_17.sh
+
+.PHONY: all clean run validate-phase15-17
