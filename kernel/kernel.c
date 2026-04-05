@@ -540,10 +540,11 @@ void exception_handler(uint32_t vector, uint32_t err, uint32_t *stack_frame) {
 
   /* Ring 3 faults should kill only the current user task, not the kernel. */
   if ((cs & 0x3) == 0x3 && os_current_task > 0 && os_current_task < os_task_count) {
-    os_tasks[os_current_task].fault_code = err;
+    os_tasks[os_current_task].fault_code = ((vector & 0xFFu) << 24) | (err & 0x00FFFFFFu);
     os_tasks[os_current_task].fault_addr = cr2;
     os_tasks[os_current_task].fault_eip = eip;
-    task_trace_event(os_current_task, TASK_TRACE_EVT_FAULT, err);
+    task_trace_event(os_current_task, TASK_TRACE_EVT_FAULT,
+                     os_tasks[os_current_task].fault_code);
     exception_report(vector, err, eip, cs, eflags, cr2);
     task_terminate_current();
     return;

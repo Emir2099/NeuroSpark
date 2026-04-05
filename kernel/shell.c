@@ -337,6 +337,26 @@ static const char *trace_event_name(uint32_t evt) {
   return "NONE";
 }
 
+static const char *fault_vector_name(uint32_t packed_fault) {
+  uint32_t vector = (packed_fault >> 24) & 0xFFu;
+  if (vector == 0) {
+    return "-";
+  }
+  if (vector == 13) {
+    return "GP";
+  }
+  if (vector == 14) {
+    return "PF";
+  }
+  if (vector == 6) {
+    return "UD";
+  }
+  if (vector == 8) {
+    return "DF";
+  }
+  return "EXC";
+}
+
 static int require_admin_context(void) {
   if (os_current_task != 0) {
     set_cmd_output("ERR: PRIVILEGED (TASK0)");
@@ -712,7 +732,7 @@ static void cmd_viz(const char *args) {
 static void cmd_ps(const char *args) {
   (void)args;
 
-  gprint("PID ST   PR CLS RT CSW TRACE EVT ARG FADDR FEIP\n", 0x99EEFF);
+  gprint("PID ST   PR CLS RT CSW TRACE EVT ARG FERR FADDR FEIP FRSN\n", 0x99EEFF);
   for (int i = 0; i < os_task_count; i++) {
     gprint_dec(i, 0xFFFFFF);
     gprint("   ", 0x000000);
@@ -732,9 +752,13 @@ static void cmd_ps(const char *args) {
     gprint(" ", 0x000000);
     gprint_dec((int)os_tasks[i].trace_last_arg, 0xFFFFFF);
     gprint(" ", 0x000000);
+    gprint_hex(os_tasks[i].fault_code, 8, 0xFFCC66);
+    gprint(" ", 0x000000);
     gprint_hex(os_tasks[i].fault_addr, 8, 0xFFAA66);
     gprint(" ", 0x000000);
     gprint_hex(os_tasks[i].fault_eip, 8, 0x77C8FF);
+    gprint(" ", 0x000000);
+    gprint((char *)fault_vector_name(os_tasks[i].fault_code), 0xFFAA66);
     gprint("\n", 0x000000);
   }
 }

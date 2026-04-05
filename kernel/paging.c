@@ -75,6 +75,21 @@ void map_page_flags(uint32_t phys_addr, uint32_t virt_addr, uint32_t flags) {
   page_table[pt_index] = (phys_addr & PAGE_MASK) | (flags & 0xFFF);
 }
 
+void unmap_kernel_page(uint32_t virt_addr) {
+  uint32_t pd_index = virt_addr >> 22;
+  uint32_t pt_index = (virt_addr >> 12) & 0x03FF;
+  uint32_t pde = page_directory[pd_index];
+  uint32_t *page_table;
+
+  if ((pde & PAGE_PRESENT) == 0) {
+    return;
+  }
+
+  page_table = (uint32_t *)(pde & PAGE_MASK);
+  page_table[pt_index] = 0;
+  __asm__ volatile("invlpg (%0)" : : "r"((void *)virt_addr) : "memory");
+}
+
 uint32_t create_user_page_directory(void) {
   uint32_t *new_pd = (uint32_t *)pmm_alloc_page();
   if (new_pd == (uint32_t *)0) {

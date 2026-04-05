@@ -49,6 +49,8 @@ typedef struct {
 } ipc_channel_t;
 
 static ipc_channel_t ipc_channels[IPC_CHANNELS];
+static wait_queue_t ipc_send_waiters[IPC_CHANNELS];
+static wait_queue_t ipc_recv_waiters[IPC_CHANNELS];
 static int ipc_initialized = 0;
 
 static void ipc_init_once(void) {
@@ -62,6 +64,8 @@ static void ipc_init_once(void) {
     for (int i = 0; i < IPC_QUEUE_CAPACITY; i++) {
       ipc_channels[c].queue[i] = 0;
     }
+    wait_queue_init(&ipc_send_waiters[c]);
+    wait_queue_init(&ipc_recv_waiters[c]);
   }
   ipc_initialized = 1;
 }
@@ -129,7 +133,9 @@ void irq_lock_release(irq_lock_t *lock, unsigned int flags) {
 
 static void scheduler_wake_sleepers_locked(void) {
   for (int i = 0; i < os_task_count; i++) {
-    if (os_tasks[i].state == TASK_STATE_SLEEPING &&
+    if ((os_tasks[i].state == TASK_STATE_SLEEPING ||
+         os_tasks[i].state == TASK_STATE_BLOCKED) &&
+        os_tasks[i].wake_tick != 0 &&
         os_tasks[i].wake_tick <= scheduler_ticks) {
       os_tasks[i].state = TASK_STATE_READY;
       os_tasks[i].wake_tick = 0;
@@ -231,15 +237,19 @@ void task_terminate_current(void) {
   unsigned int flags;
   uint32_t task_pd = 0;
   int current = 0;
+  int has_fault = 0;
 
   irq_lock_acquire(&scheduler_lock, &flags);
   current = os_current_task;
   task_pd = os_tasks[current].page_dir;
-  task_trace_event(os_current_task, TASK_TRACE_EVT_TERMINATE, 0);
+  has_fault = (os_tasks[current].fault_code != 0 ||
+               os_tasks[current].fault_addr != 0 ||
+               os_tasks[current].fault_eip != 0);
+  if (!has_fault) {
+    task_trace_event(os_current_task, TASK_TRACE_EVT_TERMINATE, 0);
+  }
   os_tasks[os_current_task].state = TASK_STATE_TERMINATED;
-  os_tasks[os_current_task].fault_code = 0;
-  os_tasks[os_current_task].fault_addr = 0;
-  os_tasks[os_current_task].fault_eip = 0;
+  os_tasks[os_current_task].wake_tick = 0;
   irq_lock_release(&scheduler_lock, flags);
 
   if (task_pd != 0 && task_pd != (uint32_t)page_directory) {
@@ -296,6 +306,7 @@ uint32_t scheduler_now_ticks(void) { return scheduler_ticks; }
 int ipc_send(int channel, int value) {
   unsigned int flags;
   ipc_channel_t *ch;
+  int wake_recv = 0;
 
   if (channel < 0 || channel >= IPC_CHANNELS) {
     return 0;
@@ -313,14 +324,19 @@ int ipc_send(int channel, int value) {
   ch->queue[ch->tail] = value;
   ch->tail = (ch->tail + 1) % IPC_QUEUE_CAPACITY;
   ch->count++;
+  wake_recv = (ch->count > 0);
 
   irq_lock_release(&scheduler_lock, flags);
+  if (wake_recv) {
+    wait_queue_wake_one(&ipc_recv_waiters[channel]);
+  }
   return 1;
 }
 
 int ipc_recv(int channel, int *out_value) {
   unsigned int flags;
   ipc_channel_t *ch;
+  int wake_send = 0;
 
   if (channel < 0 || channel >= IPC_CHANNELS || out_value == 0) {
     return 0;
@@ -338,8 +354,12 @@ int ipc_recv(int channel, int *out_value) {
   *out_value = ch->queue[ch->head];
   ch->head = (ch->head + 1) % IPC_QUEUE_CAPACITY;
   ch->count--;
+  wake_send = (ch->count < IPC_QUEUE_CAPACITY);
 
   irq_lock_release(&scheduler_lock, flags);
+  if (wake_send) {
+    wait_queue_wake_one(&ipc_send_waiters[channel]);
+  }
   return 1;
 }
 
@@ -585,18 +605,18 @@ int ipc_send_wait(int channel, int value) {
 
   ipc_init_once();
 
-  /* Retry indefinitely (infinite timeout) until space is available */
   while (1) {
     if (ipc_send(channel, value)) {
       return 1;
     }
-    task_yield();
+    wait_queue_wait(&ipc_send_waiters[channel]);
   }
 }
 
 int ipc_send_timeout(int channel, int value, unsigned int max_ticks) {
-  unsigned int flags;
-  uint32_t deadline;
+  uint32_t start;
+  uint32_t elapsed;
+  uint32_t remaining;
 
   if (channel < 0 || channel >= IPC_CHANNELS || max_ticks == 0) {
     return 0;
@@ -604,25 +624,21 @@ int ipc_send_timeout(int channel, int value, unsigned int max_ticks) {
 
   ipc_init_once();
 
-  irq_lock_acquire(&scheduler_lock, &flags);
-  deadline = scheduler_ticks + max_ticks;
-  irq_lock_release(&scheduler_lock, flags);
-
-  /* Retry until timeout */
+  start = scheduler_now_ticks();
   while (1) {
     if (ipc_send(channel, value)) {
       return 1;
     }
 
-    irq_lock_acquire(&scheduler_lock, &flags);
-    int timed_out = (scheduler_ticks >= deadline);
-    irq_lock_release(&scheduler_lock, flags);
-
-    if (timed_out) {
+    elapsed = scheduler_now_ticks() - start;
+    if (elapsed >= max_ticks) {
       return 0;
     }
 
-    task_yield();
+    remaining = max_ticks - elapsed;
+    if (!wait_queue_wait_timeout(&ipc_send_waiters[channel], remaining)) {
+      return 0;
+    }
   }
 }
 
@@ -633,18 +649,18 @@ int ipc_recv_wait(int channel, int *out_value) {
 
   ipc_init_once();
 
-  /* Retry indefinitely (infinite timeout) until data is available */
   while (1) {
     if (ipc_recv(channel, out_value)) {
       return 1;
     }
-    task_yield();
+    wait_queue_wait(&ipc_recv_waiters[channel]);
   }
 }
 
 int ipc_recv_timeout(int channel, int *out_value, unsigned int max_ticks) {
-  unsigned int flags;
-  uint32_t deadline;
+  uint32_t start;
+  uint32_t elapsed;
+  uint32_t remaining;
 
   if (channel < 0 || channel >= IPC_CHANNELS || out_value == 0 || max_ticks == 0) {
     return 0;
@@ -652,25 +668,21 @@ int ipc_recv_timeout(int channel, int *out_value, unsigned int max_ticks) {
 
   ipc_init_once();
 
-  irq_lock_acquire(&scheduler_lock, &flags);
-  deadline = scheduler_ticks + max_ticks;
-  irq_lock_release(&scheduler_lock, flags);
-
-  /* Retry until timeout */
+  start = scheduler_now_ticks();
   while (1) {
     if (ipc_recv(channel, out_value)) {
       return 1;
     }
 
-    irq_lock_acquire(&scheduler_lock, &flags);
-    int timed_out = (scheduler_ticks >= deadline);
-    irq_lock_release(&scheduler_lock, flags);
-
-    if (timed_out) {
+    elapsed = scheduler_now_ticks() - start;
+    if (elapsed >= max_ticks) {
       return 0;
     }
 
-    task_yield();
+    remaining = max_ticks - elapsed;
+    if (!wait_queue_wait_timeout(&ipc_recv_waiters[channel], remaining)) {
+      return 0;
+    }
   }
 }
 

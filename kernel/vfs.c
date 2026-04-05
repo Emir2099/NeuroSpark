@@ -196,12 +196,17 @@ static int tfs_read(int handle, void *buf, uint32_t size) {
   uint32_t remaining;
   uint32_t total = 0;
 
-  if (handle < 0 || handle >= TFS_MAX_HANDLES || !tfs_handles[handle].used ||
-      buf == 0 || size == 0) {
+  if (handle < 0 || handle >= TFS_MAX_HANDLES || !tfs_handles[handle].used) {
+    return VFS_ERR_INVALID_FD;
+  }
+  if (buf == 0 || size == 0) {
     return VFS_ERR_INVALID_ARG;
   }
 
   h = &tfs_handles[handle];
+  if ((h->flags & VFS_O_RDONLY) == 0 && (h->flags & VFS_O_RDWR) != VFS_O_RDWR) {
+    return VFS_ERR_PERM;
+  }
   entry = &root_directory[h->entry_idx];
   if (h->pos >= entry->size) {
     return 0;
@@ -240,8 +245,10 @@ static int tfs_write(int handle, const void *buf, uint32_t size) {
   uint16_t sector[TFS_SECTOR_SIZE / 2];
   uint32_t total = 0;
 
-  if (handle < 0 || handle >= TFS_MAX_HANDLES || !tfs_handles[handle].used ||
-      buf == 0 || size == 0) {
+  if (handle < 0 || handle >= TFS_MAX_HANDLES || !tfs_handles[handle].used) {
+    return VFS_ERR_INVALID_FD;
+  }
+  if (buf == 0 || size == 0) {
     return VFS_ERR_INVALID_ARG;
   }
 
@@ -341,17 +348,17 @@ void vfs_init(void) {
 
 int vfs_mount(const char *mount_path, const VfsBackendOps *ops) {
   if (mount_path == 0 || ops == 0) {
-    return -1;
+    return VFS_ERR_INVALID_ARG;
   }
   for (int i = 0; i < VFS_MAX_MOUNTS; i++) {
     if (!mounts[i].used) {
       mounts[i].used = 1;
       mounts[i].mount_path = mount_path;
       mounts[i].ops = ops;
-      return 0;
+      return VFS_OK;
     }
   }
-  return -1;
+  return VFS_ERR_NO_SPACE;
 }
 
 static const VfsBackendOps *vfs_find_backend(const char *path) {

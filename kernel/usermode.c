@@ -41,11 +41,12 @@ typedef struct {
 enum {
   USER_VA_CODE = 0x40000000,
   USER_VA_STACK_TOP = 0x40002000,
+  USER_PAGE_MASK = 0xFFFFF000u,
+  KERNEL_TEMP_MAP_VA = 0x3FF00000,
 };
 
 extern void *pmm_alloc_page(void);
 extern void create_task(int index, void (*func_ptr)(), uint32_t page_dir);
-extern void map_page(uint32_t phys_addr, uint32_t virt_addr);
 extern void enter_user_mode(uint32_t entry_eip, uint32_t user_stack, uint32_t page_dir);
 extern uint8_t user_program_start;
 extern uint8_t user_program_end;
@@ -70,6 +71,49 @@ static void mem_copy(uint8_t *dst, const uint8_t *src, uint32_t size) {
   }
 }
 
+static uint8_t *kmap_temp_page(uint32_t phys_page) {
+  map_page(phys_page, KERNEL_TEMP_MAP_VA);
+  return (uint8_t *)KERNEL_TEMP_MAP_VA;
+}
+
+static void kunmap_temp_page(void) { unmap_kernel_page(KERNEL_TEMP_MAP_VA); }
+
+static void mem_zero_phys_page(uint32_t phys_page) {
+  uint8_t *mapped = kmap_temp_page(phys_page & USER_PAGE_MASK);
+  mem_zero(mapped, 4096);
+  kunmap_temp_page();
+}
+
+static int copy_to_user_space(uint32_t pd, uint32_t user_va, const uint8_t *src,
+                              uint32_t size) {
+  uint32_t copied = 0;
+
+  while (copied < size) {
+    uint32_t dst_phys = resolve_user_phys(pd, user_va + copied);
+    uint32_t dst_page = dst_phys & USER_PAGE_MASK;
+    uint32_t page_off = dst_phys & 0xFFFu;
+    uint32_t chunk;
+    uint8_t *mapped;
+
+    if (dst_phys == 0) {
+      return 0;
+    }
+
+    chunk = 4096u - page_off;
+    if (chunk > (size - copied)) {
+      chunk = size - copied;
+    }
+
+    mapped = kmap_temp_page(dst_page);
+    mem_copy(mapped + page_off, src + copied, chunk);
+    kunmap_temp_page();
+
+    copied += chunk;
+  }
+
+  return 1;
+}
+
 static int map_user_range(uint32_t pd, uint32_t start, uint32_t size) {
   uint32_t first = start & 0xFFFFF000;
   uint32_t last = (start + size - 1) & 0xFFFFF000;
@@ -84,14 +128,11 @@ static int map_user_range(uint32_t pd, uint32_t start, uint32_t size) {
       return 0;
     }
 
-    // Ensure the current kernel CR3 can access the page for initialization.
-    map_page(phys, phys);
-
     if (!map_user_page(pd, phys, va)) {
       return 0;
     }
 
-    mem_zero((uint8_t *)phys, 4096);
+    mem_zero_phys_page(phys);
   }
 
   return 1;
@@ -110,11 +151,12 @@ static int load_flat_image(const uint8_t *image, uint32_t size, uint32_t pd,
     return 0;
   }
 
-  map_page(phys, phys);
-  mem_zero((uint8_t *)phys, 4096);
-  mem_copy((uint8_t *)phys, image, size);
-
   if (!map_user_page(pd, phys, USER_VA_CODE)) {
+    return 0;
+  }
+
+  mem_zero_phys_page(phys);
+  if (!copy_to_user_space(pd, USER_VA_CODE, image, size)) {
     return 0;
   }
 
@@ -201,13 +243,10 @@ static int load_elf32_image(const uint8_t *image, uint32_t size, uint32_t pd,
       return 0;  /* Page allocation failed */
     }
 
-    /* Copy segment data into mapped user pages */
-    for (uint32_t b = 0; b < ph->p_filesz; b++) {
-      uint32_t dst_phys = resolve_user_phys(pd, ph->p_vaddr + b);
-      if (dst_phys == 0) {
-        return 0;  /* Address resolution failed */
+    if (ph->p_filesz > 0) {
+      if (!copy_to_user_space(pd, ph->p_vaddr, &image[ph->p_offset], ph->p_filesz)) {
+        return 0;
       }
-      *((uint8_t *)dst_phys) = image[ph->p_offset + b];
     }
   }
 
@@ -232,12 +271,11 @@ static int setup_user_stack(uint32_t pd) {
     return 0;
   }
 
-  map_page(stack_phys, stack_phys);
-  mem_zero((uint8_t *)stack_phys, 4096);
-
   if (!map_user_page(pd, stack_phys, USER_VA_STACK_TOP - 4096)) {
     return 0;
   }
+
+  mem_zero_phys_page(stack_phys);
 
   /* Keep one page below the stack unmapped to catch stack overflow. */
   if (resolve_user_phys(pd, guard_page_va) != 0) {
@@ -257,42 +295,37 @@ static int finalize_user_process(uint32_t pd, uint32_t entry) {
   return 1;
 }
 
-static int setup_user_address_space(void) {
-  uint8_t *code_start = &user_program_start;
-  uint8_t *code_end = &user_program_end;
-  uint32_t code_size = (uint32_t)(code_end - code_start);
+static int exec_user_image(const uint8_t *image, uint32_t image_size) {
+  uint32_t pd;
+  uint32_t entry = USER_VA_CODE;
 
-  if (code_size == 0 || code_size > 4096) {
+  if (image == 0 || image_size == 0 || image_size > sizeof(exec_buffer)) {
     return 0;
   }
 
-  user_page_dir = create_user_page_directory();
-  if (user_page_dir == 0) {
+  pd = create_user_page_directory();
+  if (pd == 0) {
     return 0;
   }
 
-  uint32_t code_phys = (uint32_t)pmm_alloc_page();
-  uint32_t stack_phys = (uint32_t)pmm_alloc_page();
-  if (code_phys == 0 || stack_phys == 0) {
+  if (!setup_user_stack(pd)) {
+    destroy_user_address_space(pd);
     return 0;
   }
 
-  // Ensure newly allocated physical pages are visible in the active kernel map.
-  map_page(code_phys, code_phys);
-  map_page(stack_phys, stack_phys);
-
-  mem_zero((uint8_t *)code_phys, 4096);
-  mem_zero((uint8_t *)stack_phys, 4096);
-  mem_copy((uint8_t *)code_phys, code_start, code_size);
-
-  if (!map_user_page(user_page_dir, code_phys, USER_VA_CODE)) {
-    return 0;
-  }
-  if (!map_user_page(user_page_dir, stack_phys, USER_VA_STACK_TOP - 4096)) {
-    return 0;
+  if (image[0] == 0x7F && image[1] == 'E' && image[2] == 'L' && image[3] == 'F') {
+    if (!load_elf32_image(image, image_size, pd, &entry)) {
+      destroy_user_address_space(pd);
+      return 0;
+    }
+  } else {
+    if (!load_flat_image(image, image_size, pd, &entry)) {
+      destroy_user_address_space(pd);
+      return 0;
+    }
   }
 
-  return 1;
+  return finalize_user_process(pd, entry);
 }
 
 static void user_task_entry(void) {
@@ -301,19 +334,20 @@ static void user_task_entry(void) {
 }
 
 int launch_user_process_task(void) {
-  if (!setup_user_address_space()) {
+  uint8_t *code_start = &user_program_start;
+  uint8_t *code_end = &user_program_end;
+  uint32_t code_size = (uint32_t)(code_end - code_start);
+
+  if (code_size == 0 || code_size > 4096) {
     return 0;
   }
 
-  create_task(2, user_task_entry, user_page_dir);
-  return 1;
+  return exec_user_image(code_start, code_size);
 }
 
 int exec_user_program(const char *path) {
   int image_size;
   VfsFileStat stat_buf;
-  uint32_t pd;
-  uint32_t entry = USER_VA_CODE;
 
   if (path == 0 || path[0] == '\0') {
     return 0;
@@ -329,28 +363,5 @@ int exec_user_program(const char *path) {
     return 0;
   }
 
-  pd = create_user_page_directory();
-  if (pd == 0) {
-    return 0;
-  }
-
-  if (!setup_user_stack(pd)) {
-    destroy_user_address_space(pd);
-    return 0;
-  }
-
-  if (exec_buffer[0] == 0x7F && exec_buffer[1] == 'E' && exec_buffer[2] == 'L' &&
-      exec_buffer[3] == 'F') {
-    if (!load_elf32_image(exec_buffer, (uint32_t)image_size, pd, &entry)) {
-      destroy_user_address_space(pd);
-      return 0;
-    }
-  } else {
-    if (!load_flat_image(exec_buffer, (uint32_t)image_size, pd, &entry)) {
-      destroy_user_address_space(pd);
-      return 0;
-    }
-  }
-
-  return finalize_user_process(pd, entry);
+  return exec_user_image(exec_buffer, (uint32_t)image_size);
 }
