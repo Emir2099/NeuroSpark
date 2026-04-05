@@ -33,10 +33,48 @@ typedef unsigned short uint16_t;
 #define UDP_DATA_PORT 39001
 
 #define REMOTE_PKT_MAGIC 0x52435031u /* RCP1 */
+#define REMOTE_PKT_VERSION 1u
 #define REMOTE_PKT_TYPE_STATUS 1
 #define REMOTE_PKT_TYPE_COMMAND 2
 #define REMOTE_PKT_TYPE_SNAPSHOT 3
 #define REMOTE_PKT_TYPE_PROFILE 4
+#define REMOTE_PKT_TYPE_MANIFEST 5
+
+#define REMOTE_PKT_FLAG_RELIABLE 0x00000001u
+#define REMOTE_PKT_FLAG_CHUNKED 0x00000002u
+#define REMOTE_PKT_FLAG_CHUNK_FIRST 0x00000004u
+#define REMOTE_PKT_FLAG_CHUNK_LAST 0x00000008u
+
+#define REMOTE_CHUNK_MAGIC 0x43484B31u /* CHK1 */
+
+#define REMOTE_STATUS_OK 0u
+#define REMOTE_STATUS_AUTH_REQUIRED 1u
+#define REMOTE_STATUS_TOKEN_EXPIRED 2u
+#define REMOTE_STATUS_INVALID_TOKEN 3u
+
+typedef struct {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t type;
+  uint32_t flags;
+  uint32_t session;
+  uint32_t request_id;
+  uint32_t token;
+  uint32_t checksum;
+  uint32_t status;
+  uint32_t payload_len;
+} __attribute__((packed)) RemotePacketHeader;
+
+typedef struct {
+  uint32_t magic;
+  uint32_t transfer_id;
+  uint32_t chunk_index;
+  uint32_t chunk_count;
+  uint32_t total_len;
+  uint32_t chunk_offset;
+  uint32_t chunk_len;
+  uint32_t checksum;
+} __attribute__((packed)) RemoteChunkHeader;
 
 extern volatile int ata_disk_available;
 extern uint32_t tick;
@@ -54,6 +92,7 @@ static int remote_enabled = 0;
 static uint32_t remote_token = 0;
 static uint32_t remote_session = 0;
 static uint32_t remote_seq = 1;
+static uint32_t remote_auth_deadline = 0;
 static uint32_t remote_dst_ip = 0xFFFFFFFFu;
 
 static uint8_t rtl_rx_buffer[8192 + 16 + 1500] __attribute__((aligned(16)));
@@ -115,6 +154,36 @@ static void mem_set(uint8_t *dst, uint8_t value, uint32_t len) {
   for (uint32_t i = 0; i < len; i++) {
     dst[i] = value;
   }
+}
+
+static uint32_t remote_checksum32(const uint8_t *data, uint32_t len) {
+  uint32_t hash = 2166136261u;
+  for (uint32_t i = 0; i < len; i++) {
+    hash ^= data[i];
+    hash *= 16777619u;
+  }
+  return hash;
+}
+
+static int remote_auth_valid(void) {
+  if (remote_token == 0) {
+    return 0;
+  }
+  if (remote_auth_deadline == 0) {
+    return 0;
+  }
+  if (tick > remote_auth_deadline) {
+    return 0;
+  }
+  return 1;
+}
+
+static uint32_t remote_next_request_id(void) {
+  uint32_t req = remote_seq++;
+  if (req == 0) {
+    req = remote_seq++;
+  }
+  return req;
 }
 
 static int read_rtl8139_bar0_iobase(int idx, uint32_t *out_iobase) {
@@ -257,39 +326,119 @@ static int net_send_udp(uint32_t dst_ip, uint16_t src_port, uint16_t dst_port,
 }
 
 static int remote_send_payload(uint8_t type, const uint8_t *data, uint16_t len,
-                               int reliable) {
+                               uint32_t flags, uint32_t request_id,
+                               uint32_t status) {
   uint8_t payload[512];
+  RemotePacketHeader header;
   uint16_t total;
   int sent;
 
-  if (!net_ready) {
+  if (!net_ready || !remote_enabled || !remote_auth_valid()) {
     return 0;
   }
   if (data == 0 && len != 0) {
     return 0;
   }
-  if (len > (uint16_t)(sizeof(payload) - 20)) {
+  if (len > (uint16_t)(sizeof(payload) - sizeof(RemotePacketHeader))) {
     return 0;
   }
 
-  *((uint32_t *)&payload[0]) = be32(REMOTE_PKT_MAGIC);
-  *((uint32_t *)&payload[4]) = be32(remote_session);
-  *((uint32_t *)&payload[8]) = be32(remote_seq++);
-  *((uint32_t *)&payload[12]) = be32(remote_token);
-  payload[16] = type;
-  payload[17] = (uint8_t)(reliable ? 1 : 0);
-  payload[18] = (uint8_t)(len & 0xFF);
-  payload[19] = (uint8_t)((len >> 8) & 0xFF);
+  header.magic = be32(REMOTE_PKT_MAGIC);
+  header.version = be32(REMOTE_PKT_VERSION);
+  header.type = be32((uint32_t)type);
+  header.flags = be32(flags);
+  header.session = be32(remote_session);
+  header.request_id = be32(request_id);
+  header.token = be32(remote_token);
+  header.checksum = 0;
+  header.status = be32(status);
+  header.payload_len = be32((uint32_t)len);
+
+  mem_copy(payload, (const uint8_t *)&header, (uint32_t)sizeof(header));
   if (len > 0) {
-    mem_copy(&payload[20], data, len);
+    mem_copy(&payload[sizeof(RemotePacketHeader)], data, len);
   }
 
-  total = (uint16_t)(20 + len);
+  header.checksum = be32(remote_checksum32(payload, (uint32_t)(sizeof(RemotePacketHeader) + len)));
+  mem_copy(payload, (const uint8_t *)&header, (uint32_t)sizeof(header));
+
+  total = (uint16_t)(sizeof(RemotePacketHeader) + len);
   sent = net_send_udp(remote_dst_ip, UDP_CTRL_PORT, UDP_DATA_PORT, payload, total);
-  if (reliable && sent) {
+  if ((flags & REMOTE_PKT_FLAG_RELIABLE) != 0u && sent) {
     sent = net_send_udp(remote_dst_ip, UDP_CTRL_PORT, UDP_DATA_PORT, payload, total);
   }
   return sent;
+}
+
+static int remote_send_chunked_payload(uint8_t type, const uint8_t *data,
+                                       uint16_t len, uint32_t flags,
+                                       uint32_t request_id, uint32_t status) {
+  uint32_t transfer_checksum;
+  uint32_t chunk_count;
+  uint32_t chunk_index;
+  uint32_t offset;
+  uint16_t chunk_limit;
+  uint8_t chunk_payload[512];
+  RemoteChunkHeader chunk_header;
+
+  if (data == 0 && len != 0) {
+    return 0;
+  }
+
+  if (len == 0) {
+    chunk_count = 1;
+  } else {
+    chunk_limit = (uint16_t)(sizeof(chunk_payload) - sizeof(RemoteChunkHeader));
+    if (chunk_limit == 0) {
+      return 0;
+    }
+    chunk_count = (uint32_t)((len + chunk_limit - 1u) / chunk_limit);
+  }
+
+  transfer_checksum = remote_checksum32(data, len);
+  if (request_id == 0) {
+    request_id = remote_next_request_id();
+  }
+
+  chunk_limit = (uint16_t)(sizeof(chunk_payload) - sizeof(RemoteChunkHeader));
+  offset = 0;
+  for (chunk_index = 0; chunk_index < chunk_count; chunk_index++) {
+    uint32_t remaining = (offset < len) ? (uint32_t)(len - offset) : 0u;
+    uint32_t this_len = remaining > chunk_limit ? (uint32_t)chunk_limit : remaining;
+    uint32_t chunk_flags = flags | REMOTE_PKT_FLAG_CHUNKED;
+
+    if (chunk_index == 0) {
+      chunk_flags |= REMOTE_PKT_FLAG_CHUNK_FIRST;
+    }
+    if (chunk_index + 1u == chunk_count) {
+      chunk_flags |= REMOTE_PKT_FLAG_CHUNK_LAST;
+    }
+
+    chunk_header.magic = be32(REMOTE_CHUNK_MAGIC);
+    chunk_header.transfer_id = be32(request_id);
+    chunk_header.chunk_index = be32(chunk_index);
+    chunk_header.chunk_count = be32(chunk_count);
+    chunk_header.total_len = be32((uint32_t)len);
+    chunk_header.chunk_offset = be32(offset);
+    chunk_header.chunk_len = be32(this_len);
+    chunk_header.checksum = be32(transfer_checksum);
+
+    mem_copy(chunk_payload, (const uint8_t *)&chunk_header,
+             (uint32_t)sizeof(chunk_header));
+    if (this_len > 0 && data != 0) {
+      mem_copy(&chunk_payload[sizeof(RemoteChunkHeader)], &data[offset], this_len);
+    }
+
+    if (!remote_send_payload(type, chunk_payload,
+                             (uint16_t)(sizeof(RemoteChunkHeader) + this_len),
+                             chunk_flags, request_id, status)) {
+      return 0;
+    }
+
+    offset += this_len;
+  }
+
+  return 1;
 }
 
 int net_init(void) {
@@ -392,6 +541,8 @@ int net_export_snapshot(int slot) {
   uint8_t payload[64];
   int tag_len = 0;
   int total;
+  uint32_t checksum;
+  uint32_t request_id;
 
   if (!net_ready)
     return 0;
@@ -420,10 +571,19 @@ int net_export_snapshot(int slot) {
   }
   payload[20 + tag_len] = '\0';
   total = 21 + tag_len;
+  checksum = remote_checksum32(payload, (uint32_t)total);
+  request_id = remote_next_request_id();
 
-  if (remote_enabled) {
-    return remote_send_payload(REMOTE_PKT_TYPE_SNAPSHOT, payload, (uint16_t)total,
-                               0);
+  payload[21 + tag_len] = (uint8_t)(checksum & 0xFFu);
+  payload[22 + tag_len] = (uint8_t)((checksum >> 8) & 0xFFu);
+  payload[23 + tag_len] = (uint8_t)((checksum >> 16) & 0xFFu);
+  payload[24 + tag_len] = (uint8_t)((checksum >> 24) & 0xFFu);
+  total += 4;
+
+  if (remote_enabled && remote_auth_valid()) {
+    return remote_send_chunked_payload(REMOTE_PKT_TYPE_SNAPSHOT, payload,
+                                          (uint16_t)total, 0, request_id,
+                                          REMOTE_STATUS_OK);
   }
 
   return net_send_udp(0xFFFFFFFFu, UDP_DATA_PORT, UDP_DATA_PORT, payload,
@@ -437,6 +597,8 @@ int net_export_profile(void) {
   uint32_t sched_avg = 0;
   uint32_t spike_avg = 0;
   uint32_t cmd_avg = 0;
+  uint32_t request_id;
+  uint32_t checksum;
 
   if (!net_ready) {
     return 0;
@@ -471,11 +633,57 @@ int net_export_profile(void) {
   *((uint32_t *)&payload[20]) = be32((uint32_t)snap.enabled);
   *((uint32_t *)&payload[24]) = be32(tick);
 
-  if (remote_enabled) {
-    return remote_send_payload(REMOTE_PKT_TYPE_PROFILE, payload, 28, 0);
+  checksum = remote_checksum32(payload, 28);
+  request_id = remote_next_request_id();
+  *((uint32_t *)&payload[28]) = be32(checksum);
+
+  if (remote_enabled && remote_auth_valid()) {
+    return remote_send_chunked_payload(REMOTE_PKT_TYPE_PROFILE, payload, 32, 0,
+                                          request_id, REMOTE_STATUS_OK);
   }
 
-  return net_send_udp(0xFFFFFFFFu, UDP_DATA_PORT, UDP_DATA_PORT, payload, 28);
+  return net_send_udp(0xFFFFFFFFu, UDP_DATA_PORT, UDP_DATA_PORT, payload, 32);
+}
+
+int net_export_manifest(void) {
+  char summary[192];
+  uint8_t payload[256];
+  uint32_t checksum;
+  uint32_t request_id;
+  int len;
+  int pos;
+
+  if (!net_ready) {
+    return 0;
+  }
+
+  if (!storage_manifest_summary(summary, (int)sizeof(summary))) {
+    return 0;
+  }
+
+  len = 0;
+  payload[len++] = 'M';
+  payload[len++] = 'A';
+  payload[len++] = 'N';
+  payload[len++] = '1';
+  pos = 0;
+  while (summary[pos] && len < (int)sizeof(payload) - 8) {
+    payload[len++] = (uint8_t)summary[pos++];
+  }
+  payload[len++] = 0;
+  checksum = remote_checksum32(payload, (uint32_t)len);
+  *((uint32_t *)&payload[len]) = be32(checksum);
+  len += 4;
+  request_id = remote_next_request_id();
+
+  if (remote_enabled && remote_auth_valid()) {
+    return remote_send_chunked_payload(REMOTE_PKT_TYPE_MANIFEST, payload,
+                                       (uint16_t)len, 0, request_id,
+                                       REMOTE_STATUS_OK);
+  }
+
+  return net_send_udp(0xFFFFFFFFu, UDP_DATA_PORT, UDP_DATA_PORT, payload,
+                      (uint16_t)len);
 }
 
 void remote_set_enabled(int enabled) { remote_enabled = enabled ? 1 : 0; }
@@ -484,7 +692,21 @@ int remote_is_enabled(void) { return remote_enabled; }
 
 void remote_set_token(uint32_t token) { remote_token = token; }
 
+void remote_set_auth(uint32_t token, uint32_t ttl_ticks) {
+  remote_token = token;
+  remote_auth_deadline = ttl_ticks ? (tick + ttl_ticks) : 0;
+}
+
+void remote_clear_auth(void) {
+  remote_auth_deadline = 0;
+  remote_token = 0;
+}
+
+int remote_is_authorized(void) { return remote_auth_valid(); }
+
 uint32_t remote_get_token(void) { return remote_token; }
+
+uint32_t remote_get_auth_deadline(void) { return remote_auth_deadline; }
 
 uint32_t remote_get_session(void) {
   if (remote_session == 0) {
@@ -496,8 +718,9 @@ uint32_t remote_get_session(void) {
 int remote_send_command_result(const char *cmd_text) {
   uint8_t payload[128];
   int n = 0;
+  uint32_t request_id;
 
-  if (!remote_enabled || !net_ready || cmd_text == 0) {
+  if (!remote_enabled || !net_ready || cmd_text == 0 || !remote_auth_valid()) {
     return 0;
   }
 
@@ -510,7 +733,9 @@ int remote_send_command_result(const char *cmd_text) {
     cmd_text++;
   }
   payload[n] = '\0';
+  request_id = remote_next_request_id();
 
-  return remote_send_payload(REMOTE_PKT_TYPE_COMMAND, payload, (uint16_t)(n + 1),
-                             1);
+  return remote_send_chunked_payload(REMOTE_PKT_TYPE_COMMAND, payload,
+                                     (uint16_t)(n + 1), REMOTE_PKT_FLAG_RELIABLE,
+                                     request_id, REMOTE_STATUS_OK);
 }

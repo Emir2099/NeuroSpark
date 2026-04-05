@@ -75,6 +75,7 @@ extern void set_cmd_output(const char *text);
 extern int vfs_delete(const char *path);
 extern int wm_set_timezone_offset_minutes(int minutes);
 extern int wm_get_timezone_offset_minutes(void);
+extern uint32_t remote_get_auth_deadline(void);
 
 void process_command(char *cmd);
 
@@ -490,14 +491,15 @@ static void cmd_help(const char *args) {
   (void)args;
   gprint("commands: help save load ls clear delete eval stim mall free map\n", 0xFFFFFF);
     gprint("          tsave tload pci pci bar ahci [show|backend|reset|identify|read|smoke]\n", 0xFFFFFF);
-  gprint("          exec <path> mkdemo net up|cfg|status|tx|export|profile remote ...\n", 0xFFFFFF);
+    gprint("          exec <path> mkdemo net up|cfg|status|tx|export|profile|manifest remote ...\n", 0xFFFFFF);
   gprint("phase8:   manifest save|load|show  replay rec on|off|run|show|clear\n", 0x88E0FF);
   gprint("          dataset export <path>  dataset import <path>\n", 0x88E0FF);
   gprint("phase9:   profile on|off|show|reset|export <path>|hud compact|detail\n", 0x88E0FF);
   gprint("phase10:  model show|select|param ...  stdp on|off\n", 0x88E0FF);
   gprint("phase11:  ps  kill <pid>  nice <pid> <0..3>  trace <pid> on|off|show\n", 0x88E0FF);
   gprint("phase11.1: ipc send <ch> <val> | ipc recv <ch> | ipc stat <ch>\n", 0x88E0FF);
-  gprint("phase12:  net up  net cfg <ip> <mask> <gw>  remote on|off|token <hex>\n", 0x88E0FF);
+  gprint("phase12:  net up  net cfg <ip> <mask> <gw>  net export manifest\n", 0x88E0FF);
+  gprint("          remote on|off|auth <hex> [ttl]|token <hex>\n", 0x88E0FF);
   gprint("phase13:  viz heatmap|raster|off|show  viz scrub <0..63|+|->  viz play on|off\n", 0x88E0FF);
   gprint("          viz compare <a> <b>  viz export <path>\n", 0x88E0FF);
   gprint("phase6:   synview synset synrule synpreset syncmp\n", 0x77C8FF);
@@ -516,7 +518,7 @@ static void cmd_tz(const char *args) {
   args = next_token(args, sub, sizeof(sub));
   next_token(args, val, sizeof(val));
 
-  if (sub[0] == '\0' || str_ieq(sub, "show")) {
+    if (sub[0] == '\0' || str_ieq(sub, "show")) {
     minutes = wm_get_timezone_offset_minutes();
     abs_minutes = minutes < 0 ? -minutes : minutes;
     hh = abs_minutes / 60;
@@ -1417,6 +1419,15 @@ static void cmd_net(const char *args) {
     return;
   }
 
+  if (str_eq(sub, "manifest")) {
+    if (net_export_manifest()) {
+      set_cmd_output("NET MANIFEST EXPORTED");
+    } else {
+      set_cmd_output("NET MANIFEST EXPORT FAIL");
+    }
+    return;
+  }
+
   if (str_eq(sub, "profile")) {
     if (net_export_profile()) {
       set_cmd_output("NET PROFILE EXPORTED");
@@ -1426,14 +1437,16 @@ static void cmd_net(const char *args) {
     return;
   }
 
-  set_cmd_output("USAGE: net up|cfg|status|tx|export <slot>|profile");
+  set_cmd_output("USAGE: net up|cfg|status|tx|export <slot>|manifest|profile");
 }
 
 static void cmd_remote(const char *args) {
   char sub[12];
   char tok[24];
+  char ttl[12];
   args = next_token(args, sub, sizeof(sub));
   next_token(args, tok, sizeof(tok));
+  next_token(args, ttl, sizeof(ttl));
 
   if (sub[0] == '\0') {
     gprint("REMOTE:", 0x99EEFF);
@@ -1442,6 +1455,10 @@ static void cmd_remote(const char *args) {
     gprint_hex(remote_get_token(), 8, 0xFFFFFF);
     gprint(" SESSION:", 0x99EEFF);
     gprint_hex(remote_get_session(), 8, 0xFFFFFF);
+    gprint(" AUTH:", 0x99EEFF);
+    gprint(remote_is_authorized() ? "VALID" : "EXPIRED", remote_is_authorized() ? 0x44FF88 : 0xFFAA66);
+    gprint(" EXP:", 0x99EEFF);
+    gprint_hex(remote_get_auth_deadline(), 8, 0xFFFFFF);
     gprint("\n", 0x000000);
     return;
   }
@@ -1456,17 +1473,33 @@ static void cmd_remote(const char *args) {
     set_cmd_output("REMOTE OFF");
     return;
   }
+  if (str_eq(sub, "auth")) {
+    uint32_t token;
+    uint32_t ttl_ticks = 6000u;
+
+    if (tok[0] == '\0') {
+      set_cmd_output("USAGE: remote auth <hex> [ttl]");
+      return;
+    }
+    token = parse_u32_hex(tok);
+    if (ttl[0] != '\0') {
+      ttl_ticks = is_dec_number(ttl) ? (uint32_t)parse_u32_dec(ttl) : parse_u32_hex(ttl);
+    }
+    remote_set_auth(token, ttl_ticks);
+    set_cmd_output("REMOTE AUTH SET");
+    return;
+  }
   if (str_eq(sub, "token")) {
     if (tok[0] == '\0') {
       set_cmd_output("USAGE: remote token <hex>");
       return;
     }
-    remote_set_token(parse_u32_hex(tok));
+    remote_set_auth(parse_u32_hex(tok), 6000u);
     set_cmd_output("REMOTE TOKEN SET");
     return;
   }
 
-  set_cmd_output("USAGE: remote on|off|token <hex>");
+  set_cmd_output("USAGE: remote on|off|auth <hex> [ttl]|token <hex>");
 }
 
 static void cmd_synview(const char *args) {
