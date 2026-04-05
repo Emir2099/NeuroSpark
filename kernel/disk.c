@@ -1,4 +1,5 @@
 #include "disk.h"
+#include "ahci.h"
 
 // ============================================================================
 // DISK DRIVER FUNCTIONS (ATA PIO Mode)
@@ -27,6 +28,38 @@ static inline uint16_t inw(uint16_t port) {
 
 // Global flag: is ATA disk controller present?
 volatile int ata_disk_available = 0;
+static uint8_t disk_preferred_backend = DISK_BACKEND_AUTO;
+
+void disk_set_preferred_backend(uint8_t backend) {
+    if (backend != DISK_BACKEND_AUTO && backend != DISK_BACKEND_ATA &&
+        backend != DISK_BACKEND_AHCI) {
+        backend = DISK_BACKEND_AUTO;
+    }
+    disk_preferred_backend = backend;
+}
+
+uint8_t disk_get_preferred_backend(void) {
+    return disk_preferred_backend;
+}
+
+const char *disk_read_error_string(int code) {
+    switch (code) {
+    case DISK_IO_OK:
+        return "OK";
+    case DISK_IO_ERR_NO_DEVICE:
+        return "NO_DEVICE";
+    case DISK_IO_ERR_NO_READY_PORT:
+        return "NO_READY_PORT";
+    case DISK_IO_ERR_TIMEOUT:
+        return "TIMEOUT";
+    case DISK_IO_ERR_TFES:
+        return "TFES";
+    case DISK_IO_ERR_UNSUPPORTED:
+        return "UNSUPPORTED";
+    default:
+        return "ERR";
+    }
+}
 
 /*
  * ata_detect_disk() - Check if an ATA disk controller is present
@@ -88,6 +121,93 @@ static void ata_wait_drq(void) {
     } while (!(status & 0x08)); // DRQ = bit 3
 }
 
+static int ata_read_sector_ex(uint32_t lba, uint16_t *buffer) {
+    int timeout = 500000;
+    uint8_t status;
+
+    if (!ata_disk_available || buffer == 0) {
+        return DISK_IO_ERR_NO_DEVICE;
+    }
+
+    do {
+        status = inb(PORT_COMMAND);
+        if (status == 0xFF) {
+            return DISK_IO_ERR_NO_DEVICE;
+        }
+        if (!(status & STATUS_BSY)) {
+            break;
+        }
+    } while (--timeout > 0);
+
+    if (timeout <= 0) {
+        return DISK_IO_ERR_TIMEOUT;
+    }
+
+    outb(PORT_DEVICE, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(PORT_SECCOUNT, 1);
+    outb(PORT_LBA_LOW,  (uint8_t)(lba & 0xFF));
+    outb(PORT_LBA_MID,  (uint8_t)((lba >> 8) & 0xFF));
+    outb(PORT_LBA_HIGH, (uint8_t)((lba >> 16) & 0xFF));
+
+    outb(PORT_COMMAND, CMD_READ);
+    do {
+        status = inb(PORT_COMMAND);
+        if (status & 0x01) {
+            return DISK_IO_ERR_NO_DEVICE;
+        }
+        if (status & 0x08) {
+            break;
+        }
+    } while (--timeout > 0);
+
+    if (timeout <= 0) {
+        return DISK_IO_ERR_TIMEOUT;
+    }
+
+    for (int i = 0; i < 256; i++) {
+        buffer[i] = inw(PORT_DATA);
+    }
+
+    return DISK_IO_OK;
+}
+
+static int ahci_read_sector_ex(uint32_t lba, uint16_t *buffer) {
+    AhciProbeReport report;
+
+    if (buffer == 0) {
+        return DISK_IO_ERR_UNSUPPORTED;
+    }
+
+    if (!ahci_get_runtime_report(&report) || !report.controller_found ||
+        report.ready_ports == 0) {
+        return DISK_IO_ERR_NO_READY_PORT;
+    }
+
+    for (uint8_t port = 0; port < AHCI_MAX_PORTS; port++) {
+        int rc;
+        if (!report.ports[port].implemented || !report.ports[port].ready ||
+            !report.ports[port].sata) {
+            continue;
+        }
+        rc = ahci_read_sector(port, lba, buffer);
+        if (rc == AHCI_READ_OK) {
+            return DISK_IO_OK;
+        }
+        if (rc == AHCI_READ_ERR_TIMEOUT) {
+            return DISK_IO_ERR_TIMEOUT;
+        }
+        if (rc == AHCI_READ_ERR_TFES) {
+            return DISK_IO_ERR_TFES;
+        }
+        if (rc == AHCI_READ_ERR_NO_READY_PORT) {
+            return DISK_IO_ERR_NO_READY_PORT;
+        }
+        return DISK_IO_ERR_NO_DEVICE;
+    }
+
+    return DISK_IO_ERR_NO_READY_PORT;
+}
+
 void disk_write_sector(uint32_t lba, uint16_t *buffer) {
     ata_wait_ready();
 
@@ -109,26 +229,47 @@ void disk_write_sector(uint32_t lba, uint16_t *buffer) {
     ata_wait_ready();
 }
 
+int disk_read_sector_backend(uint32_t lba, uint16_t *buffer, uint8_t backend) {
+    if (backend == DISK_BACKEND_ATA) {
+        return ata_read_sector_ex(lba, buffer);
+    }
+    if (backend == DISK_BACKEND_AHCI) {
+        return ahci_read_sector_ex(lba, buffer);
+    }
+    return DISK_IO_ERR_UNSUPPORTED;
+}
+
+int disk_read_sector_ex(uint32_t lba, uint16_t *buffer) {
+    int rc;
+
+    if (disk_preferred_backend == DISK_BACKEND_ATA) {
+        return ata_read_sector_ex(lba, buffer);
+    }
+    if (disk_preferred_backend == DISK_BACKEND_AHCI) {
+        return ahci_read_sector_ex(lba, buffer);
+    }
+
+    rc = ahci_read_sector_ex(lba, buffer);
+    if (rc == DISK_IO_OK) {
+        return DISK_IO_OK;
+    }
+    if (ata_disk_available) {
+        int ata_rc = ata_read_sector_ex(lba, buffer);
+        if (ata_rc == DISK_IO_OK) {
+            return DISK_IO_OK;
+        }
+        return ata_rc;
+    }
+    return rc;
+}
+
 /*
  * disk_read_sector() - Read 512 bytes (256 words) from disk
  * @lba: Logical Block Address (sector number)
  * @buffer: Pointer to buffer for 512 bytes
  */
 void disk_read_sector(uint32_t lba, uint16_t *buffer) {
-    ata_wait_ready();
-
-    outb(PORT_DEVICE, 0xE0 | ((lba >> 24) & 0x0F));
-    outb(PORT_SECCOUNT, 1);
-    outb(PORT_LBA_LOW,  (uint8_t)(lba & 0xFF));
-    outb(PORT_LBA_MID,  (uint8_t)((lba >> 8) & 0xFF));
-    outb(PORT_LBA_HIGH, (uint8_t)((lba >> 16) & 0xFF));
-
-    outb(PORT_COMMAND, CMD_READ);
-    ata_wait_drq();  // Wait for data to be ready
-
-    for (int i = 0; i < 256; i++) {
-        buffer[i] = inw(PORT_DATA);
-    }
+    (void)disk_read_sector_ex(lba, buffer);
 }
 
 /* TFS: Find first empty slot in root directory */

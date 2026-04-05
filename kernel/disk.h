@@ -44,6 +44,21 @@ typedef unsigned int uint32_t;
 // Global flag: is ATA disk controller present?
 extern volatile int ata_disk_available;
 
+typedef enum {
+    DISK_BACKEND_AUTO = 0,
+    DISK_BACKEND_ATA = 1,
+    DISK_BACKEND_AHCI = 2,
+} DiskBackendPreference;
+
+typedef enum {
+    DISK_IO_OK = 0,
+    DISK_IO_ERR_NO_DEVICE = -1,
+    DISK_IO_ERR_NO_READY_PORT = -2,
+    DISK_IO_ERR_TIMEOUT = -3,
+    DISK_IO_ERR_TFES = -4,
+    DISK_IO_ERR_UNSUPPORTED = -5,
+} DiskIoResult;
+
 // ===== TINY FILE SYSTEM (TFS) =====
 #define TFS_DIR_LBA    150   // Root directory stored at LBA 150
 #define TFS_DATA_START 200   // Neural snapshots start at LBA 200+
@@ -61,6 +76,11 @@ int  ata_detect_disk(void);
 void ata_wait_ready(void);
 void disk_write_sector(uint32_t lba, uint16_t *buffer);
 void disk_read_sector(uint32_t lba, uint16_t *buffer);
+int  disk_read_sector_backend(uint32_t lba, uint16_t *buffer, uint8_t backend);
+int  disk_read_sector_ex(uint32_t lba, uint16_t *buffer);
+void disk_set_preferred_backend(uint8_t backend);
+uint8_t disk_get_preferred_backend(void);
+const char *disk_read_error_string(int code);
 int  find_free_slot(FileEntry *dir);
 
 #endif

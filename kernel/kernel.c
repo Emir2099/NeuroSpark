@@ -264,6 +264,7 @@ extern void gprint_hex(uint32_t val, int digits, uint32_t color);
 #include "shell.h"
 #include "input.h"
 #include "dashboard.h"
+#include "ahci.h"
 #include "storage_manager.h"
 #include "klog.h"
 #include "paging.h"
@@ -2043,6 +2044,69 @@ void kprint(const char *str, int row, int col, unsigned char color) {
   }
 }
 
+extern void gprint_dec(int val, uint32_t color);
+
+static void ahci_print_boot_report(const AhciProbeReport *report,
+                                   int graphics_mode) {
+  if (report == 0 || !report->controller_found) {
+    if (graphics_mode) {
+      gprint("AHCI: no controller found\n", 0xCCCCCC);
+    } else {
+      kprint("AHCI: no controller found", 2, 0, 0x07);
+    }
+    return;
+  }
+
+  if (graphics_mode) {
+    gprint("AHCI HBA @ B", 0x66FFCC);
+    gprint_hex(report->bus, 2, 0xFFFFFF);
+    gprint(":D", 0x66FFCC);
+    gprint_hex(report->slot, 2, 0xFFFFFF);
+    gprint(":F", 0x66FFCC);
+    gprint_hex(report->function, 2, 0xFFFFFF);
+    gprint(" ABAR=", 0x66FFCC);
+    gprint_hex(report->abar, 8, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("AHCI CAP=", 0x55CCFF);
+    gprint_hex(report->cap, 8, 0xFFFFFF);
+    gprint(" PI=", 0x55CCFF);
+    gprint_hex(report->pi, 8, 0xFFFFFF);
+    gprint(" VS=", 0x55CCFF);
+    gprint_hex(report->version, 8, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("AHCI ports ready ", 0x88FFAA);
+    gprint_dec(report->ready_ports, 0xFFFFFF);
+    gprint("/", 0x88FFAA);
+    gprint_dec(report->implemented_ports, 0xFFFFFF);
+    gprint(report->ahci_enabled ? " (AE=ON)\n" : " (AE=OFF)\n", 0x88FFAA);
+
+    for (int p = 0; p < AHCI_MAX_PORTS; p++) {
+      const AhciPortReport *pr = &report->ports[p];
+      if (!pr->implemented) {
+        continue;
+      }
+
+      gprint("  P", 0xAAAAAA);
+      gprint_hex(pr->port_no, 2, 0xFFFFFF);
+      gprint(" DET=", 0xAAAAAA);
+      gprint_hex(pr->det, 1, 0xFFFFFF);
+      gprint(" IPM=", 0xAAAAAA);
+      gprint_hex(pr->ipm, 1, 0xFFFFFF);
+      gprint(" TFD=", 0xAAAAAA);
+      gprint_hex(pr->tfd, 8, 0xFFFFFF);
+      gprint(" SIG=", 0xAAAAAA);
+      gprint_hex(pr->sig, 8, 0xFFFFFF);
+      gprint(pr->ready ? " READY\n" : " NOT_READY\n",
+             pr->ready ? 0x55FF88 : 0xFFCC55);
+    }
+  } else {
+    kprint("AHCI: controller present (see graphics log for details)", 2, 0,
+           0x0F);
+  }
+}
+
 /* 6. Kernel Entry Point */
 extern void pci_scan_all(); // Added for PCI Discovery
 extern void flip_buffer();
@@ -2220,6 +2284,13 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
 
   /* PCI scan now happens safely AFTER IDT is set up */
   pci_scan_all();
+
+  {
+    AhciProbeReport ahci_report;
+    ahci_probe_and_enumerate(&ahci_report);
+    ahci_print_boot_report(&ahci_report, graphics_enabled);
+  }
+
   net_init();
 
   void init_syscalls();

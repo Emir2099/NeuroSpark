@@ -8,6 +8,7 @@ extern uint32_t page_directory[1024];
 void init_paging(void);
 void map_page(uint32_t phys_addr, uint32_t virt_addr);
 void map_page_flags(uint32_t phys_addr, uint32_t virt_addr, uint32_t flags);
+void map_mmio_region(uint32_t phys, uint32_t size);
 
 uint32_t create_user_page_directory(void);
 int map_user_page(uint32_t pd_phys, uint32_t phys_addr, uint32_t virt_addr);

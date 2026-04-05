@@ -25,7 +25,7 @@ boot/boot.bin: boot/boot.asm
 # 	$(CC) $(CFLAGS) -c kernel/kernel.c -o kernel.o
 # 	$(LD) -o $@ -T linker.ld kernel.o --oformat binary
 
-kernel.bin: kernel/kernel.c kernel/disk.c kernel/disk.h kernel/pmm.c kernel/paging.c kernel/paging.asm kernel/interrupt.asm kernel/idt.c kernel/syscall.c kernel/graphics.c kernel/pci.c kernel/scheduler.c kernel/shell.c kernel/input.c kernel/dashboard.c kernel/storage_manager.c kernel/klog.c kernel/vfs.c kernel/net.c kernel/net.h kernel/profiling.c kernel/profiling.h kernel/model_manager.c kernel/model_manager.h kernel/multiboot.asm kernel/usermode.c kernel/usermode.asm kernel/wm.c kernel/wm.h kernel/font.h linker.ld
+kernel.bin: kernel/kernel.c kernel/disk.c kernel/disk.h kernel/pmm.c kernel/paging.c kernel/paging.asm kernel/interrupt.asm kernel/idt.c kernel/syscall.c kernel/graphics.c kernel/pci.c kernel/ahci.c kernel/ahci.h kernel/scheduler.c kernel/shell.c kernel/input.c kernel/dashboard.c kernel/storage_manager.c kernel/klog.c kernel/vfs.c kernel/net.c kernel/net.h kernel/profiling.c kernel/profiling.h kernel/model_manager.c kernel/model_manager.h kernel/multiboot.asm kernel/usermode.c kernel/usermode.asm kernel/wm.c kernel/wm.h kernel/font.h linker.ld
 	nasm -f elf32 kernel/multiboot.asm -o multiboot.o
 	nasm -f elf32 kernel/interrupt.asm -o interrupt.o
 	nasm -f elf32 kernel/paging.asm -o paging_asm.o
@@ -39,6 +39,7 @@ kernel.bin: kernel/kernel.c kernel/disk.c kernel/disk.h kernel/pmm.c kernel/pagi
 	$(CC) $(CFLAGS) -c kernel/syscall.c -o syscall.o
 	$(CC) $(CFLAGS) -c kernel/graphics.c -o graphics.o
 	$(CC) $(CFLAGS) -c kernel/pci.c -o pci.o
+	$(CC) $(CFLAGS) -c kernel/ahci.c -o ahci.o
 	$(CC) $(CFLAGS) -c kernel/scheduler.c -o scheduler.o
 	$(CC) $(CFLAGS) -c kernel/shell.c -o shell.o
 	$(CC) $(CFLAGS) -c kernel/input.c -o input.o
@@ -52,11 +53,11 @@ kernel.bin: kernel/kernel.c kernel/disk.c kernel/disk.h kernel/pmm.c kernel/pagi
 	$(CC) $(CFLAGS) -c kernel/usermode.c -o usermode.o
 	$(CC) $(CFLAGS) -c kernel/wm.c -o wm.o
 	$(CC) $(CFLAGS) -c kernel/kernel.c -o kernel.o
-	$(LD) -o $@ -T linker.ld multiboot.o kernel.o disk.o pmm.o paging.o paging_asm.o interrupt.o switch.o usermode_asm.o task.o scheduler.o idt.o syscall.o graphics.o pci.o shell.o input.o dashboard.o storage_manager.o klog.o vfs.o net.o profiling.o model_manager.o usermode.o wm.o --oformat binary
+	$(LD) -o $@ -T linker.ld multiboot.o kernel.o disk.o pmm.o paging.o paging_asm.o interrupt.o switch.o usermode_asm.o task.o scheduler.o idt.o syscall.o graphics.o pci.o ahci.o shell.o input.o dashboard.o storage_manager.o klog.o vfs.o net.o profiling.o model_manager.o usermode.o wm.o --oformat binary
 
 # Clean build artifacts
 clean:
-	rm -f NeuroSpark.bin kernel.bin kernel.o disk.o pmm.o paging.o paging_asm.o interrupt.o switch.o usermode_asm.o task.o scheduler.o idt.o syscall.o graphics.o pci.o shell.o input.o dashboard.o storage_manager.o klog.o vfs.o net.o profiling.o model_manager.o usermode.o wm.o boot/boot.bin
+	rm -f NeuroSpark.bin kernel.bin kernel.o disk.o pmm.o paging.o paging_asm.o interrupt.o switch.o usermode_asm.o task.o scheduler.o idt.o syscall.o graphics.o pci.o ahci.o shell.o input.o dashboard.o storage_manager.o klog.o vfs.o net.o profiling.o model_manager.o usermode.o wm.o boot/boot.bin
 
 # Run in QEMU
 run: NeuroSpark.bin

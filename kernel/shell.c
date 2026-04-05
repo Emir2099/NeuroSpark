@@ -1,6 +1,7 @@
 #include "shell.h"
 #include "disk.h"
 #include "pci.h"
+#include "ahci.h"
 #include "storage_manager.h"
 #include "klog.h"
 #include "vfs.h"
@@ -488,7 +489,7 @@ void list_files_gfx(void) { list_files(); }
 static void cmd_help(const char *args) {
   (void)args;
   gprint("commands: help save load ls clear delete eval stim mall free map\n", 0xFFFFFF);
-  gprint("          tsave tload pci pci bar zoom+ zoom- zpan+ zpan- wipe\n", 0xFFFFFF);
+    gprint("          tsave tload pci pci bar ahci [show|backend|reset|identify|read|smoke]\n", 0xFFFFFF);
   gprint("          exec <path> mkdemo net up|cfg|status|tx|export|profile remote ...\n", 0xFFFFFF);
   gprint("phase8:   manifest save|load|show  replay rec on|off|run|show|clear\n", 0x88E0FF);
   gprint("          dataset export <path>  dataset import <path>\n", 0x88E0FF);
@@ -2080,6 +2081,299 @@ static void cmd_pci(const char *args) {
   }
 }
 
+static void ahci_print_report(const AhciProbeReport *r) {
+  if (r == 0 || !r->controller_found) {
+    gprint("AHCI: no controller found\n", 0xFFAA66);
+    return;
+  }
+
+  gprint("AHCI HBA B", 0x99EEFF);
+  gprint_hex(r->bus, 2, 0xFFFFFF);
+  gprint(":D", 0x99EEFF);
+  gprint_hex(r->slot, 2, 0xFFFFFF);
+  gprint(":F", 0x99EEFF);
+  gprint_hex(r->function, 2, 0xFFFFFF);
+  gprint(" ABAR=", 0x99EEFF);
+  gprint_hex(r->abar, 8, 0xFFFFFF);
+  gprint("\n", 0x000000);
+
+  gprint("CAP=", 0x77C8FF);
+  gprint_hex(r->cap, 8, 0xFFFFFF);
+  gprint(" PI=", 0x77C8FF);
+  gprint_hex(r->pi, 8, 0xFFFFFF);
+  gprint(" VS=", 0x77C8FF);
+  gprint_hex(r->version, 8, 0xFFFFFF);
+  gprint(" READY ", 0x77C8FF);
+  gprint_dec(r->ready_ports, 0xFFFFFF);
+  gprint("/", 0x77C8FF);
+  gprint_dec(r->implemented_ports, 0xFFFFFF);
+  gprint("\n", 0x000000);
+
+  for (int p = 0; p < AHCI_MAX_PORTS; p++) {
+    const AhciPortReport *pr = &r->ports[p];
+    if (!pr->implemented) {
+      continue;
+    }
+    gprint(" P", 0xAAAAAA);
+    gprint_hex(pr->port_no, 2, 0xFFFFFF);
+    gprint(" DET=", 0xAAAAAA);
+    gprint_hex(pr->det, 1, 0xFFFFFF);
+    gprint(" IPM=", 0xAAAAAA);
+    gprint_hex(pr->ipm, 1, 0xFFFFFF);
+    gprint(" SIG=", 0xAAAAAA);
+    gprint_hex(pr->sig, 8, 0xFFFFFF);
+    gprint(" ", 0x000000);
+    gprint(pr->sata ? "SATA" : "NON-SATA", pr->sata ? 0x77FFAA : 0xFFAA66);
+    gprint(" ", 0x000000);
+    gprint(pr->ready ? "READY" : "NOT_READY", pr->ready ? 0x44FF88 : 0xFFAA66);
+    gprint("\n", 0x000000);
+  }
+}
+
+static uint32_t sector_checksum(const uint16_t *sector) {
+  uint32_t hash = 0x811C9DC5U;
+
+  for (int i = 0; i < 256; i++) {
+    hash ^= (uint32_t)sector[i];
+    hash *= 16777619U;
+  }
+  return hash;
+}
+
+static const char *backend_name(uint8_t backend) {
+  if (backend == DISK_BACKEND_ATA) {
+    return "ATA";
+  }
+  if (backend == DISK_BACKEND_AHCI) {
+    return "AHCI";
+  }
+  return "AUTO";
+}
+
+static void cmd_ahci(const char *args) {
+  char sub[16];
+  char arg1[16];
+  char arg2[16];
+  AhciProbeReport report;
+
+  args = next_token(args, sub, sizeof(sub));
+  args = next_token(args, arg1, sizeof(arg1));
+  next_token(args, arg2, sizeof(arg2));
+
+  if (sub[0] == '\0' || str_eq(sub, "show")) {
+    if (!ahci_get_runtime_report(&report)) {
+      set_cmd_output("AHCI REPORT FAIL");
+      return;
+    }
+    ahci_print_report(&report);
+    set_cmd_output("AHCI REPORT");
+    return;
+  }
+
+  if (str_eq(sub, "backend")) {
+    if (arg1[0] == '\0') {
+      gprint("AHCI READ BACKEND: ", 0x99EEFF);
+      gprint((char *)backend_name(disk_get_preferred_backend()), 0xFFFFFF);
+      gprint("\n", 0x000000);
+      set_cmd_output("AHCI BACKEND SHOW");
+      return;
+    }
+
+    if (str_eq(arg1, "ata")) {
+      disk_set_preferred_backend(DISK_BACKEND_ATA);
+      set_cmd_output("AHCI BACKEND ATA");
+      return;
+    }
+    if (str_eq(arg1, "ahci")) {
+      disk_set_preferred_backend(DISK_BACKEND_AHCI);
+      set_cmd_output("AHCI BACKEND AHCI");
+      return;
+    }
+    if (str_eq(arg1, "auto")) {
+      disk_set_preferred_backend(DISK_BACKEND_AUTO);
+      set_cmd_output("AHCI BACKEND AUTO");
+      return;
+    }
+
+    set_cmd_output("USAGE: ahci backend [auto|ata|ahci]");
+    return;
+  }
+
+  if (str_eq(sub, "reset")) {
+    AhciPortReport pr;
+    int ok = 0;
+
+    if (!is_dec_number(arg1)) {
+      set_cmd_output("USAGE: ahci reset <port>");
+      return;
+    }
+
+    ok = ahci_port_reset_and_start((uint8_t)parse_u32_dec(arg1), &pr);
+    if (!ok) {
+      set_cmd_output("AHCI RESET FAIL");
+      return;
+    }
+
+    gprint("AHCI RESET OK P", 0x44FF88);
+    gprint_dec(parse_u32_dec(arg1), 0xFFFFFF);
+    gprint(" DET=", 0x99EEFF);
+    gprint_hex(pr.det, 1, 0xFFFFFF);
+    gprint(" IPM=", 0x99EEFF);
+    gprint_hex(pr.ipm, 1, 0xFFFFFF);
+    gprint("\n", 0x000000);
+    set_cmd_output("AHCI RESET OK");
+    return;
+  }
+
+  if (str_eq(sub, "identify")) {
+    AhciIdentifyInfo info;
+    int ok = 0;
+
+    if (arg1[0] == '\0') {
+      ok = ahci_identify_first_ready(&info);
+    } else if (is_dec_number(arg1)) {
+      ok = ahci_identify_port((uint8_t)parse_u32_dec(arg1), &info);
+    } else {
+      set_cmd_output("USAGE: ahci identify [port]");
+      return;
+    }
+
+    if (!ok || !info.success) {
+      set_cmd_output("AHCI IDENTIFY FAIL");
+      return;
+    }
+
+    gprint("AHCI IDENTIFY P", 0x44FF88);
+    gprint_dec(info.port_no, 0xFFFFFF);
+    gprint(" MODEL:", 0x99EEFF);
+    gprint(info.model, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("  SERIAL: ", 0x99EEFF);
+    gprint(info.serial, 0xFFFFFF);
+    gprint(" FW: ", 0x99EEFF);
+    gprint(info.firmware, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("  LBA28 sectors: ", 0x99EEFF);
+    gprint_dec((int)info.lba28_sectors, 0xFFFFFF);
+    gprint("\n", 0x000000);
+    set_cmd_output("AHCI IDENTIFY OK");
+    return;
+  }
+
+  if (str_eq(sub, "read")) {
+    uint16_t sector[256];
+    uint8_t port = 0xFF;
+    uint32_t lba = 0;
+    int ok = 0;
+
+    if (arg1[0] == '\0') {
+      set_cmd_output("USAGE: ahci read <lba> | ahci read <port> <lba>");
+      return;
+    }
+
+    if (arg2[0] == '\0') {
+      if (is_dec_number(arg1)) {
+        lba = (uint32_t)parse_u32_dec(arg1);
+      } else {
+        lba = parse_u32_hex(arg1);
+      }
+      ok = ahci_read_first_ready_sector(lba, &port, sector);
+    } else {
+      if (!is_dec_number(arg1)) {
+        set_cmd_output("USAGE: ahci read <lba> | ahci read <port> <lba>");
+        return;
+      }
+      port = (uint8_t)parse_u32_dec(arg1);
+      if (is_dec_number(arg2)) {
+        lba = (uint32_t)parse_u32_dec(arg2);
+      } else {
+        lba = parse_u32_hex(arg2);
+      }
+      ok = ahci_read_sector(port, lba, sector);
+    }
+
+    if (ok != AHCI_READ_OK) {
+      gprint("AHCI READ FAIL: ", 0xFFAA66);
+      gprint((char *)disk_read_error_string(ok), 0xFFFFFF);
+      gprint("\n", 0x000000);
+      set_cmd_output("AHCI READ FAIL");
+      return;
+    }
+
+    gprint("AHCI READ OK P", 0x44FF88);
+    gprint_dec((int)port, 0xFFFFFF);
+    gprint(" LBA=", 0x99EEFF);
+    gprint_hex(lba, 8, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("W0=", 0x99EEFF);
+    gprint_hex((uint32_t)sector[0], 4, 0xFFFFFF);
+    gprint(" W1=", 0x99EEFF);
+    gprint_hex((uint32_t)sector[1], 4, 0xFFFFFF);
+    gprint(" W2=", 0x99EEFF);
+    gprint_hex((uint32_t)sector[2], 4, 0xFFFFFF);
+    gprint(" W3=", 0x99EEFF);
+    gprint_hex((uint32_t)sector[3], 4, 0xFFFFFF);
+    gprint("\n", 0x000000);
+    set_cmd_output("AHCI READ OK");
+    return;
+  }
+
+  if (str_eq(sub, "smoke")) {
+    uint16_t ata_sector[256];
+    uint16_t ahci_sector[256];
+    uint32_t lba = 0;
+    int ata_rc;
+    int ahci_rc;
+    uint32_t ata_sum;
+    uint32_t ahci_sum;
+
+    if (arg1[0] == '\0') {
+      set_cmd_output("USAGE: ahci smoke <lba>");
+      return;
+    }
+
+    lba = is_dec_number(arg1) ? (uint32_t)parse_u32_dec(arg1)
+                              : parse_u32_hex(arg1);
+    ata_rc = disk_read_sector_backend(lba, ata_sector, DISK_BACKEND_ATA);
+    ahci_rc = disk_read_sector_backend(lba, ahci_sector, DISK_BACKEND_AHCI);
+
+    if (ata_rc != DISK_IO_OK) {
+      gprint("SMOKE ATA FAIL: ", 0xFFAA66);
+      gprint((char *)disk_read_error_string(ata_rc), 0xFFFFFF);
+      gprint("\n", 0x000000);
+      set_cmd_output("AHCI SMOKE ATA FAIL");
+      return;
+    }
+    if (ahci_rc != DISK_IO_OK) {
+      gprint("SMOKE AHCI FAIL: ", 0xFFAA66);
+      gprint((char *)disk_read_error_string(ahci_rc), 0xFFFFFF);
+      gprint("\n", 0x000000);
+      set_cmd_output("AHCI SMOKE AHCI FAIL");
+      return;
+    }
+
+    ata_sum = sector_checksum(ata_sector);
+    ahci_sum = sector_checksum(ahci_sector);
+
+    gprint("SMOKE LBA=", 0x99EEFF);
+    gprint_hex(lba, 8, 0xFFFFFF);
+    gprint(" ATA=", 0x99EEFF);
+    gprint_hex(ata_sum, 8, 0xFFFFFF);
+    gprint(" AHCI=", 0x99EEFF);
+    gprint_hex(ahci_sum, 8, 0xFFFFFF);
+    gprint((ata_sum == ahci_sum) ? " MATCH\n" : " MISMATCH\n",
+           (ata_sum == ahci_sum) ? 0x44FF88 : 0xFF5555);
+
+    set_cmd_output((ata_sum == ahci_sum) ? "AHCI SMOKE OK" : "AHCI SMOKE MISMATCH");
+    return;
+  }
+
+  set_cmd_output("USAGE: ahci [show|backend [auto|ata|ahci]|reset <port>|identify [port]|read <lba>|read <port> <lba>|smoke <lba>]");
+}
+
 static void cmd_zoomp(const char *args) {
   (void)args;
   if (zoom_level < 4)
@@ -2155,6 +2449,7 @@ static const CommandEntry command_table[] = {
     {"stim", cmd_stim}, {"mall", cmd_mall},   {"free", cmd_free},
     {"map", cmd_map},   {"tsave", cmd_tsave}, {"tload", cmd_tload},
     {"pci", cmd_pci},   {"zoom+", cmd_zoomp}, {"zoom-", cmd_zoomm},
+    {"ahci", cmd_ahci},
     {"zpan+", cmd_zpanp},
     {"zpan-", cmd_zpanm},
     {"wipe", cmd_wipe},
