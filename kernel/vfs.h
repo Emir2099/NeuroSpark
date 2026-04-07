@@ -3,6 +3,11 @@
 
 typedef unsigned int uint32_t;
 
+typedef struct VfsFileStat {
+  uint32_t size;   /* File size in bytes */
+  uint32_t flags;  /* File flags (1=exists, 0=deleted) */
+} VfsFileStat;
+
 /* ===== VFS Error Codes ===== */
 #define VFS_OK              0
 #define VFS_ERR_INVALID_FD  -1
@@ -25,6 +30,8 @@ typedef struct {
   int (*write)(int handle, const void *buf, uint32_t size);
   int (*close)(int handle);
   int (*delete)(const char *path);
+  int (*lseek)(int handle, int offset, int whence);
+  int (*stat)(const char *path, struct VfsFileStat *stat_out);
 } VfsBackendOps;
 
 /* Initialize VFS and mount default filesystems */
@@ -32,24 +39,41 @@ void vfs_init(void);
 
 /* Mount a filesystem backend at a path */
 int vfs_mount(const char *mount_path, const VfsBackendOps *ops);
+int vfs_umount(const char *mount_path);
+int vfs_mount_backend(const char *mount_path, const char *backend_name);
 
 /* Core VFS operations: open, read, write, close */
 int vfs_open(const char *path, int flags);
 int vfs_read(int fd, void *buf, uint32_t size);
 int vfs_write(int fd, const void *buf, uint32_t size);
 int vfs_close(int fd);
+int vfs_lseek(int fd, int offset, int whence);
+int vfs_dup(int fd);
+int vfs_dup2(int fd, int newfd);
+int vfs_fcntl(int fd, int cmd, int arg);
+void vfs_close_all_for_task(int task_id);
+
+typedef struct {
+  char mount_path[24];
+  int used;
+} VfsMountInfo;
+
+int vfs_list_mounts(VfsMountInfo *out, int max_entries);
 
 /* Convenience functions: single-call file I/O */
 int vfs_read_file(const char *path, void *buf, uint32_t max_size);
 int vfs_write_file(const char *path, const void *buf, uint32_t size);
 int vfs_delete(const char *path);
 
-/* File metadata query */
-typedef struct {
-  uint32_t size;   /* File size in bytes */
-  uint32_t flags;  /* File flags (1=exists, 0=deleted) */
-} VfsFileStat;
-
 int vfs_stat(const char *path, VfsFileStat *stat_out);
+
+/* Seek semantics */
+#define VFS_SEEK_SET 0
+#define VFS_SEEK_CUR 1
+#define VFS_SEEK_END 2
+
+/* fcntl commands (minimal subset) */
+#define VFS_F_GETFL 1
+#define VFS_F_SETFL 2
 
 #endif

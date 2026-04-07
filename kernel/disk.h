@@ -71,6 +71,13 @@ typedef struct {
     uint32_t flags;    // 1 = Active, 0 = Empty
 } FileEntry;
 
+typedef struct {
+    uint32_t uncached_reads;
+    uint32_t uncached_writes;
+    uint32_t cached_reads;
+    uint32_t cached_writes;
+} DiskIoStats;
+
 // Disk driver functions
 int  ata_detect_disk(void);
 void ata_wait_ready(void);
@@ -78,9 +85,13 @@ void disk_write_sector(uint32_t lba, uint16_t *buffer);
 void disk_read_sector(uint32_t lba, uint16_t *buffer);
 int  disk_read_sector_backend(uint32_t lba, uint16_t *buffer, uint8_t backend);
 int  disk_read_sector_ex(uint32_t lba, uint16_t *buffer);
+int  disk_read_sector_uncached(uint32_t lba, uint16_t *buffer);
+void disk_write_sector_uncached(uint32_t lba, const uint16_t *buffer);
 void disk_set_preferred_backend(uint8_t backend);
 uint8_t disk_get_preferred_backend(void);
 const char *disk_read_error_string(int code);
 int  find_free_slot(FileEntry *dir);
+void disk_get_io_stats(DiskIoStats *out_stats);
+void disk_reset_io_stats(void);
 
 #endif

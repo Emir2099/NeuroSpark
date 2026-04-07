@@ -1,6 +1,7 @@
 #include "scheduler.h"
 #include "profiling.h"
 #include "paging.h"
+#include "vfs.h"
 
 typedef unsigned int uint32_t;
 
@@ -251,6 +252,8 @@ void task_terminate_current(void) {
   os_tasks[os_current_task].state = TASK_STATE_TERMINATED;
   os_tasks[os_current_task].wake_tick = 0;
   irq_lock_release(&scheduler_lock, flags);
+
+  vfs_close_all_for_task(current);
 
   if (task_pd != 0 && task_pd != (uint32_t)page_directory) {
     destroy_user_address_space(task_pd);

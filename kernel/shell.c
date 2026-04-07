@@ -13,6 +13,8 @@
 #include "scheduler.h"
 #include "dashboard.h"
 #include "wm.h"
+#include "ext2fs.h"
+#include "page_cache.h"
 
 typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
@@ -509,7 +511,7 @@ void list_files_gfx(void) { list_files(); }
 
 static void cmd_help(const char *args) {
   (void)args;
-  gprint("commands: help save load ls clear delete eval stim mall free map\n", 0xFFFFFF);
+  gprint("commands: help save load ls stat mount umount pcache clear delete eval stim mall free map\n", 0xFFFFFF);
     gprint("          tsave tload pci pci bar ahci [show|backend|reset|identify|read|smoke]\n", 0xFFFFFF);
     gprint("          exec <path> mkdemo net up|cfg|status|tx|export|profile|manifest remote ...\n", 0xFFFFFF);
   gprint("phase8:   manifest save|load|show  replay rec on|off|run|show|clear\n", 0x88E0FF);
@@ -1899,6 +1901,80 @@ static void cmd_delete(const char *args) {
   }
 }
 
+static void cmd_stat(const char *args) {
+  VfsFileStat st;
+
+  if (args == 0 || args[0] == '\0') {
+    set_cmd_output("USAGE: stat <PATH>");
+    return;
+  }
+
+  if (vfs_stat(args, &st) != 0) {
+    set_cmd_output("STAT FAIL");
+    return;
+  }
+
+  gprint("SIZE=", 0x99EEFF);
+  gprint_dec((int)st.size, 0xFFFFFF);
+  gprint(" FLAGS=", 0x99EEFF);
+  gprint_dec((int)st.flags, 0xFFFFFF);
+  gprint("\n", 0x000000);
+  set_cmd_output("STAT OK");
+}
+
+static void cmd_mount(const char *args) {
+  char path[24];
+  char backend[16];
+  VfsMountInfo mounts[8];
+
+  args = next_token(args, path, sizeof(path));
+  next_token(args, backend, sizeof(backend));
+
+  if (path[0] == '\0') {
+    int count = vfs_list_mounts(mounts, 8);
+    if (count < 0) {
+      set_cmd_output("MOUNT LIST FAIL");
+      return;
+    }
+    gprint("MOUNTS:\n", 0x99EEFF);
+    for (int i = 0; i < count; i++) {
+      gprint("  ", 0x000000);
+      gprint(mounts[i].mount_path, 0x77FFAA);
+      gprint("\n", 0x000000);
+    }
+    if (count == 0) {
+      gprint("  (none)\n", 0xFFAA66);
+    }
+    set_cmd_output("MOUNT LIST OK");
+    return;
+  }
+
+  if (backend[0] == '\0') {
+    set_cmd_output("USAGE: mount <path> <tfs|ramdisk|ext2|ext2:<lba>>");
+    return;
+  }
+
+  if (vfs_mount_backend(path, backend) == 0) {
+    set_cmd_output("MOUNT OK");
+  } else {
+    set_cmd_output("MOUNT FAIL");
+  }
+}
+
+static void cmd_umount(const char *args) {
+  char path[24];
+  next_token(args, path, sizeof(path));
+  if (path[0] == '\0') {
+    set_cmd_output("USAGE: umount <path>");
+    return;
+  }
+  if (vfs_umount(path) == 0) {
+    set_cmd_output("UMOUNT OK");
+  } else {
+    set_cmd_output("UMOUNT FAIL");
+  }
+}
+
 static void cmd_mkdemo(const char *args) {
   (void)args;
 
@@ -1939,8 +2015,161 @@ static void cmd_load(const char *args) {
 }
 
 static void cmd_ls(const char *args) {
-  (void)args;
+  if (args && args[0] == '-' && args[1] == 'l') {
+    Ext2LsEntry entries[64];
+    int ext2_count = ext2_list_root_long(entries, 64);
+    if (ext2_count >= 0) {
+      gprint("INODE SIZE MTIME NAME\n", 0x99EEFF);
+      gprint("----------------------\n", 0x557799);
+      for (int i = 0; i < ext2_count; i++) {
+        gprint_dec((int)entries[i].inode, 0x77FFAA);
+        gprint(" ", 0x000000);
+        gprint_dec((int)entries[i].size, 0xFFFFFF);
+        gprint(" ", 0x000000);
+        gprint_dec((int)entries[i].mtime, 0xFFE066);
+        gprint(" ", 0x000000);
+        gprint(entries[i].name, 0x00FF88);
+        gprint("\n", 0x000000);
+      }
+      if (ext2_count == 0) {
+        gprint("(empty)\n", 0xFFAA66);
+      }
+      return;
+    }
+
+    if (ata_disk_available) {
+      disk_read_sector(TFS_DIR_LBA, (uint16_t *)root_directory);
+    }
+    gprint("FLAGS SIZE NAME\n", 0x99EEFF);
+    gprint("----------------\n", 0x557799);
+    for (int i = 0; i < TFS_MAX_FILES; i++) {
+      if (root_directory[i].flags == 1) {
+        gprint_dec((int)root_directory[i].flags, 0x77FFAA);
+        gprint("     ", 0x000000);
+        gprint_dec((int)root_directory[i].size, 0xFFFFFF);
+        gprint(" ", 0x000000);
+        gprint(root_directory[i].name, 0x00FF88);
+        gprint("\n", 0x000000);
+      }
+    }
+    return;
+  }
+
   list_files();
+}
+
+static void cmd_pcache(const char *args) {
+  char sub[12];
+  char val[12];
+  int loops = 1000;
+  DiskIoStats before_disk;
+  DiskIoStats after_disk;
+  PageCacheStats cache_stats;
+
+  args = next_token(args, sub, sizeof(sub));
+  next_token(args, val, sizeof(val));
+
+  if (sub[0] == '\0' || str_eq(sub, "show")) {
+    disk_get_io_stats(&before_disk);
+    page_cache_get_stats(&cache_stats);
+
+    gprint("PCACHE RH/RM ", 0x99EEFF);
+    gprint_dec((int)cache_stats.read_hits, 0x77FFAA);
+    gprint("/", 0x666666);
+    gprint_dec((int)cache_stats.read_misses, 0xFFFFFF);
+    gprint(" WH/WM ", 0x99EEFF);
+    gprint_dec((int)cache_stats.write_hits, 0x77FFAA);
+    gprint("/", 0x666666);
+    gprint_dec((int)cache_stats.write_misses, 0xFFFFFF);
+    gprint(" DIRTY ", 0x99EEFF);
+    gprint_dec((int)cache_stats.dirty_lines, 0xFFE066);
+    gprint("\n", 0x000000);
+
+    gprint("PCACHE BUF/FLUSH ", 0x99EEFF);
+    gprint_dec((int)cache_stats.buffered_writes, 0x77FFAA);
+    gprint("/", 0x666666);
+    gprint_dec((int)cache_stats.flush_writes, 0xFFFFFF);
+    gprint(" EVICT ", 0x99EEFF);
+    gprint_dec((int)cache_stats.evictions, 0xFFE066);
+    gprint("\n", 0x000000);
+
+    gprint("DISK C-R/C-W/U-R/U-W ", 0x99EEFF);
+    gprint_dec((int)before_disk.cached_reads, 0x77FFAA);
+    gprint("/", 0x666666);
+    gprint_dec((int)before_disk.cached_writes, 0x77FFAA);
+    gprint("/", 0x666666);
+    gprint_dec((int)before_disk.uncached_reads, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)before_disk.uncached_writes, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    set_cmd_output("PCACHE SHOW OK");
+    return;
+  }
+
+  if (str_eq(sub, "reset")) {
+    disk_reset_io_stats();
+    page_cache_reset_stats();
+    set_cmd_output("PCACHE RESET OK");
+    return;
+  }
+
+  if (str_eq(sub, "flush")) {
+    page_cache_flush_all();
+    set_cmd_output("PCACHE FLUSH OK");
+    return;
+  }
+
+  if (str_eq(sub, "stress")) {
+    uint16_t sector_buf[256];
+    uint32_t base_lba = 480;
+    int logical_sector_writes;
+
+    if (is_dec_number(val)) {
+      loops = parse_u32_dec(val);
+      if (loops <= 0) {
+        loops = 1000;
+      }
+    }
+
+    disk_reset_io_stats();
+    page_cache_reset_stats();
+
+    for (int i = 0; i < loops; i++) {
+      for (int s = 0; s < 8; s++) {
+        for (int w = 0; w < 256; w++) {
+          sector_buf[w] = (uint16_t)(i + s + w);
+        }
+        disk_write_sector(base_lba + (uint32_t)s, sector_buf);
+      }
+    }
+
+    page_cache_flush_all();
+    disk_get_io_stats(&after_disk);
+    page_cache_get_stats(&cache_stats);
+
+    logical_sector_writes = loops * 8;
+    gprint("STRESS logical sectors: ", 0x99EEFF);
+    gprint_dec(logical_sector_writes, 0xFFFFFF);
+    gprint(" uncached writes: ", 0x99EEFF);
+    gprint_dec((int)after_disk.uncached_writes, 0x77FFAA);
+    gprint("\n", 0x000000);
+
+    gprint("coalescing ratio x", 0x99EEFF);
+    if (after_disk.uncached_writes > 0) {
+      gprint_dec((int)(logical_sector_writes / (int)after_disk.uncached_writes), 0xFFE066);
+    } else {
+      gprint_dec(0, 0xFFE066);
+    }
+    gprint(" flushWrites ", 0x99EEFF);
+    gprint_dec((int)cache_stats.flush_writes, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    set_cmd_output("PCACHE STRESS OK");
+    return;
+  }
+
+  set_cmd_output("USAGE: pcache show|reset|flush|stress [loops]");
 }
 
 static void cmd_clear(const char *args) {
@@ -2524,6 +2753,10 @@ static const CommandEntry command_table[] = {
     {"manifest", cmd_manifest},
     {"dataset", cmd_dataset},
     {"replay", cmd_replay},
+    {"pcache", cmd_pcache},
+    {"mount", cmd_mount},
+    {"umount", cmd_umount},
+    {"stat", cmd_stat},
     {"delete", cmd_delete},
     {"exec", cmd_exec},
     {"mkdemo", cmd_mkdemo},

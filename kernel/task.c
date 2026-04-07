@@ -81,6 +81,9 @@ void create_task(int index, void (*func_ptr)(), uint32_t page_dir) {
     os_tasks[index].fault_code = 0;
     os_tasks[index].fault_addr = 0;
     os_tasks[index].fault_eip = 0;
+    for (int fd = 0; fd < TASK_MAX_FDS; fd++) {
+        os_tasks[index].fd_table[fd] = -1;
+    }
     os_tasks[index].wait_reason = 0;
     os_tasks[index].task_id = index;
 

@@ -6,6 +6,7 @@ typedef unsigned char uint8_t;
 #include "paging.h"
 #include "task.h"
 #include "scheduler.h"
+#include "vfs.h"
 
 extern int is_user_range(const void *ptr, uint32_t size);
 
@@ -33,6 +34,11 @@ enum {
 #define SYS_FLIP 10
 #define SYS_IPC_SEND 11
 #define SYS_IPC_RECV 12
+#define SYS_OPEN 13
+#define SYS_LSEEK 14
+#define SYS_DUP 15
+#define SYS_DUP2 16
+#define SYS_FCNTL 17
 
 /* ============================================================
  * Syscall Validation and Error Codes
@@ -189,15 +195,81 @@ void syscall_handler(uint32_t *regs) {
     syscall_complete(regs, syscall_num, NS_ERR_INVALID_SYSCALL);
     break;
 
-  /* ---- SYS_READ (3): not yet implemented ---- */
+  /* ---- SYS_READ (3): read from VFS FD ---- */
   case SYS_READ:
-    syscall_complete(regs, syscall_num, NS_ERR_INVALID_SYSCALL);
+    {
+      int fd = (int)regs[4];
+      void *buf = (void *)regs[6];
+      uint32_t size = regs[5];
+      int rc;
+      if (cpl == 3 && !validate_user_ptr(buf, size)) {
+        syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+        break;
+      }
+      rc = vfs_read(fd, buf, size);
+      syscall_complete(regs, syscall_num, (uint32_t)rc);
+    }
     break;
 
-  /* ---- SYS_CLOSE (6): not yet implemented ---- */
+  /* ---- SYS_CLOSE (6): close a VFS FD ---- */
   case SYS_CLOSE:
-    syscall_complete(regs, syscall_num, NS_ERR_INVALID_SYSCALL);
+    {
+      int fd = (int)regs[4];
+      int rc = vfs_close(fd);
+      syscall_complete(regs, syscall_num, (uint32_t)rc);
+    }
     break;
+
+  /* ---- SYS_OPEN (13): open path with VFS flags ---- */
+  case SYS_OPEN: {
+    const char *path = (const char *)regs[4];
+    int flags = (int)regs[6];
+    int rc;
+    if (cpl == 3 && !validate_user_string(path)) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+    rc = vfs_open(path, flags);
+    syscall_complete(regs, syscall_num, (uint32_t)rc);
+    break;
+  }
+
+  /* ---- SYS_LSEEK (14): move read/write cursor ---- */
+  case SYS_LSEEK: {
+    int fd = (int)regs[4];
+    int offset = (int)regs[6];
+    int whence = (int)regs[5];
+    int rc = vfs_lseek(fd, offset, whence);
+    syscall_complete(regs, syscall_num, (uint32_t)rc);
+    break;
+  }
+
+  /* ---- SYS_DUP (15): duplicate file descriptor ---- */
+  case SYS_DUP: {
+    int fd = (int)regs[4];
+    int rc = vfs_dup(fd);
+    syscall_complete(regs, syscall_num, (uint32_t)rc);
+    break;
+  }
+
+  /* ---- SYS_DUP2 (16): duplicate into specific descriptor ---- */
+  case SYS_DUP2: {
+    int fd = (int)regs[4];
+    int newfd = (int)regs[6];
+    int rc = vfs_dup2(fd, newfd);
+    syscall_complete(regs, syscall_num, (uint32_t)rc);
+    break;
+  }
+
+  /* ---- SYS_FCNTL (17): descriptor flag operations ---- */
+  case SYS_FCNTL: {
+    int fd = (int)regs[4];
+    int cmd = (int)regs[6];
+    int arg = (int)regs[5];
+    int rc = vfs_fcntl(fd, cmd, arg);
+    syscall_complete(regs, syscall_num, (uint32_t)rc);
+    break;
+  }
 
   /* ---- SYS_EXIT (1): terminate current user task (Ring 3 only) ---- */
   case SYS_EXIT: {
@@ -211,17 +283,34 @@ void syscall_handler(uint32_t *regs) {
     break;
   }
 
-  /* ---- SYS_WRITE (4): write a NUL-terminated string via gprint ---- */
+  /* ---- SYS_WRITE (4): write to FD or fallback to legacy gprint ---- */
   case SYS_WRITE: {
-    char *msg = (char *)regs[4]; /* EBX */
-    if (cpl == 3) {
-      if (!validate_user_string(msg)) {
+    int fd = (int)regs[4];
+    const void *buf = (const void *)regs[6];
+    uint32_t size = regs[5];
+    int wrote = VFS_ERR_INVALID_ARG;
+
+    if (fd >= 0 && buf != 0 && size > 0) {
+      if (cpl == 3 && !validate_user_ptr(buf, size)) {
         syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
         break;
       }
+      wrote = vfs_write(fd, buf, size);
+      if (wrote >= 0) {
+        syscall_complete(regs, syscall_num, (uint32_t)wrote);
+        break;
+      }
     }
-    gprint(msg, 0x00FF00);       /* Green */
-    syscall_complete(regs, syscall_num, NS_OK);
+
+    {
+      char *msg = (char *)regs[4]; /* EBX */
+      if (cpl == 3 && !validate_user_string(msg)) {
+        syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+        break;
+      }
+      gprint(msg, 0x00FF00);
+      syscall_complete(regs, syscall_num, NS_OK);
+    }
     break;
   }
 

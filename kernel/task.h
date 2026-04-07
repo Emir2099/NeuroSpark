@@ -12,6 +12,7 @@ enum {
 };
 
 #define MAX_TASKS 3
+#define TASK_MAX_FDS 256
 
 enum {
   WORKLOAD_CLASS_SIM = 0,
@@ -50,6 +51,7 @@ typedef struct {
   uint32_t fault_code;
   uint32_t fault_addr;
   uint32_t fault_eip;
+  int fd_table[TASK_MAX_FDS];
   int wait_reason;
   int task_id;
 } TCB;

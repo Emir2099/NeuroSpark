@@ -1,5 +1,6 @@
 #include "disk.h"
 #include "ahci.h"
+#include "page_cache.h"
 
 // ============================================================================
 // DISK DRIVER FUNCTIONS (ATA PIO Mode)
@@ -29,6 +30,21 @@ static inline uint16_t inw(uint16_t port) {
 // Global flag: is ATA disk controller present?
 volatile int ata_disk_available = 0;
 static uint8_t disk_preferred_backend = DISK_BACKEND_AUTO;
+static DiskIoStats disk_io_stats = {0, 0, 0, 0};
+
+void disk_get_io_stats(DiskIoStats *out_stats) {
+    if (out_stats == 0) {
+        return;
+    }
+    *out_stats = disk_io_stats;
+}
+
+void disk_reset_io_stats(void) {
+    disk_io_stats.uncached_reads = 0;
+    disk_io_stats.uncached_writes = 0;
+    disk_io_stats.cached_reads = 0;
+    disk_io_stats.cached_writes = 0;
+}
 
 void disk_set_preferred_backend(uint8_t backend) {
     if (backend != DISK_BACKEND_AUTO && backend != DISK_BACKEND_ATA &&
@@ -208,7 +224,8 @@ static int ahci_read_sector_ex(uint32_t lba, uint16_t *buffer) {
     return DISK_IO_ERR_NO_READY_PORT;
 }
 
-void disk_write_sector(uint32_t lba, uint16_t *buffer) {
+void disk_write_sector_uncached(uint32_t lba, const uint16_t *buffer) {
+    disk_io_stats.uncached_writes++;
     ata_wait_ready();
 
     outb(PORT_DEVICE, 0xE0 | ((lba >> 24) & 0x0F));
@@ -239,7 +256,8 @@ int disk_read_sector_backend(uint32_t lba, uint16_t *buffer, uint8_t backend) {
     return DISK_IO_ERR_UNSUPPORTED;
 }
 
-int disk_read_sector_ex(uint32_t lba, uint16_t *buffer) {
+int disk_read_sector_uncached(uint32_t lba, uint16_t *buffer) {
+    disk_io_stats.uncached_reads++;
     int rc;
 
     if (disk_preferred_backend == DISK_BACKEND_ATA) {
@@ -263,13 +281,23 @@ int disk_read_sector_ex(uint32_t lba, uint16_t *buffer) {
     return rc;
 }
 
+int disk_read_sector_ex(uint32_t lba, uint16_t *buffer) {
+    return disk_read_sector_uncached(lba, buffer);
+}
+
 /*
  * disk_read_sector() - Read 512 bytes (256 words) from disk
  * @lba: Logical Block Address (sector number)
  * @buffer: Pointer to buffer for 512 bytes
  */
 void disk_read_sector(uint32_t lba, uint16_t *buffer) {
-    (void)disk_read_sector_ex(lba, buffer);
+    disk_io_stats.cached_reads++;
+    (void)page_cache_read_sector(lba, buffer);
+}
+
+void disk_write_sector(uint32_t lba, uint16_t *buffer) {
+    disk_io_stats.cached_writes++;
+    (void)page_cache_write_sector(lba, buffer);
 }
 
 /* TFS: Find first empty slot in root directory */
