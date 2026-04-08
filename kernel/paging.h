@@ -13,6 +13,8 @@ void map_mmio_region(uint32_t phys, uint32_t size);
 
 uint32_t create_user_page_directory(void);
 int map_user_page(uint32_t pd_phys, uint32_t phys_addr, uint32_t virt_addr);
+int unmap_user_page(uint32_t pd_phys, uint32_t virt_addr);
+int set_user_page_writable(uint32_t pd_phys, uint32_t virt_addr, int writable);
 int is_user_range(const void *ptr, uint32_t size);
 int is_user_range_accessible(uint32_t pd_phys, const void *ptr, uint32_t size);
 uint32_t resolve_user_phys(uint32_t pd_phys, uint32_t virt_addr);

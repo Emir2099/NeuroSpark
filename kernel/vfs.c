@@ -12,6 +12,8 @@
 #define RAMDISK_MAX_HANDLES 128
 #define RAMDISK_NAME_MAX 23
 #define RAMDISK_FILE_CAPACITY 8192
+#define VFS_PIPE_MAX 64
+#define VFS_PIPE_BUFFER_SIZE 1024
 
 typedef struct {
   int used;
@@ -52,6 +54,22 @@ typedef struct {
   int flags;
 } RamdiskHandle;
 
+typedef struct {
+  int used;
+  uint8_t data[VFS_PIPE_BUFFER_SIZE];
+  uint32_t head;
+  uint32_t tail;
+  uint32_t count;
+  int read_refs;
+  int write_refs;
+} VfsPipe;
+
+typedef struct {
+  int used;
+  int pipe_idx;
+  int writable;
+} VfsPipeHandle;
+
 extern FileEntry root_directory[TFS_MAX_FILES];
 extern void disk_write_sector(uint32_t lba, uint16_t *buffer);
 extern void disk_read_sector(uint32_t lba, uint16_t *buffer);
@@ -62,6 +80,8 @@ static int task_fd_map[MAX_TASKS][TASK_MAX_FDS];
 static TfsHandle tfs_handles[TFS_MAX_HANDLES];
 static RamdiskFile ramdisk_files[RAMDISK_MAX_FILES];
 static RamdiskHandle ramdisk_handles[RAMDISK_MAX_HANDLES];
+static VfsPipe vfs_pipes[VFS_PIPE_MAX];
+static VfsPipeHandle vfs_pipe_handles[VFS_PIPE_MAX * 2];
 static uint32_t ramdisk_next_inode = 1;
 static uint32_t ramdisk_mtime_tick = 1;
 
@@ -99,6 +119,231 @@ static int task_fd_to_global(int local_fd) {
   }
   return task_fd_map[task_id][local_fd];
 }
+
+static int vfs_pipe_alloc_slot(void) {
+  for (int i = 0; i < VFS_PIPE_MAX; i++) {
+    if (!vfs_pipes[i].used) {
+      vfs_pipes[i].used = 1;
+      vfs_pipes[i].head = 0;
+      vfs_pipes[i].tail = 0;
+      vfs_pipes[i].count = 0;
+      vfs_pipes[i].read_refs = 0;
+      vfs_pipes[i].write_refs = 0;
+      return i;
+    }
+  }
+  return -1;
+}
+
+static int vfs_pipe_handle_alloc(int pipe_idx, int writable) {
+  for (int i = 0; i < (VFS_PIPE_MAX * 2); i++) {
+    if (!vfs_pipe_handles[i].used) {
+      vfs_pipe_handles[i].used = 1;
+      vfs_pipe_handles[i].pipe_idx = pipe_idx;
+      vfs_pipe_handles[i].writable = writable;
+      if (writable) {
+        vfs_pipes[pipe_idx].write_refs++;
+      } else {
+        vfs_pipes[pipe_idx].read_refs++;
+      }
+      return i;
+    }
+  }
+  return -1;
+}
+
+static int pipe_read_backend(int handle, void *buf, uint32_t size) {
+  VfsPipeHandle *h;
+  VfsPipe *pipe;
+  uint8_t *out;
+  uint32_t done = 0;
+
+  if (handle < 0 || handle >= (VFS_PIPE_MAX * 2) || !vfs_pipe_handles[handle].used || buf == 0) {
+    return VFS_ERR_INVALID_FD;
+  }
+
+  h = &vfs_pipe_handles[handle];
+  if (h->writable) {
+    return VFS_ERR_PERM;
+  }
+  pipe = &vfs_pipes[h->pipe_idx];
+  out = (uint8_t *)buf;
+
+  while (done < size && pipe->count > 0) {
+    out[done++] = pipe->data[pipe->head];
+    pipe->head = (pipe->head + 1u) % VFS_PIPE_BUFFER_SIZE;
+    pipe->count--;
+  }
+
+  if (done == 0 && pipe->write_refs > 0) {
+    return VFS_ERR_WOULD_BLOCK;
+  }
+  return (int)done;
+}
+
+static int pipe_write_backend(int handle, const void *buf, uint32_t size) {
+  VfsPipeHandle *h;
+  VfsPipe *pipe;
+  const uint8_t *in;
+  uint32_t done = 0;
+
+  if (handle < 0 || handle >= (VFS_PIPE_MAX * 2) || !vfs_pipe_handles[handle].used || buf == 0) {
+    return VFS_ERR_INVALID_FD;
+  }
+
+  h = &vfs_pipe_handles[handle];
+  if (!h->writable) {
+    return VFS_ERR_PERM;
+  }
+  pipe = &vfs_pipes[h->pipe_idx];
+  if (pipe->read_refs <= 0) {
+    return VFS_ERR_IO;
+  }
+
+  in = (const uint8_t *)buf;
+  while (done < size && pipe->count < VFS_PIPE_BUFFER_SIZE) {
+    pipe->data[pipe->tail] = in[done++];
+    pipe->tail = (pipe->tail + 1u) % VFS_PIPE_BUFFER_SIZE;
+    pipe->count++;
+  }
+
+  if (done == 0) {
+    return VFS_ERR_WOULD_BLOCK;
+  }
+  return (int)done;
+}
+
+static int pipe_close_backend(int handle) {
+  VfsPipeHandle *h;
+  VfsPipe *pipe;
+
+  if (handle < 0 || handle >= (VFS_PIPE_MAX * 2) || !vfs_pipe_handles[handle].used) {
+    return VFS_ERR_INVALID_FD;
+  }
+
+  h = &vfs_pipe_handles[handle];
+  pipe = &vfs_pipes[h->pipe_idx];
+  if (h->writable) {
+    if (pipe->write_refs > 0) {
+      pipe->write_refs--;
+    }
+  } else {
+    if (pipe->read_refs > 0) {
+      pipe->read_refs--;
+    }
+  }
+
+  vfs_pipe_handles[handle].used = 0;
+  vfs_pipe_handles[handle].pipe_idx = -1;
+  vfs_pipe_handles[handle].writable = 0;
+
+  if (pipe->read_refs == 0 && pipe->write_refs == 0) {
+    pipe->used = 0;
+    pipe->head = 0;
+    pipe->tail = 0;
+    pipe->count = 0;
+  }
+  return VFS_OK;
+}
+
+static int pipe_lseek_backend(int handle, int offset, int whence) {
+  (void)handle;
+  (void)offset;
+  (void)whence;
+  return VFS_ERR_INVALID_ARG;
+}
+
+static int pipe_stat_backend(const char *path, VfsFileStat *stat_out) {
+  (void)path;
+  (void)stat_out;
+  return VFS_ERR_INVALID_ARG;
+}
+
+static int pipe_delete_backend(const char *path) {
+  (void)path;
+  return VFS_ERR_PERM;
+}
+
+static int pipe_unsupported_rename(const char *old_path, const char *new_path) {
+  (void)old_path;
+  (void)new_path;
+  return VFS_ERR_PERM;
+}
+
+static int pipe_unsupported_mkdir(const char *path, int mode) {
+  (void)path;
+  (void)mode;
+  return VFS_ERR_PERM;
+}
+
+static int pipe_unsupported_rmdir(const char *path) {
+  (void)path;
+  return VFS_ERR_PERM;
+}
+
+static int pipe_unsupported_truncate(const char *path, uint32_t size) {
+  (void)path;
+  (void)size;
+  return VFS_ERR_PERM;
+}
+
+static int pipe_unsupported_ftruncate(int handle, uint32_t size) {
+  (void)handle;
+  (void)size;
+  return VFS_ERR_PERM;
+}
+
+static int pipe_unsupported_chmod(const char *path, int mode) {
+  (void)path;
+  (void)mode;
+  return VFS_ERR_PERM;
+}
+
+static int pipe_unsupported_chown(const char *path, int uid, int gid) {
+  (void)path;
+  (void)uid;
+  (void)gid;
+  return VFS_ERR_PERM;
+}
+
+static int pipe_unsupported_link(const char *old_path, const char *new_path) {
+  (void)old_path;
+  (void)new_path;
+  return VFS_ERR_PERM;
+}
+
+static int pipe_unsupported_symlink(const char *target, const char *link_path) {
+  (void)target;
+  (void)link_path;
+  return VFS_ERR_PERM;
+}
+
+static int pipe_unsupported_readlink(const char *link_path, char *target_buf, uint32_t max_len) {
+  (void)link_path;
+  (void)target_buf;
+  (void)max_len;
+  return VFS_ERR_PERM;
+}
+
+static const VfsBackendOps pipe_backend_ops = {
+    0,
+    pipe_read_backend,
+    pipe_write_backend,
+    pipe_close_backend,
+    pipe_delete_backend,
+    pipe_lseek_backend,
+    pipe_stat_backend,
+    pipe_unsupported_rename,
+    pipe_unsupported_mkdir,
+    pipe_unsupported_rmdir,
+    pipe_unsupported_truncate,
+    pipe_unsupported_ftruncate,
+    pipe_unsupported_chmod,
+    pipe_unsupported_chown,
+    pipe_unsupported_link,
+    pipe_unsupported_symlink,
+    pipe_unsupported_readlink,
+};
 
 static void clear_file_entry(FileEntry *entry) {
   int i;
@@ -501,14 +746,138 @@ static int tfs_delete(const char *path) {
   return VFS_OK;
 }
 
+static int tfs_rename(const char *old_path, const char *new_path) {
+  char old_name[12];
+  char new_name[12];
+  int old_idx;
+  int new_idx;
+
+  if (!ata_disk_available) {
+    return VFS_ERR_IO;
+  }
+  if (!normalize_tfs_name(old_path, old_name) || !normalize_tfs_name(new_path, new_name)) {
+    return VFS_ERR_INVALID_ARG;
+  }
+
+  disk_read_sector(TFS_DIR_LBA, (uint16_t *)root_directory);
+  old_idx = tfs_find_entry_by_name(old_name);
+  if (old_idx < 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  new_idx = tfs_find_entry_by_name(new_name);
+  if (new_idx >= 0 && new_idx != old_idx) {
+    return VFS_ERR_PERM;
+  }
+
+  for (int i = 0; i < 12; i++) {
+    root_directory[old_idx].name[i] = new_name[i];
+    if (new_name[i] == '\0') {
+      break;
+    }
+  }
+  disk_write_sector(TFS_DIR_LBA, (uint16_t *)root_directory);
+  return VFS_OK;
+}
+
+static int tfs_mkdir(const char *path, int mode) {
+  (void)path;
+  (void)mode;
+  return VFS_ERR_INVALID_ARG;
+}
+
+static int tfs_rmdir(const char *path) {
+  (void)path;
+  return VFS_ERR_INVALID_ARG;
+}
+
+static int tfs_truncate(const char *path, uint32_t size) {
+  char name[12];
+  int entry_idx;
+
+  if (!ata_disk_available) {
+    return VFS_ERR_IO;
+  }
+  if (!normalize_tfs_name(path, name)) {
+    return VFS_ERR_INVALID_ARG;
+  }
+
+  disk_read_sector(TFS_DIR_LBA, (uint16_t *)root_directory);
+  entry_idx = tfs_find_entry_by_name(name);
+  if (entry_idx < 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  root_directory[entry_idx].size = size;
+  disk_write_sector(TFS_DIR_LBA, (uint16_t *)root_directory);
+  return VFS_OK;
+}
+
+static int tfs_ftruncate(int handle, uint32_t size) {
+  TfsHandle *h;
+  FileEntry *entry;
+
+  if (handle < 0 || handle >= TFS_MAX_HANDLES || !tfs_handles[handle].used) {
+    return VFS_ERR_INVALID_FD;
+  }
+  h = &tfs_handles[handle];
+  entry = &root_directory[h->entry_idx];
+  entry->size = size;
+  if (h->pos > size) {
+    h->pos = size;
+  }
+  disk_write_sector(TFS_DIR_LBA, (uint16_t *)root_directory);
+  return VFS_OK;
+}
+
+static int tfs_chmod(const char *path, int mode) {
+  (void)path;
+  (void)mode;
+  return VFS_ERR_PERM;
+}
+
+static int tfs_chown(const char *path, int uid, int gid) {
+  (void)path;
+  (void)uid;
+  (void)gid;
+  return VFS_ERR_PERM;
+}
+
+static int tfs_link(const char *old_path, const char *new_path) {
+  (void)old_path;
+  (void)new_path;
+  return VFS_ERR_INVALID_ARG;
+}
+
+static int tfs_symlink(const char *target, const char *link_path) {
+  (void)target;
+  (void)link_path;
+  return VFS_ERR_INVALID_ARG;
+}
+
+static int tfs_readlink(const char *link_path, char *target_buf, uint32_t max_len) {
+  (void)link_path;
+  (void)target_buf;
+  (void)max_len;
+  return VFS_ERR_INVALID_ARG;
+}
+
 static const VfsBackendOps tfs_backend_ops = {
     tfs_open,
     tfs_read,
     tfs_write,
     tfs_close,
     tfs_delete,
-  tfs_lseek,
-  tfs_stat,
+    tfs_lseek,
+    tfs_stat,
+    tfs_rename,
+    tfs_mkdir,
+    tfs_rmdir,
+    tfs_truncate,
+    tfs_ftruncate,
+    tfs_chmod,
+    tfs_chown,
+    tfs_link,
+    tfs_symlink,
+    tfs_readlink,
 };
 
 static int ramdisk_extract_name(const char *path, char *out_name) {
@@ -749,6 +1118,118 @@ static int ramdisk_stat(const char *path, VfsFileStat *stat_out) {
   return VFS_OK;
 }
 
+static int ramdisk_rename(const char *old_path, const char *new_path) {
+  char old_name[RAMDISK_NAME_MAX + 1];
+  char new_name[RAMDISK_NAME_MAX + 1];
+  int old_idx;
+  int new_idx;
+
+  if (!ramdisk_extract_name(old_path, old_name) || !ramdisk_extract_name(new_path, new_name)) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  old_idx = ramdisk_find_entry(old_name);
+  if (old_idx < 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  new_idx = ramdisk_find_entry(new_name);
+  if (new_idx >= 0 && new_idx != old_idx) {
+    return VFS_ERR_PERM;
+  }
+  copy_text(ramdisk_files[old_idx].name, RAMDISK_NAME_MAX + 1, new_name);
+  ramdisk_files[old_idx].mtime = ramdisk_mtime_tick++;
+  return VFS_OK;
+}
+
+static int ramdisk_mkdir(const char *path, int mode) {
+  (void)path;
+  (void)mode;
+  return VFS_ERR_INVALID_ARG;
+}
+
+static int ramdisk_rmdir(const char *path) {
+  (void)path;
+  return VFS_ERR_INVALID_ARG;
+}
+
+static int ramdisk_truncate(const char *path, uint32_t size) {
+  char name[RAMDISK_NAME_MAX + 1];
+  int entry_idx;
+
+  if (!ramdisk_extract_name(path, name)) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  entry_idx = ramdisk_find_entry(name);
+  if (entry_idx < 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  if (size > RAMDISK_FILE_CAPACITY) {
+    size = RAMDISK_FILE_CAPACITY;
+  }
+  ramdisk_files[entry_idx].size = size;
+  ramdisk_files[entry_idx].mtime = ramdisk_mtime_tick++;
+  for (int i = 0; i < RAMDISK_MAX_HANDLES; i++) {
+    if (ramdisk_handles[i].used && ramdisk_handles[i].entry_idx == entry_idx &&
+        ramdisk_handles[i].pos > size) {
+      ramdisk_handles[i].pos = size;
+    }
+  }
+  return VFS_OK;
+}
+
+static int ramdisk_ftruncate(int handle, uint32_t size) {
+  RamdiskFile *file;
+
+  if (handle < 0 || handle >= RAMDISK_MAX_HANDLES || !ramdisk_handles[handle].used) {
+    return VFS_ERR_INVALID_FD;
+  }
+  if (size > RAMDISK_FILE_CAPACITY) {
+    size = RAMDISK_FILE_CAPACITY;
+  }
+  file = &ramdisk_files[ramdisk_handles[handle].entry_idx];
+  file->size = size;
+  if (ramdisk_handles[handle].pos > size) {
+    ramdisk_handles[handle].pos = size;
+  }
+  file->mtime = ramdisk_mtime_tick++;
+  return VFS_OK;
+}
+
+static int ramdisk_chmod(const char *path, int mode) {
+  (void)mode;
+  if (path == 0) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  return VFS_OK;
+}
+
+static int ramdisk_chown(const char *path, int uid, int gid) {
+  (void)uid;
+  (void)gid;
+  if (path == 0) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  return VFS_OK;
+}
+
+static int ramdisk_link(const char *old_path, const char *new_path) {
+  (void)old_path;
+  (void)new_path;
+  return VFS_ERR_INVALID_ARG;
+}
+
+static int ramdisk_symlink(const char *target, const char *link_path) {
+  (void)target;
+  (void)link_path;
+  return VFS_ERR_INVALID_ARG;
+}
+
+static int ramdisk_readlink(const char *link_path, char *target_buf, uint32_t max_len) {
+  (void)link_path;
+  (void)target_buf;
+  (void)max_len;
+  return VFS_ERR_INVALID_ARG;
+}
+
 static const VfsBackendOps ramdisk_backend_ops = {
     ramdisk_open,
     ramdisk_read,
@@ -757,6 +1238,16 @@ static const VfsBackendOps ramdisk_backend_ops = {
     ramdisk_delete,
     ramdisk_lseek,
     ramdisk_stat,
+  ramdisk_rename,
+  ramdisk_mkdir,
+  ramdisk_rmdir,
+  ramdisk_truncate,
+  ramdisk_ftruncate,
+  ramdisk_chmod,
+  ramdisk_chown,
+  ramdisk_link,
+  ramdisk_symlink,
+  ramdisk_readlink,
 };
 
 static const VfsBackendOps *lookup_backend(const char *name) {
@@ -832,6 +1323,19 @@ void vfs_init(void) {
     ramdisk_handles[i].entry_idx = -1;
     ramdisk_handles[i].pos = 0;
     ramdisk_handles[i].flags = 0;
+  }
+  for (int i = 0; i < VFS_PIPE_MAX; i++) {
+    vfs_pipes[i].used = 0;
+    vfs_pipes[i].head = 0;
+    vfs_pipes[i].tail = 0;
+    vfs_pipes[i].count = 0;
+    vfs_pipes[i].read_refs = 0;
+    vfs_pipes[i].write_refs = 0;
+  }
+  for (int i = 0; i < (VFS_PIPE_MAX * 2); i++) {
+    vfs_pipe_handles[i].used = 0;
+    vfs_pipe_handles[i].pipe_idx = -1;
+    vfs_pipe_handles[i].writable = 0;
   }
   ramdisk_next_inode = 1;
   ramdisk_mtime_tick = 1;
@@ -1151,4 +1655,216 @@ int vfs_stat(const char *path, VfsFileStat *stat_out) {
   }
 
   return ops->stat(rel_path, stat_out);
+}
+
+int vfs_rename(const char *old_path, const char *new_path) {
+  const VfsBackendOps *ops_old;
+  const VfsBackendOps *ops_new;
+  const char *rel_old;
+  const char *rel_new;
+
+  if (old_path == 0 || new_path == 0) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (!resolve_mount(old_path, &ops_old, &rel_old) || !resolve_mount(new_path, &ops_new, &rel_new)) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  if (ops_old != ops_new || ops_old == 0 || ops_old->rename == 0) {
+    return VFS_ERR_PERM;
+  }
+  return ops_old->rename(rel_old, rel_new);
+}
+
+int vfs_mkdir(const char *path, int mode) {
+  const VfsBackendOps *ops;
+  const char *rel_path;
+
+  if (path == 0) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (!resolve_mount(path, &ops, &rel_path) || ops == 0 || ops->mkdir == 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  return ops->mkdir(rel_path, mode);
+}
+
+int vfs_rmdir(const char *path) {
+  const VfsBackendOps *ops;
+  const char *rel_path;
+
+  if (path == 0) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (!resolve_mount(path, &ops, &rel_path) || ops == 0 || ops->rmdir == 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  return ops->rmdir(rel_path);
+}
+
+int vfs_truncate(const char *path, uint32_t size) {
+  const VfsBackendOps *ops;
+  const char *rel_path;
+
+  if (path == 0) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (!resolve_mount(path, &ops, &rel_path) || ops == 0 || ops->truncate == 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  return ops->truncate(rel_path, size);
+}
+
+int vfs_ftruncate(int fd, uint32_t size) {
+  int gfd = task_fd_to_global(fd);
+  if (gfd < 0 || gfd >= VFS_MAX_GLOBAL_FDS || !fd_table[gfd].used ||
+      fd_table[gfd].ops == 0 || fd_table[gfd].ops->ftruncate == 0) {
+    return VFS_ERR_INVALID_FD;
+  }
+  return fd_table[gfd].ops->ftruncate(fd_table[gfd].backend_handle, size);
+}
+
+int vfs_chmod(const char *path, int mode) {
+  const VfsBackendOps *ops;
+  const char *rel_path;
+
+  if (path == 0) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (!resolve_mount(path, &ops, &rel_path) || ops == 0 || ops->chmod == 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  return ops->chmod(rel_path, mode);
+}
+
+int vfs_chown(const char *path, int uid, int gid) {
+  const VfsBackendOps *ops;
+  const char *rel_path;
+
+  if (path == 0) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (!resolve_mount(path, &ops, &rel_path) || ops == 0 || ops->chown == 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  return ops->chown(rel_path, uid, gid);
+}
+
+int vfs_pipe(int *read_fd_out, int *write_fd_out) {
+  int pipe_idx;
+  int read_handle;
+  int write_handle;
+  int read_gfd;
+  int write_gfd;
+  int read_lfd;
+  int write_lfd;
+  int task_id = current_task_id();
+
+  if (read_fd_out == 0 || write_fd_out == 0) {
+    return VFS_ERR_INVALID_ARG;
+  }
+
+  pipe_idx = vfs_pipe_alloc_slot();
+  if (pipe_idx < 0) {
+    return VFS_ERR_NO_SPACE;
+  }
+
+  read_handle = vfs_pipe_handle_alloc(pipe_idx, 0);
+  write_handle = vfs_pipe_handle_alloc(pipe_idx, 1);
+  if (read_handle < 0 || write_handle < 0) {
+    if (read_handle >= 0) {
+      (void)pipe_close_backend(read_handle);
+    }
+    if (write_handle >= 0) {
+      (void)pipe_close_backend(write_handle);
+    }
+    vfs_pipes[pipe_idx].used = 0;
+    return VFS_ERR_NO_SPACE;
+  }
+
+  read_gfd = alloc_global_fd();
+  if (read_gfd >= 0) {
+    fd_table[read_gfd].used = 1;
+  }
+  write_gfd = alloc_global_fd();
+  if (write_gfd >= 0) {
+    fd_table[write_gfd].used = 1;
+  }
+  read_lfd = alloc_task_fd(task_id);
+  if (read_lfd >= 0) {
+    task_fd_map[task_id][read_lfd] = -2;
+  }
+  write_lfd = alloc_task_fd(task_id);
+
+  if (read_gfd < 0 || write_gfd < 0 || read_lfd < 0 || write_lfd < 0 || read_lfd == write_lfd) {
+    if (read_gfd >= 0) {
+      fd_table[read_gfd].used = 0;
+    }
+    if (write_gfd >= 0) {
+      fd_table[write_gfd].used = 0;
+    }
+    if (read_lfd >= 0 && task_fd_map[task_id][read_lfd] == -2) {
+      task_fd_map[task_id][read_lfd] = -1;
+    }
+    (void)pipe_close_backend(read_handle);
+    (void)pipe_close_backend(write_handle);
+    return VFS_ERR_NO_SPACE;
+  }
+
+  fd_table[read_gfd].used = 1;
+  fd_table[read_gfd].ops = &pipe_backend_ops;
+  fd_table[read_gfd].backend_handle = read_handle;
+  fd_table[read_gfd].flags = VFS_O_RDONLY;
+  fd_table[read_gfd].ref_count = 1;
+
+  fd_table[write_gfd].used = 1;
+  fd_table[write_gfd].ops = &pipe_backend_ops;
+  fd_table[write_gfd].backend_handle = write_handle;
+  fd_table[write_gfd].flags = VFS_O_WRONLY;
+  fd_table[write_gfd].ref_count = 1;
+
+  task_fd_map[task_id][read_lfd] = read_gfd;
+  task_fd_map[task_id][write_lfd] = write_gfd;
+
+  *read_fd_out = read_lfd;
+  *write_fd_out = write_lfd;
+  return VFS_OK;
+}
+
+int vfs_link(const char *old_path, const char *new_path) {
+  const VfsBackendOps *ops;
+  const char *rel_path;
+
+  if (old_path == 0 || new_path == 0) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (!resolve_mount(new_path, &ops, &rel_path) || ops == 0 || ops->link == 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  return ops->link(old_path, new_path);
+}
+
+int vfs_symlink(const char *target, const char *link_path) {
+  const VfsBackendOps *ops;
+  const char *rel_path;
+
+  if (target == 0 || link_path == 0) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (!resolve_mount(link_path, &ops, &rel_path) || ops == 0 || ops->symlink == 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  return ops->symlink(target, link_path);
+}
+
+int vfs_readlink(const char *link_path, char *target_buf, uint32_t max_len) {
+  const VfsBackendOps *ops;
+  const char *rel_path;
+
+  if (link_path == 0 || target_buf == 0) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (!resolve_mount(link_path, &ops, &rel_path) || ops == 0 || ops->readlink == 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  return ops->readlink(link_path, target_buf, max_len);
 }

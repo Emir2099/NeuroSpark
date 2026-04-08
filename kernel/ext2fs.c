@@ -1117,6 +1117,451 @@ static int ext2_stat(const char *path, VfsFileStat *stat_out) {
   return VFS_OK;
 }
 
+static int ext2_is_dir_effectively_empty(uint32_t inode_num) {
+  Ext2Inode dir_inode;
+  uint8_t block[4096];
+  uint32_t block_count;
+
+  if (!read_inode(inode_num, &dir_inode) || !(dir_inode.mode & EXT2_S_IFDIR)) {
+    return 0;
+  }
+
+  block_count = (dir_inode.size + ext2_state.block_size - 1u) / ext2_state.block_size;
+  for (uint32_t b = 0; b < block_count; b++) {
+    int block_num = inode_get_block(&dir_inode, b, 0);
+    if (block_num <= 0 || !read_block((uint32_t)block_num, block)) {
+      continue;
+    }
+
+    uint32_t off = 0;
+    while (off + 8u <= ext2_state.block_size) {
+      Ext2DirEntry *entry = (Ext2DirEntry *)(block + off);
+      if (entry->rec_len == 0) {
+        break;
+      }
+      if (entry->inode != 0 && entry->name_len > 0) {
+        char name[EXT2_NAME_MAX + 1];
+        int is_dot = 0;
+        int is_dotdot = 0;
+        for (uint32_t i = 0; i < entry->name_len; i++) {
+          name[i] = entry->name[i];
+        }
+        name[entry->name_len] = '\0';
+        is_dot = (name[0] == '.' && name[1] == '\0');
+        is_dotdot = (name[0] == '.' && name[1] == '.' && name[2] == '\0');
+        if (!is_dot && !is_dotdot) {
+          return 0;
+        }
+      }
+      off += entry->rec_len;
+    }
+  }
+
+  return 1;
+}
+
+static int ext2_rename(const char *old_path, const char *new_path) {
+  uint32_t old_inode = 0;
+  uint32_t old_parent = 0;
+  uint32_t new_inode = 0;
+  uint32_t new_parent = 0;
+  char old_leaf[EXT2_NAME_MAX + 1];
+  char new_leaf[EXT2_NAME_MAX + 1];
+  Ext2Inode inode;
+  uint8_t file_type;
+
+  if (!resolve_path(old_path, &old_inode, &old_parent, old_leaf, sizeof(old_leaf)) ||
+      !resolve_path(new_path, &new_inode, &new_parent, new_leaf, sizeof(new_leaf))) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (old_inode == 0 || old_parent == 0 || new_parent == 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  if (new_inode != 0) {
+    return VFS_ERR_PERM;
+  }
+  if (!read_inode(old_inode, &inode)) {
+    return VFS_ERR_IO;
+  }
+
+  file_type = (inode.mode & EXT2_S_IFDIR) ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
+  if (!dir_add_entry(new_parent, new_leaf, old_inode, file_type)) {
+    return VFS_ERR_IO;
+  }
+  if (!dir_remove_entry(old_parent, old_leaf)) {
+    (void)dir_remove_entry(new_parent, new_leaf);
+    (void)dir_add_entry(old_parent, old_leaf, old_inode, file_type);
+    return VFS_ERR_IO;
+  }
+  return VFS_OK;
+}
+
+static int ext2_mkdir(const char *path, int mode) {
+  uint32_t inode_num = 0;
+  uint32_t parent_inode = 0;
+  char leaf[EXT2_NAME_MAX + 1];
+  Ext2Inode inode;
+  Ext2Inode parent;
+  uint8_t block[4096];
+  int block_num;
+
+  if (!resolve_path(path, &inode_num, &parent_inode, leaf, sizeof(leaf))) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (inode_num != 0) {
+    return VFS_ERR_PERM;
+  }
+  if (parent_inode == 0 || leaf[0] == '\0') {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (!read_inode(parent_inode, &parent) || !(parent.mode & EXT2_S_IFDIR)) {
+    return VFS_ERR_INVALID_ARG;
+  }
+
+  inode_num = (uint32_t)alloc_inode();
+  if (inode_num == 0 || (int)inode_num < 0) {
+    return VFS_ERR_NO_SPACE;
+  }
+
+  inode.mode = (uint16_t)(EXT2_S_IFDIR | (mode & 0777));
+  inode.uid = 0;
+  inode.size = ext2_state.block_size;
+  inode.atime = 0;
+  inode.ctime = 0;
+  inode.mtime = 0;
+  inode.dtime = 0;
+  inode.gid = 0;
+  inode.links_count = 2;
+  inode.blocks = ext2_state.block_size / 512u;
+  inode.flags = 0;
+  inode.osd1 = 0;
+  for (int i = 0; i < 15; i++) {
+    inode.block[i] = 0;
+  }
+  inode.generation = 0;
+  inode.file_acl = 0;
+  inode.dir_acl = 0;
+  inode.faddr = 0;
+  for (int i = 0; i < 12; i++) {
+    inode.osd2[i] = 0;
+  }
+
+  block_num = inode_get_block(&inode, 0, 1);
+  if (block_num <= 0) {
+    free_inode(inode_num);
+    return VFS_ERR_NO_SPACE;
+  }
+  for (uint32_t i = 0; i < ext2_state.block_size; i++) {
+    block[i] = 0;
+  }
+  {
+    Ext2DirEntry *dot = (Ext2DirEntry *)block;
+    uint16_t dot_len = 12;
+    Ext2DirEntry *dotdot = (Ext2DirEntry *)(block + dot_len);
+    dot->inode = inode_num;
+    dot->rec_len = dot_len;
+    dot->name_len = 1;
+    dot->file_type = EXT2_FT_DIR;
+    dot->name[0] = '.';
+
+    dotdot->inode = parent_inode;
+    dotdot->rec_len = (uint16_t)(ext2_state.block_size - dot_len);
+    dotdot->name_len = 2;
+    dotdot->file_type = EXT2_FT_DIR;
+    dotdot->name[0] = '.';
+    dotdot->name[1] = '.';
+  }
+  if (!write_block((uint32_t)block_num, block)) {
+    free_block((uint32_t)block_num);
+    free_inode(inode_num);
+    return VFS_ERR_IO;
+  }
+  if (!write_inode(inode_num, &inode)) {
+    free_block((uint32_t)block_num);
+    free_inode(inode_num);
+    return VFS_ERR_IO;
+  }
+  if (!dir_add_entry(parent_inode, leaf, inode_num, EXT2_FT_DIR)) {
+    free_block((uint32_t)block_num);
+    free_inode(inode_num);
+    return VFS_ERR_IO;
+  }
+
+  parent.links_count++;
+  (void)write_inode(parent_inode, &parent);
+  return VFS_OK;
+}
+
+static int ext2_rmdir(const char *path) {
+  uint32_t inode_num = 0;
+  uint32_t parent_inode = 0;
+  char leaf[EXT2_NAME_MAX + 1];
+  Ext2Inode inode;
+  Ext2Inode parent;
+
+  if (!resolve_path(path, &inode_num, &parent_inode, leaf, sizeof(leaf))) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (inode_num == 0 || parent_inode == 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  if (!read_inode(inode_num, &inode) || !(inode.mode & EXT2_S_IFDIR)) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (!ext2_is_dir_effectively_empty(inode_num)) {
+    return VFS_ERR_PERM;
+  }
+
+  if (!dir_remove_entry(parent_inode, leaf)) {
+    return VFS_ERR_IO;
+  }
+  if (!inode_clear_blocks(&inode)) {
+    return VFS_ERR_IO;
+  }
+  free_inode(inode_num);
+
+  if (read_inode(parent_inode, &parent) && parent.links_count > 0) {
+    parent.links_count--;
+    (void)write_inode(parent_inode, &parent);
+  }
+  return VFS_OK;
+}
+
+static int ext2_truncate_path(const char *path, uint32_t size) {
+  uint32_t inode_num = 0;
+
+  if (!resolve_path(path, &inode_num, 0, 0, 0)) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (inode_num == 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  if (!ext2_truncate_inode(inode_num, size)) {
+    return VFS_ERR_IO;
+  }
+  return VFS_OK;
+}
+
+static int ext2_ftruncate(int handle, uint32_t size) {
+  if (handle < 0 || handle >= EXT2_MAX_HANDLES || !ext2_handles[handle].used) {
+    return VFS_ERR_INVALID_FD;
+  }
+  if (!ext2_truncate_inode(ext2_handles[handle].inode_num, size)) {
+    return VFS_ERR_IO;
+  }
+  if (ext2_handles[handle].pos > size) {
+    ext2_handles[handle].pos = size;
+  }
+  return VFS_OK;
+}
+
+static int ext2_chmod(const char *path, int mode) {
+  uint32_t inode_num = 0;
+  Ext2Inode inode;
+
+  if (!resolve_path(path, &inode_num, 0, 0, 0) || inode_num == 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  if (!read_inode(inode_num, &inode)) {
+    return VFS_ERR_IO;
+  }
+
+  inode.mode = (uint16_t)((inode.mode & 0xF000u) | (mode & 0777));
+  if (!write_inode(inode_num, &inode)) {
+    return VFS_ERR_IO;
+  }
+  return VFS_OK;
+}
+
+static int ext2_chown(const char *path, int uid, int gid) {
+  uint32_t inode_num = 0;
+  Ext2Inode inode;
+
+  if (!resolve_path(path, &inode_num, 0, 0, 0) || inode_num == 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  if (!read_inode(inode_num, &inode)) {
+    return VFS_ERR_IO;
+  }
+
+  inode.uid = (uint16_t)uid;
+  inode.gid = (uint16_t)gid;
+  if (!write_inode(inode_num, &inode)) {
+    return VFS_ERR_IO;
+  }
+  return VFS_OK;
+}
+
+static int ext2_link(const char *old_path, const char *new_path) {
+  uint32_t old_inode = 0;
+  uint32_t new_parent = 0;
+  char new_leaf[EXT2_NAME_MAX + 1];
+  Ext2Inode inode;
+  uint8_t file_type;
+
+  if (!resolve_path(old_path, &old_inode, 0, 0, 0) || old_inode == 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  if (!resolve_path(new_path, 0, &new_parent, new_leaf, sizeof(new_leaf))) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (new_parent == 0 || new_leaf[0] == '\0') {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (!read_inode(old_inode, &inode)) {
+    return VFS_ERR_IO;
+  }
+  if (inode.mode & EXT2_S_IFDIR) {
+    return VFS_ERR_PERM;
+  }
+
+  file_type = EXT2_FT_REG_FILE;
+  if (!dir_add_entry(new_parent, new_leaf, old_inode, file_type)) {
+    return VFS_ERR_IO;
+  }
+
+  inode.links_count++;
+  if (!write_inode(old_inode, &inode)) {
+    (void)dir_remove_entry(new_parent, new_leaf);
+    return VFS_ERR_IO;
+  }
+  return VFS_OK;
+}
+
+static int ext2_symlink(const char *target, const char *link_path) {
+  uint32_t link_inode = 0;
+  uint32_t parent_inode = 0;
+  char leaf[EXT2_NAME_MAX + 1];
+  Ext2Inode inode;
+  int target_len;
+  int block_num;
+
+  if (target == 0 || target[0] == '\0') {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (!resolve_path(link_path, &link_inode, &parent_inode, leaf, sizeof(leaf))) {
+    return VFS_ERR_INVALID_ARG;
+  }
+  if (link_inode != 0) {
+    return VFS_ERR_PERM;
+  }
+  if (parent_inode == 0 || leaf[0] == '\0') {
+    return VFS_ERR_INVALID_ARG;
+  }
+
+  for (target_len = 0; target[target_len] && target_len < 256; target_len++) {
+    ;
+  }
+  if (target_len >= 256) {
+    return VFS_ERR_INVALID_ARG;
+  }
+
+  link_inode = (uint32_t)alloc_inode();
+  if (link_inode == 0 || (int)link_inode < 0) {
+    return VFS_ERR_NO_SPACE;
+  }
+
+  inode.mode = 0xA1EDu;
+  inode.uid = 0;
+  inode.size = (uint32_t)target_len;
+  inode.atime = 0;
+  inode.ctime = 0;
+  inode.mtime = 0;
+  inode.dtime = 0;
+  inode.gid = 0;
+  inode.links_count = 1;
+  inode.blocks = 0;
+  inode.flags = 0;
+  inode.osd1 = 0;
+  for (int i = 0; i < 15; i++) {
+    inode.block[i] = 0;
+  }
+  inode.generation = 0;
+  inode.file_acl = 0;
+  inode.dir_acl = 0;
+  inode.faddr = 0;
+  for (int i = 0; i < 12; i++) {
+    inode.osd2[i] = 0;
+  }
+
+  if (target_len <= 60) {
+    for (int i = 0; i < target_len; i++) {
+      ((uint8_t *)&inode.block[0])[i] = (uint8_t)target[i];
+    }
+  } else {
+    block_num = inode_get_block(&inode, 0, 1);
+    if (block_num <= 0) {
+      free_inode(link_inode);
+      return VFS_ERR_NO_SPACE;
+    }
+    uint8_t block[4096];
+    for (int i = 0; i < target_len; i++) {
+      block[i] = (uint8_t)target[i];
+    }
+    if (!write_block((uint32_t)block_num, block)) {
+      free_inode(link_inode);
+      return VFS_ERR_IO;
+    }
+    inode.blocks = ext2_state.block_size / 512u;
+  }
+
+  if (!write_inode(link_inode, &inode)) {
+    free_inode(link_inode);
+    return VFS_ERR_IO;
+  }
+
+  if (!dir_add_entry(parent_inode, leaf, link_inode, EXT2_FT_UNKNOWN)) {
+    (void)inode_clear_blocks(&inode);
+    free_inode(link_inode);
+    return VFS_ERR_IO;
+  }
+  return VFS_OK;
+}
+
+static int ext2_readlink(const char *link_path, char *target_buf, uint32_t max_len) {
+  uint32_t link_inode = 0;
+  Ext2Inode inode;
+  int link_len;
+  int block_num;
+  uint8_t block[4096];
+
+  if (!resolve_path(link_path, &link_inode, 0, 0, 0) || link_inode == 0) {
+    return VFS_ERR_NOT_FOUND;
+  }
+  if (!read_inode(link_inode, &inode)) {
+    return VFS_ERR_IO;
+  }
+  if (!(inode.mode & 0xA000u)) {
+    return VFS_ERR_INVALID_ARG;
+  }
+
+  link_len = (int)inode.size;
+  if (link_len <= 0) {
+    return 0;
+  }
+  if (link_len > (int)max_len) {
+    link_len = (int)max_len;
+  }
+
+  if (inode.size <= 60u) {
+    for (int i = 0; i < link_len; i++) {
+      target_buf[i] = ((uint8_t *)&inode.block[0])[i];
+    }
+  } else {
+    block_num = inode_get_block(&inode, 0, 0);
+    if (block_num <= 0) {
+      return VFS_ERR_IO;
+    }
+    if (!read_block((uint32_t)block_num, block)) {
+      return VFS_ERR_IO;
+    }
+    for (int i = 0; i < link_len; i++) {
+      target_buf[i] = block[i];
+    }
+  }
+  return link_len;
+}
+
 static int ext2_init_state_from_partition(uint32_t partition_lba) {
   uint32_t gd_block;
   uint32_t total_groups;
@@ -1168,6 +1613,16 @@ static const VfsBackendOps ext2_backend_ops = {
     ext2_delete,
     ext2_lseek,
     ext2_stat,
+  ext2_rename,
+  ext2_mkdir,
+  ext2_rmdir,
+  ext2_truncate_path,
+  ext2_ftruncate,
+  ext2_chmod,
+  ext2_chown,
+  ext2_link,
+  ext2_symlink,
+  ext2_readlink,
 };
 
 int ext2_list_root_long(Ext2LsEntry *out, int max_entries) {

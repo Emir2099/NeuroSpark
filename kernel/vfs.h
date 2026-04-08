@@ -16,6 +16,7 @@ typedef struct VfsFileStat {
 #define VFS_ERR_INVALID_ARG -4
 #define VFS_ERR_IO          -5
 #define VFS_ERR_PERM        -6
+#define VFS_ERR_WOULD_BLOCK -7
 
 /* ===== VFS File Operations Flags ===== */
 #define VFS_O_RDONLY 0x1
@@ -32,6 +33,16 @@ typedef struct {
   int (*delete)(const char *path);
   int (*lseek)(int handle, int offset, int whence);
   int (*stat)(const char *path, struct VfsFileStat *stat_out);
+  int (*rename)(const char *old_path, const char *new_path);
+  int (*mkdir)(const char *path, int mode);
+  int (*rmdir)(const char *path);
+  int (*truncate)(const char *path, uint32_t size);
+  int (*ftruncate)(int handle, uint32_t size);
+  int (*chmod)(const char *path, int mode);
+  int (*chown)(const char *path, int uid, int gid);
+  int (*link)(const char *old_path, const char *new_path);
+  int (*symlink)(const char *target, const char *link_path);
+  int (*readlink)(const char *link_path, char *target_buf, uint32_t max_len);
 } VfsBackendOps;
 
 /* Initialize VFS and mount default filesystems */
@@ -67,6 +78,17 @@ int vfs_write_file(const char *path, const void *buf, uint32_t size);
 int vfs_delete(const char *path);
 
 int vfs_stat(const char *path, VfsFileStat *stat_out);
+int vfs_rename(const char *old_path, const char *new_path);
+int vfs_mkdir(const char *path, int mode);
+int vfs_rmdir(const char *path);
+int vfs_truncate(const char *path, uint32_t size);
+int vfs_ftruncate(int fd, uint32_t size);
+int vfs_chmod(const char *path, int mode);
+int vfs_chown(const char *path, int uid, int gid);
+int vfs_link(const char *old_path, const char *new_path);
+int vfs_symlink(const char *target, const char *link_path);
+int vfs_readlink(const char *link_path, char *target_buf, uint32_t max_len);
+int vfs_pipe(int *read_fd_out, int *write_fd_out);
 
 /* Seek semantics */
 #define VFS_SEEK_SET 0

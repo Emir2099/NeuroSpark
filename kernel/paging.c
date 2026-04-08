@@ -141,6 +141,70 @@ int map_user_page(uint32_t pd_phys, uint32_t phys_addr, uint32_t virt_addr) {
   return 1;
 }
 
+int unmap_user_page(uint32_t pd_phys, uint32_t virt_addr) {
+  uint32_t *pd = (uint32_t *)(pd_phys & PAGE_MASK);
+  uint32_t pd_index;
+  uint32_t pt_index;
+  uint32_t *pt;
+  uint32_t pte;
+
+  if (pd == (uint32_t *)0) {
+    return 0;
+  }
+
+  pd_index = virt_addr >> 22;
+  pt_index = (virt_addr >> 12) & 0x03FF;
+
+  if ((pd[pd_index] & PAGE_PRESENT) == 0 || (pd[pd_index] & PAGE_USER) == 0) {
+    return 0;
+  }
+
+  pt = (uint32_t *)(pd[pd_index] & PAGE_MASK);
+  pte = pt[pt_index];
+  if ((pte & PAGE_PRESENT) == 0 || (pte & PAGE_USER) == 0) {
+    return 0;
+  }
+
+  pmm_free_page(pte & PAGE_MASK);
+  pt[pt_index] = 0;
+  __asm__ volatile("invlpg (%0)" : : "r"((void *)virt_addr) : "memory");
+  return 1;
+}
+
+int set_user_page_writable(uint32_t pd_phys, uint32_t virt_addr, int writable) {
+  uint32_t *pd = (uint32_t *)(pd_phys & PAGE_MASK);
+  uint32_t pd_index;
+  uint32_t pt_index;
+  uint32_t *pt;
+  uint32_t pte;
+
+  if (pd == (uint32_t *)0) {
+    return 0;
+  }
+
+  pd_index = virt_addr >> 22;
+  pt_index = (virt_addr >> 12) & 0x03FF;
+
+  if ((pd[pd_index] & PAGE_PRESENT) == 0 || (pd[pd_index] & PAGE_USER) == 0) {
+    return 0;
+  }
+
+  pt = (uint32_t *)(pd[pd_index] & PAGE_MASK);
+  pte = pt[pt_index];
+  if ((pte & PAGE_PRESENT) == 0 || (pte & PAGE_USER) == 0) {
+    return 0;
+  }
+
+  if (writable) {
+    pte |= PAGE_RW;
+  } else {
+    pte &= ~PAGE_RW;
+  }
+  pt[pt_index] = pte;
+  __asm__ volatile("invlpg (%0)" : : "r"((void *)virt_addr) : "memory");
+  return 1;
+}
+
 int is_user_range(const void *ptr, uint32_t size) {
   uint32_t start = (uint32_t)ptr;
   uint32_t end;
