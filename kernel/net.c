@@ -33,6 +33,7 @@ typedef unsigned short uint16_t;
 #define ETH_TYPE_ARP 0x0806
 #define IP_PROTO_ICMP 1u
 #define IP_PROTO_UDP 17u
+#define IP_PROTO_TCP 6u
 
 #define ICMP_TYPE_ECHO_REPLY 0u
 #define ICMP_TYPE_ECHO_REQUEST 8u
@@ -50,6 +51,18 @@ typedef unsigned short uint16_t;
 #define UDP_MAX_BINDINGS 16
 #define UDP_QUEUE_DEPTH 16
 #define UDP_MAX_PAYLOAD 1200
+
+#define TCP_MAX_CONNS 32
+#define TCP_QUEUE_DEPTH 16
+#define TCP_MAX_PAYLOAD 1200
+#define TCP_RETX_TICKS 20u
+#define TCP_RETX_MAX 5u
+
+#define TCP_FLAG_FIN 0x01u
+#define TCP_FLAG_SYN 0x02u
+#define TCP_FLAG_RST 0x04u
+#define TCP_FLAG_PSH 0x08u
+#define TCP_FLAG_ACK 0x10u
 
 #define REMOTE_PKT_MAGIC 0x52435031u /* RCP1 */
 #define REMOTE_PKT_VERSION 1u
@@ -112,6 +125,46 @@ typedef struct {
   UdpPacket queue[UDP_QUEUE_DEPTH];
 } UdpBinding;
 
+typedef struct {
+  uint16_t len;
+  uint8_t data[TCP_MAX_PAYLOAD];
+} TcpSegment;
+
+typedef struct {
+  int used;
+  int listening;
+  int parent_listen;
+  int accepted;
+  int state;
+  uint16_t local_port;
+  uint16_t remote_port;
+  uint32_t remote_ip;
+  uint32_t snd_una;
+  uint32_t snd_nxt;
+  uint32_t rcv_nxt;
+  uint16_t rx_head;
+  uint16_t rx_tail;
+  uint16_t rx_count;
+  uint32_t last_tx_tick;
+  uint32_t last_tx_seq;
+  uint32_t last_tx_ack;
+  uint16_t last_tx_len;
+  uint8_t last_tx_flags;
+  uint8_t last_tx_retries;
+  uint8_t waiting_ack;
+  uint8_t last_tx_data[TCP_MAX_PAYLOAD];
+  TcpSegment rx_queue[TCP_QUEUE_DEPTH];
+} TcpConn;
+
+enum {
+  TCP_STATE_CLOSED = 0,
+  TCP_STATE_LISTEN = 1,
+  TCP_STATE_SYN_SENT = 2,
+  TCP_STATE_SYN_RCVD = 3,
+  TCP_STATE_ESTABLISHED = 4,
+  TCP_STATE_CLOSE_WAIT = 5
+};
+
 extern volatile int ata_disk_available;
 extern uint32_t tick;
 
@@ -140,9 +193,14 @@ static uint32_t arp_cache_ip = 0;
 static uint8_t arp_cache_mac[6] = {0, 0, 0, 0, 0, 0};
 static int arp_cache_valid = 0;
 static UdpBinding udp_bindings[UDP_MAX_BINDINGS];
+static TcpConn tcp_conns[TCP_MAX_CONNS];
+static uint32_t tcp_iss_seed = 0x10203040u;
 
 static int rtl8139_send_frame(const uint8_t *frame, uint32_t len);
 static uint16_t internet_checksum(const uint8_t *data, uint32_t len);
+static int tcp_send_segment(uint32_t dst_ip, uint16_t src_port, uint16_t dst_port,
+                            uint32_t seq, uint32_t ack, uint8_t flags,
+                            const uint8_t *payload, uint16_t payload_len);
 
 static inline void outb(uint16_t port, uint8_t val) {
   __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
@@ -306,6 +364,344 @@ static int net_send_arp_request(uint32_t target_ip) {
 
 static int net_send_arp_reply(const uint8_t requester_mac[6], uint32_t requester_ip) {
   return net_send_arp_packet(ARP_OPER_REPLY, requester_mac, net_ip, requester_ip, requester_mac);
+}
+
+static int tcp_alloc_conn(void) {
+  for (int i = 0; i < TCP_MAX_CONNS; i++) {
+    if (!tcp_conns[i].used) {
+      tcp_conns[i].used = 1;
+      tcp_conns[i].listening = 0;
+      tcp_conns[i].parent_listen = -1;
+      tcp_conns[i].accepted = 0;
+      tcp_conns[i].state = TCP_STATE_CLOSED;
+      tcp_conns[i].local_port = 0;
+      tcp_conns[i].remote_port = 0;
+      tcp_conns[i].remote_ip = 0;
+      tcp_conns[i].snd_una = 0;
+      tcp_conns[i].snd_nxt = 0;
+      tcp_conns[i].rcv_nxt = 0;
+      tcp_conns[i].rx_head = 0;
+      tcp_conns[i].rx_tail = 0;
+      tcp_conns[i].rx_count = 0;
+      tcp_conns[i].last_tx_tick = 0;
+      tcp_conns[i].last_tx_seq = 0;
+      tcp_conns[i].last_tx_ack = 0;
+      tcp_conns[i].last_tx_len = 0;
+      tcp_conns[i].last_tx_flags = 0;
+      tcp_conns[i].last_tx_retries = 0;
+      tcp_conns[i].waiting_ack = 0;
+      return i;
+    }
+  }
+  return -1;
+}
+
+static void tcp_track_outbound(TcpConn *c, uint32_t seq, uint32_t ack,
+                               uint8_t flags, const uint8_t *payload,
+                               uint16_t payload_len) {
+  if (c == 0) {
+    return;
+  }
+
+  c->last_tx_tick = tick;
+  c->last_tx_seq = seq;
+  c->last_tx_ack = ack;
+  c->last_tx_flags = flags;
+  c->last_tx_len = payload_len;
+  c->last_tx_retries = 0;
+  c->waiting_ack = (uint8_t)(((flags & TCP_FLAG_SYN) != 0u) ||
+                             ((flags & TCP_FLAG_FIN) != 0u) ||
+                             (payload_len > 0u));
+
+  if (payload_len > 0u && payload != 0) {
+    mem_copy(c->last_tx_data, payload, payload_len);
+  }
+}
+
+static int tcp_send_and_track(TcpConn *c, uint8_t flags, const uint8_t *payload,
+                              uint16_t payload_len) {
+  if (c == 0) {
+    return 0;
+  }
+  if (!tcp_send_segment(c->remote_ip, c->local_port, c->remote_port,
+                        c->snd_nxt, c->rcv_nxt, flags, payload, payload_len)) {
+    return 0;
+  }
+  tcp_track_outbound(c, c->snd_nxt, c->rcv_nxt, flags, payload, payload_len);
+  if ((flags & TCP_FLAG_SYN) != 0u || (flags & TCP_FLAG_FIN) != 0u) {
+    c->snd_nxt++;
+  }
+  c->snd_nxt += payload_len;
+  return 1;
+}
+
+static int tcp_retransmit_last(TcpConn *c) {
+  if (c == 0 || !c->used || c->listening || !c->waiting_ack) {
+    return 0;
+  }
+  if (c->last_tx_retries >= TCP_RETX_MAX) {
+    c->used = 0;
+    c->state = TCP_STATE_CLOSED;
+    return 0;
+  }
+  if (!tcp_send_segment(c->remote_ip, c->local_port, c->remote_port,
+                        c->last_tx_seq, c->last_tx_ack,
+                        c->last_tx_flags,
+                        (c->last_tx_len > 0u) ? c->last_tx_data : 0,
+                        c->last_tx_len)) {
+    return 0;
+  }
+  c->last_tx_tick = tick;
+  c->last_tx_retries++;
+  return 1;
+}
+
+static int tcp_find_listener(uint16_t port) {
+  for (int i = 0; i < TCP_MAX_CONNS; i++) {
+    if (tcp_conns[i].used && tcp_conns[i].listening && tcp_conns[i].local_port == port) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static int tcp_find_conn(uint32_t remote_ip, uint16_t remote_port, uint16_t local_port) {
+  for (int i = 0; i < TCP_MAX_CONNS; i++) {
+    if (!tcp_conns[i].used || tcp_conns[i].listening) {
+      continue;
+    }
+    if (tcp_conns[i].remote_ip == remote_ip && tcp_conns[i].remote_port == remote_port &&
+        tcp_conns[i].local_port == local_port && tcp_conns[i].state != TCP_STATE_CLOSED) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static int tcp_send_segment(uint32_t dst_ip, uint16_t src_port, uint16_t dst_port,
+                            uint32_t seq, uint32_t ack, uint8_t flags,
+                            const uint8_t *payload, uint16_t payload_len) {
+  uint8_t frame[1514];
+  uint8_t dst_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  uint32_t arp_target_ip = dst_ip;
+  uint16_t ip_len;
+  uint16_t tcp_len;
+  uint16_t frame_len;
+  uint16_t csum;
+  uint8_t pseudo[1600];
+  uint16_t pseudo_len;
+
+  if (!net_ready || payload_len > 1300u) {
+    return 0;
+  }
+
+  if (dst_ip != 0xFFFFFFFFu) {
+    if ((dst_ip & net_mask) != (net_ip & net_mask) && net_gw != 0) {
+      arp_target_ip = net_gw;
+    }
+    if (!arp_cache_lookup(arp_target_ip, dst_mac)) {
+      (void)net_send_arp_request(arp_target_ip);
+    }
+  }
+
+  mem_set(frame, 0, sizeof(frame));
+  for (int i = 0; i < 6; i++) {
+    frame[i] = dst_mac[i];
+    frame[6 + i] = rtl_mac[i];
+  }
+  write_be16(&frame[12], ETH_TYPE_IPV4);
+
+  tcp_len = (uint16_t)(20u + payload_len);
+  ip_len = (uint16_t)(20u + tcp_len);
+
+  frame[14] = 0x45;
+  frame[15] = 0x00;
+  write_be16(&frame[16], ip_len);
+  write_be16(&frame[18], (uint16_t)(tcp_iss_seed & 0xFFFFu));
+  write_be16(&frame[20], 0x0000u);
+  frame[22] = 64;
+  frame[23] = (uint8_t)IP_PROTO_TCP;
+  write_be16(&frame[24], 0x0000u);
+  write_be32(&frame[26], net_ip);
+  write_be32(&frame[30], dst_ip);
+  csum = internet_checksum(&frame[14], 20u);
+  write_be16(&frame[24], csum);
+
+  write_be16(&frame[34], src_port);
+  write_be16(&frame[36], dst_port);
+  write_be32(&frame[38], seq);
+  write_be32(&frame[42], ack);
+  frame[46] = (uint8_t)(5u << 4);
+  frame[47] = flags;
+  write_be16(&frame[48], 4096u);
+  write_be16(&frame[50], 0u);
+  write_be16(&frame[52], 0u);
+  if (payload_len > 0 && payload != 0) {
+    mem_copy(&frame[54], payload, payload_len);
+  }
+
+  write_be32(&pseudo[0], net_ip);
+  write_be32(&pseudo[4], dst_ip);
+  pseudo[8] = 0;
+  pseudo[9] = IP_PROTO_TCP;
+  write_be16(&pseudo[10], tcp_len);
+  mem_copy(&pseudo[12], &frame[34], tcp_len);
+  pseudo_len = (uint16_t)(12u + tcp_len);
+  csum = internet_checksum(pseudo, pseudo_len);
+  write_be16(&frame[50], csum);
+
+  frame_len = (uint16_t)(14u + ip_len);
+  if (frame_len < 60u) {
+    frame_len = 60u;
+  }
+  return rtl8139_send_frame(frame, frame_len);
+}
+
+static int tcp_queue_rx(TcpConn *c, const uint8_t *payload, uint16_t len) {
+  TcpSegment *seg;
+  if (c == 0 || payload == 0 || len == 0) {
+    return 1;
+  }
+  if (len > TCP_MAX_PAYLOAD || c->rx_count >= TCP_QUEUE_DEPTH) {
+    return 0;
+  }
+  seg = &c->rx_queue[c->rx_tail];
+  seg->len = len;
+  mem_copy(seg->data, payload, len);
+  c->rx_tail = (uint16_t)((c->rx_tail + 1u) % TCP_QUEUE_DEPTH);
+  c->rx_count++;
+  return 1;
+}
+
+static int net_handle_tcp_segment(uint32_t src_ip, uint32_t dst_ip,
+                                  const uint8_t *tcp, uint16_t tcp_len) {
+  uint16_t src_port;
+  uint16_t dst_port;
+  uint32_t seq;
+  uint32_t ack;
+  uint8_t data_off;
+  uint16_t hdr_len;
+  uint8_t flags;
+  uint16_t seg_payload_len;
+  int conn_idx;
+  int listener_idx;
+  TcpConn *c;
+
+  (void)dst_ip;
+
+  if (tcp == 0 || tcp_len < 20u) {
+    return 0;
+  }
+
+  src_port = read_be16(&tcp[0]);
+  dst_port = read_be16(&tcp[2]);
+  seq = read_be32(&tcp[4]);
+  ack = read_be32(&tcp[8]);
+  data_off = (uint8_t)(tcp[12] >> 4);
+  hdr_len = (uint16_t)(data_off * 4u);
+  flags = tcp[13];
+  if (hdr_len < 20u || hdr_len > tcp_len) {
+    return 0;
+  }
+  seg_payload_len = (uint16_t)(tcp_len - hdr_len);
+
+  conn_idx = tcp_find_conn(src_ip, src_port, dst_port);
+
+  if (conn_idx < 0) {
+    listener_idx = tcp_find_listener(dst_port);
+    if (listener_idx >= 0 && (flags & TCP_FLAG_SYN) && !(flags & TCP_FLAG_ACK)) {
+      int child = tcp_alloc_conn();
+      if (child < 0) {
+        return 0;
+      }
+      c = &tcp_conns[child];
+      c->listening = 0;
+      c->parent_listen = listener_idx;
+      c->accepted = 0;
+      c->state = TCP_STATE_SYN_RCVD;
+      c->local_port = dst_port;
+      c->remote_port = src_port;
+      c->remote_ip = src_ip;
+      c->rcv_nxt = seq + 1u;
+      c->snd_una = tcp_iss_seed;
+      c->snd_nxt = tcp_iss_seed + 1u;
+      tcp_iss_seed += 0x101u;
+      if (!tcp_send_segment(c->remote_ip, c->local_port, c->remote_port,
+                            c->snd_una, c->rcv_nxt, TCP_FLAG_SYN | TCP_FLAG_ACK, 0, 0)) {
+        c->used = 0;
+        return 0;
+      }
+      c->last_tx_tick = tick;
+      c->last_tx_seq = c->snd_una;
+      c->last_tx_ack = c->rcv_nxt;
+      c->last_tx_flags = TCP_FLAG_SYN | TCP_FLAG_ACK;
+      c->last_tx_len = 0;
+      c->last_tx_retries = 0;
+      c->waiting_ack = 1;
+      return 1;
+    }
+    return 0;
+  }
+
+  c = &tcp_conns[conn_idx];
+
+  if ((flags & TCP_FLAG_RST) != 0u) {
+    c->state = TCP_STATE_CLOSED;
+    c->used = 0;
+    return 1;
+  }
+
+  if (c->state == TCP_STATE_SYN_SENT) {
+    if ((flags & TCP_FLAG_SYN) && (flags & TCP_FLAG_ACK) && ack == c->snd_nxt) {
+      c->rcv_nxt = seq + 1u;
+      c->snd_una = ack;
+      c->state = TCP_STATE_ESTABLISHED;
+      c->waiting_ack = 0;
+      (void)tcp_send_segment(c->remote_ip, c->local_port, c->remote_port,
+                             c->snd_nxt, c->rcv_nxt, TCP_FLAG_ACK, 0, 0);
+      return 1;
+    }
+  }
+
+  if (c->state == TCP_STATE_SYN_RCVD) {
+    if ((flags & TCP_FLAG_ACK) && ack == c->snd_nxt) {
+      c->snd_una = ack;
+      c->state = TCP_STATE_ESTABLISHED;
+      c->waiting_ack = 0;
+      return 1;
+    }
+  }
+
+  if (c->state == TCP_STATE_ESTABLISHED || c->state == TCP_STATE_CLOSE_WAIT) {
+    if ((flags & TCP_FLAG_ACK) && ack > c->snd_una) {
+      c->snd_una = ack;
+      if (ack >= c->snd_nxt) {
+        c->waiting_ack = 0;
+      }
+    }
+
+    if (seg_payload_len > 0u) {
+      if (seq == c->rcv_nxt) {
+        if (tcp_queue_rx(c, &tcp[hdr_len], seg_payload_len)) {
+          c->rcv_nxt += seg_payload_len;
+        }
+      }
+      (void)tcp_send_segment(c->remote_ip, c->local_port, c->remote_port,
+                             c->snd_nxt, c->rcv_nxt, TCP_FLAG_ACK, 0, 0);
+    }
+
+    if ((flags & TCP_FLAG_FIN) != 0u) {
+      if (seq == c->rcv_nxt) {
+        c->rcv_nxt++;
+      }
+      c->state = TCP_STATE_CLOSE_WAIT;
+      (void)tcp_send_segment(c->remote_ip, c->local_port, c->remote_port,
+                             c->snd_nxt, c->rcv_nxt, TCP_FLAG_ACK, 0, 0);
+    }
+    return 1;
+  }
+
+  return 0;
 }
 
 static int udp_find_binding(uint16_t port) {
@@ -541,6 +937,13 @@ static int net_handle_ipv4_frame(const uint8_t *frame, uint16_t len) {
     }
     payload = &frame[14u + header_len];
     return net_handle_udp_datagram(src_ip, dst_ip, payload, udp_len);
+  } else if (protocol == IP_PROTO_TCP) {
+    uint16_t tcp_len = (uint16_t)(total_len - header_len);
+    if (tcp_len < 20u) {
+      return 0;
+    }
+    payload = &frame[14u + header_len];
+    return net_handle_tcp_segment(src_ip, dst_ip, payload, tcp_len);
   }
 
   return 1;
@@ -985,6 +1388,29 @@ int net_init(void) {
     udp_bindings[i].count = 0;
     udp_bindings[i].dropped = 0;
   }
+  for (int i = 0; i < TCP_MAX_CONNS; i++) {
+    tcp_conns[i].used = 0;
+    tcp_conns[i].listening = 0;
+    tcp_conns[i].parent_listen = -1;
+    tcp_conns[i].accepted = 0;
+    tcp_conns[i].state = TCP_STATE_CLOSED;
+    tcp_conns[i].local_port = 0;
+    tcp_conns[i].remote_port = 0;
+    tcp_conns[i].remote_ip = 0;
+    tcp_conns[i].snd_una = 0;
+    tcp_conns[i].snd_nxt = 0;
+    tcp_conns[i].rcv_nxt = 0;
+    tcp_conns[i].rx_head = 0;
+    tcp_conns[i].rx_tail = 0;
+    tcp_conns[i].rx_count = 0;
+    tcp_conns[i].last_tx_tick = 0;
+    tcp_conns[i].last_tx_seq = 0;
+    tcp_conns[i].last_tx_ack = 0;
+    tcp_conns[i].last_tx_len = 0;
+    tcp_conns[i].last_tx_flags = 0;
+    tcp_conns[i].last_tx_retries = 0;
+    tcp_conns[i].waiting_ack = 0;
+  }
   net_ready = rtl8139_hw_init(rtl_iobase);
   if (net_ready && remote_session == 0) {
     remote_session = (tick ^ 0x4E53504Bu) | 1u;
@@ -1049,6 +1475,15 @@ int net_udp_unbind(uint16_t port) {
   return 1;
 }
 
+int net_udp_has_data(uint16_t port) {
+  int idx = udp_find_binding(port);
+
+  if (idx < 0) {
+    return 0;
+  }
+  return udp_bindings[idx].count > 0u;
+}
+
 int net_udp_send(uint32_t dst_ip, uint16_t src_port, uint16_t dst_port,
                  const void *payload, uint16_t payload_len) {
   if (payload == 0) {
@@ -1089,6 +1524,213 @@ int net_udp_recv(uint16_t port, uint32_t *src_ip, uint16_t *src_port,
   binding->head = (uint16_t)((binding->head + 1u) % UDP_QUEUE_DEPTH);
   binding->count--;
   return (int)copy_len;
+}
+
+int net_tcp_listen(uint16_t port) {
+  int idx;
+  if (port == 0u || tcp_find_listener(port) >= 0) {
+    return -1;
+  }
+  idx = tcp_alloc_conn();
+  if (idx < 0) {
+    return -1;
+  }
+  tcp_conns[idx].listening = 1;
+  tcp_conns[idx].state = TCP_STATE_LISTEN;
+  tcp_conns[idx].local_port = port;
+  tcp_conns[idx].accepted = 1;
+  return idx;
+}
+
+int net_tcp_unlisten(uint16_t port) {
+  int idx = tcp_find_listener(port);
+  if (idx < 0) {
+    return 0;
+  }
+  tcp_conns[idx].used = 0;
+  return 1;
+}
+
+int net_tcp_accept_ready(uint16_t listen_port) {
+  int listener = tcp_find_listener(listen_port);
+
+  if (listener < 0) {
+    return 0;
+  }
+  for (int i = 0; i < TCP_MAX_CONNS; i++) {
+    if (!tcp_conns[i].used || tcp_conns[i].listening) {
+      continue;
+    }
+    if (tcp_conns[i].parent_listen == listener && tcp_conns[i].state == TCP_STATE_ESTABLISHED &&
+        !tcp_conns[i].accepted) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int net_tcp_connect(uint32_t dst_ip, uint16_t dst_port, uint16_t src_port) {
+  int idx;
+  if (dst_ip == 0 || dst_port == 0 || src_port == 0) {
+    return -1;
+  }
+  idx = tcp_alloc_conn();
+  if (idx < 0) {
+    return -1;
+  }
+  tcp_conns[idx].listening = 0;
+  tcp_conns[idx].parent_listen = -1;
+  tcp_conns[idx].accepted = 1;
+  tcp_conns[idx].state = TCP_STATE_SYN_SENT;
+  tcp_conns[idx].local_port = src_port;
+  tcp_conns[idx].remote_port = dst_port;
+  tcp_conns[idx].remote_ip = dst_ip;
+  tcp_conns[idx].snd_una = tcp_iss_seed;
+  tcp_conns[idx].snd_nxt = tcp_iss_seed + 1u;
+  tcp_conns[idx].rcv_nxt = 0;
+  tcp_iss_seed += 0x101u;
+
+  if (!tcp_send_segment(dst_ip, src_port, dst_port, tcp_conns[idx].snd_una, 0,
+                        TCP_FLAG_SYN, 0, 0)) {
+    tcp_conns[idx].used = 0;
+    return -1;
+  }
+  tcp_conns[idx].last_tx_tick = tick;
+  tcp_conns[idx].last_tx_seq = tcp_conns[idx].snd_una;
+  tcp_conns[idx].last_tx_ack = 0;
+  tcp_conns[idx].last_tx_len = 0;
+  tcp_conns[idx].last_tx_flags = TCP_FLAG_SYN;
+  tcp_conns[idx].last_tx_retries = 0;
+  tcp_conns[idx].waiting_ack = 1;
+  return idx;
+}
+
+int net_tcp_accept(uint16_t listen_port, uint32_t *peer_ip, uint16_t *peer_port) {
+  int listener = tcp_find_listener(listen_port);
+  if (listener < 0) {
+    return -1;
+  }
+  for (int i = 0; i < TCP_MAX_CONNS; i++) {
+    if (!tcp_conns[i].used || tcp_conns[i].listening) {
+      continue;
+    }
+    if (tcp_conns[i].parent_listen == listener && tcp_conns[i].state == TCP_STATE_ESTABLISHED &&
+        !tcp_conns[i].accepted) {
+      tcp_conns[i].accepted = 1;
+      if (peer_ip != 0) {
+        *peer_ip = tcp_conns[i].remote_ip;
+      }
+      if (peer_port != 0) {
+        *peer_port = tcp_conns[i].remote_port;
+      }
+      return i;
+    }
+  }
+  return -1;
+}
+
+int net_tcp_is_established(int conn_id) {
+  TcpConn *c;
+
+  if (conn_id < 0 || conn_id >= TCP_MAX_CONNS) {
+    return 0;
+  }
+  c = &tcp_conns[conn_id];
+  return c->used && !c->listening && c->state == TCP_STATE_ESTABLISHED;
+}
+
+int net_tcp_can_recv(int conn_id) {
+  TcpConn *c;
+
+  if (conn_id < 0 || conn_id >= TCP_MAX_CONNS) {
+    return 0;
+  }
+  c = &tcp_conns[conn_id];
+  return c->used && !c->listening && c->rx_count > 0u;
+}
+
+int net_tcp_can_send(int conn_id) {
+  TcpConn *c;
+
+  if (conn_id < 0 || conn_id >= TCP_MAX_CONNS) {
+    return 0;
+  }
+  c = &tcp_conns[conn_id];
+  return c->used && !c->listening && c->state == TCP_STATE_ESTABLISHED;
+}
+
+int net_tcp_send(int conn_id, const void *payload, uint16_t payload_len) {
+  TcpConn *c;
+  if (conn_id < 0 || conn_id >= TCP_MAX_CONNS || payload == 0 || payload_len == 0u) {
+    return 0;
+  }
+  c = &tcp_conns[conn_id];
+  if (!c->used || c->listening || c->state != TCP_STATE_ESTABLISHED) {
+    return 0;
+  }
+  if (payload_len > TCP_MAX_PAYLOAD) {
+    payload_len = TCP_MAX_PAYLOAD;
+  }
+  if (!tcp_send_and_track(c, TCP_FLAG_ACK | TCP_FLAG_PSH,
+                          (const uint8_t *)payload, payload_len)) {
+    return 0;
+  }
+  return (int)payload_len;
+}
+
+int net_tcp_recv(int conn_id, void *buf, uint16_t max_len) {
+  TcpConn *c;
+  TcpSegment *seg;
+  uint16_t copy_len;
+  if (conn_id < 0 || conn_id >= TCP_MAX_CONNS || buf == 0 || max_len == 0u) {
+    return 0;
+  }
+  c = &tcp_conns[conn_id];
+  if (!c->used || c->listening || c->rx_count == 0u) {
+    return 0;
+  }
+  seg = &c->rx_queue[c->rx_head];
+  copy_len = seg->len;
+  if (copy_len > max_len) {
+    copy_len = max_len;
+  }
+  mem_copy((uint8_t *)buf, seg->data, copy_len);
+  c->rx_head = (uint16_t)((c->rx_head + 1u) % TCP_QUEUE_DEPTH);
+  c->rx_count--;
+  return (int)copy_len;
+}
+
+int net_tcp_close(int conn_id) {
+  TcpConn *c;
+  if (conn_id < 0 || conn_id >= TCP_MAX_CONNS) {
+    return 0;
+  }
+  c = &tcp_conns[conn_id];
+  if (!c->used) {
+    return 0;
+  }
+  if (!c->listening && (c->state == TCP_STATE_ESTABLISHED || c->state == TCP_STATE_CLOSE_WAIT)) {
+    (void)tcp_send_and_track(c, TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
+  }
+  c->used = 0;
+  c->state = TCP_STATE_CLOSED;
+  return 1;
+}
+
+int net_tcp_poll(void) {
+  int retransmits = 0;
+  for (int i = 0; i < TCP_MAX_CONNS; i++) {
+    TcpConn *c = &tcp_conns[i];
+    if (!c->used || c->listening || !c->waiting_ack) {
+      continue;
+    }
+    if ((tick - c->last_tx_tick) >= TCP_RETX_TICKS) {
+      if (tcp_retransmit_last(c)) {
+        retransmits++;
+      }
+    }
+  }
+  return retransmits;
 }
 
 void net_get_ipv4(uint32_t *ip, uint32_t *mask, uint32_t *gw) {

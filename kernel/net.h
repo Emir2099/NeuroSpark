@@ -29,10 +29,24 @@ void net_get_ipv4(uint32_t *ip, uint32_t *mask, uint32_t *gw);
 
 int net_udp_bind(uint16_t port);
 int net_udp_unbind(uint16_t port);
+int net_udp_has_data(uint16_t port);
 int net_udp_send(uint32_t dst_ip, uint16_t src_port, uint16_t dst_port,
 				 const void *payload, uint16_t payload_len);
 int net_udp_recv(uint16_t port, uint32_t *src_ip, uint16_t *src_port,
 				 void *buf, uint16_t max_len);
+
+int net_tcp_listen(uint16_t port);
+int net_tcp_unlisten(uint16_t port);
+int net_tcp_accept_ready(uint16_t listen_port);
+int net_tcp_connect(uint32_t dst_ip, uint16_t dst_port, uint16_t src_port);
+int net_tcp_accept(uint16_t listen_port, uint32_t *peer_ip, uint16_t *peer_port);
+int net_tcp_is_established(int conn_id);
+int net_tcp_can_recv(int conn_id);
+int net_tcp_can_send(int conn_id);
+int net_tcp_send(int conn_id, const void *payload, uint16_t payload_len);
+int net_tcp_recv(int conn_id, void *buf, uint16_t max_len);
+int net_tcp_close(int conn_id);
+int net_tcp_poll(void);
 
 uint32_t net_nic_io_base(void);
 int net_nic_index(void);

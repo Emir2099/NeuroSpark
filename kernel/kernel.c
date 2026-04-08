@@ -2345,6 +2345,7 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
   extern void schedule();
   while (1) {
     net_rx_poll();
+    net_tcp_poll();
     schedule();
     __asm__ volatile("hlt");
   }

@@ -7,6 +7,7 @@ typedef unsigned char uint8_t;
 #include "task.h"
 #include "scheduler.h"
 #include "vfs.h"
+#include "net.h"
 
 extern int is_user_range(const void *ptr, uint32_t size);
 
@@ -83,12 +84,50 @@ enum {
 #define SYS_IOCTL 59
 #define SYS_GETRUSAGE 60
 #define SYS_UNAME 61
+#define SYS_SOCKET 62
+#define SYS_BIND 63
+#define SYS_LISTEN 64
+#define SYS_ACCEPT 65
+#define SYS_CONNECT 66
+#define SYS_SENDTO 67
+#define SYS_RECVFROM 68
+#define SYS_SELECT 69
+#define SYS_POLL 70
+#define SYS_EPOLL 71
 
 #define SIGKILL 9
 #define SIGTERM 15
 #define WNOHANG 1
 
 #define NS_ERR_NOT_IMPLEMENTED ((uint32_t)-38)
+
+#define NS_ERR_INVALID_ARG ((uint32_t)-22)
+
+#define NS_SOCKET_FD_BASE 1024
+#define NS_SOCKET_MAX_PER_TASK 64
+
+#define NS_O_NONBLOCK 0x800
+
+#define NS_POLLIN 0x0001u
+#define NS_POLLOUT 0x0004u
+#define NS_POLLERR 0x0008u
+
+#define NS_EPOLL_OP_CREATE 1
+#define NS_EPOLL_OP_CTL 2
+#define NS_EPOLL_OP_WAIT 3
+#define NS_EPOLL_OP_CLOSE 4
+
+#define NS_EPOLL_CTL_ADD 1
+#define NS_EPOLL_CTL_MOD 2
+#define NS_EPOLL_CTL_DEL 3
+
+#define NS_EPOLL_FD_BASE 2048
+#define NS_EPOLL_MAX_PER_TASK 8
+#define NS_EPOLL_MAX_WATCH 64
+
+#define NS_AF_INET 2
+#define NS_SOCK_STREAM 1
+#define NS_SOCK_DGRAM 2
 
 #define MMAP_ANON_BASE 0x50000000u
 #define MMAP_ANON_LIMIT 0xB0000000u
@@ -199,6 +238,412 @@ static uint32_t task_brk_base[MAX_TASKS];
 static uint32_t task_brk_current[MAX_TASKS];
 static uint32_t task_mmap_next[MAX_TASKS];
 static uint32_t task_alarm_tick[MAX_TASKS];
+
+typedef struct {
+  uint16_t sin_family;
+  uint16_t sin_port;
+  uint32_t sin_addr;
+} NsSockAddrIn;
+
+typedef struct {
+  int used;
+  int type;
+  int protocol;
+  int flags;
+  int bound;
+  uint16_t local_port;
+  uint32_t peer_ip;
+  uint16_t peer_port;
+  int listening;
+  int net_conn_id;
+} NsSocketEntry;
+
+typedef struct {
+  int fd;
+  uint16_t events;
+  uint16_t revents;
+} NsPollFd;
+
+typedef struct {
+  int op;
+  NsPollFd event;
+} NsEpollCtlReq;
+
+typedef struct {
+  NsPollFd *events;
+  uint32_t maxevents;
+  uint32_t timeout_ticks;
+} NsEpollWaitReq;
+
+typedef struct {
+  int used;
+  int fd;
+  uint16_t events;
+} NsEpollWatch;
+
+typedef struct {
+  int used;
+  NsEpollWatch watches[NS_EPOLL_MAX_WATCH];
+} NsEpollObject;
+
+static NsSocketEntry task_sockets[MAX_TASKS][NS_SOCKET_MAX_PER_TASK];
+static NsEpollObject task_epolls[MAX_TASKS][NS_EPOLL_MAX_PER_TASK];
+
+static uint16_t ns_bswap16(uint16_t v) {
+  return (uint16_t)((v << 8) | (v >> 8));
+}
+
+static uint32_t ns_bswap32(uint32_t v) {
+  return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |
+         ((v & 0x00FF0000u) >> 8) | ((v & 0xFF000000u) >> 24);
+}
+
+static int socket_fd_to_slot(int fd) {
+  int slot = fd - NS_SOCKET_FD_BASE;
+  if (slot < 0 || slot >= NS_SOCKET_MAX_PER_TASK) {
+    return -1;
+  }
+  return slot;
+}
+
+static NsSocketEntry *socket_entry_for_fd(int task_id, int fd) {
+  int slot;
+  if (task_id < 0 || task_id >= MAX_TASKS) {
+    return 0;
+  }
+  slot = socket_fd_to_slot(fd);
+  if (slot < 0 || !task_sockets[task_id][slot].used) {
+    return 0;
+  }
+  return &task_sockets[task_id][slot];
+}
+
+static int socket_alloc_fd(int task_id, int type, int protocol) {
+  if (task_id < 0 || task_id >= MAX_TASKS) {
+    return -1;
+  }
+  for (int i = 0; i < NS_SOCKET_MAX_PER_TASK; i++) {
+    if (!task_sockets[task_id][i].used) {
+      task_sockets[task_id][i].used = 1;
+      task_sockets[task_id][i].type = type;
+      task_sockets[task_id][i].protocol = protocol;
+      task_sockets[task_id][i].flags = 0;
+      task_sockets[task_id][i].bound = 0;
+      task_sockets[task_id][i].local_port = 0;
+      task_sockets[task_id][i].peer_ip = 0;
+      task_sockets[task_id][i].peer_port = 0;
+      task_sockets[task_id][i].listening = 0;
+      task_sockets[task_id][i].net_conn_id = -1;
+      return NS_SOCKET_FD_BASE + i;
+    }
+  }
+  return -1;
+}
+
+static void socket_close_entry(NsSocketEntry *s) {
+  if (s == 0 || !s->used) {
+    return;
+  }
+  if (s->type == NS_SOCK_DGRAM && s->bound) {
+    (void)net_udp_unbind(s->local_port);
+  }
+  if (s->type == NS_SOCK_STREAM) {
+    if (s->listening && s->bound) {
+      (void)net_tcp_unlisten(s->local_port);
+    } else if (s->net_conn_id >= 0) {
+      (void)net_tcp_close(s->net_conn_id);
+    }
+  }
+  s->used = 0;
+  s->type = 0;
+  s->protocol = 0;
+  s->flags = 0;
+  s->bound = 0;
+  s->local_port = 0;
+  s->peer_ip = 0;
+  s->peer_port = 0;
+  s->listening = 0;
+  s->net_conn_id = -1;
+}
+
+static int socket_is_nonblocking(const NsSocketEntry *s) {
+  return s != 0 && (s->flags & NS_O_NONBLOCK);
+}
+
+static int socket_ready_for_read(const NsSocketEntry *s) {
+  if (s == 0 || !s->used) {
+    return 0;
+  }
+  if (s->type == NS_SOCK_DGRAM) {
+    return s->bound && net_udp_has_data(s->local_port);
+  }
+  if (s->type == NS_SOCK_STREAM) {
+    if (s->listening) {
+      return net_tcp_accept_ready(s->local_port);
+    }
+    return s->net_conn_id >= 0 && net_tcp_can_recv(s->net_conn_id);
+  }
+  return 0;
+}
+
+static int socket_ready_for_write(const NsSocketEntry *s) {
+  if (s == 0 || !s->used) {
+    return 0;
+  }
+  if (s->type == NS_SOCK_DGRAM) {
+    return s->peer_ip != 0u && s->peer_port != 0u;
+  }
+  if (s->type == NS_SOCK_STREAM) {
+    return s->net_conn_id >= 0 && net_tcp_can_send(s->net_conn_id);
+  }
+  return 0;
+}
+
+static int epoll_fd_to_slot(int fd) {
+  int slot = fd - NS_EPOLL_FD_BASE;
+
+  if (slot < 0 || slot >= NS_EPOLL_MAX_PER_TASK) {
+    return -1;
+  }
+  return slot;
+}
+
+static NsEpollObject *epoll_object_for_fd(int task_id, int fd) {
+  int slot;
+
+  if (task_id < 0 || task_id >= MAX_TASKS) {
+    return 0;
+  }
+  slot = epoll_fd_to_slot(fd);
+  if (slot < 0 || !task_epolls[task_id][slot].used) {
+    return 0;
+  }
+  return &task_epolls[task_id][slot];
+}
+
+static int epoll_alloc_fd(int task_id) {
+  if (task_id < 0 || task_id >= MAX_TASKS) {
+    return -1;
+  }
+  for (int i = 0; i < NS_EPOLL_MAX_PER_TASK; i++) {
+    if (!task_epolls[task_id][i].used) {
+      task_epolls[task_id][i].used = 1;
+      for (int j = 0; j < NS_EPOLL_MAX_WATCH; j++) {
+        task_epolls[task_id][i].watches[j].used = 0;
+        task_epolls[task_id][i].watches[j].fd = -1;
+        task_epolls[task_id][i].watches[j].events = 0;
+      }
+      return NS_EPOLL_FD_BASE + i;
+    }
+  }
+  return -1;
+}
+
+static void epoll_close_object(NsEpollObject *obj) {
+  if (obj == 0 || !obj->used) {
+    return;
+  }
+  obj->used = 0;
+  for (int i = 0; i < NS_EPOLL_MAX_WATCH; i++) {
+    obj->watches[i].used = 0;
+    obj->watches[i].fd = -1;
+    obj->watches[i].events = 0;
+  }
+}
+
+static void epoll_close_all_for_task(int task_id) {
+  if (task_id < 0 || task_id >= MAX_TASKS) {
+    return;
+  }
+  for (int i = 0; i < NS_EPOLL_MAX_PER_TASK; i++) {
+    if (task_epolls[task_id][i].used) {
+      epoll_close_object(&task_epolls[task_id][i]);
+    }
+  }
+}
+
+static int fd_poll_revents(int fd, uint16_t events, uint16_t *revents_out) {
+  NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+  uint16_t revents = 0;
+
+  if (s != 0) {
+    if (socket_ready_for_read(s) && (events & NS_POLLIN) != 0u) {
+      revents |= NS_POLLIN;
+    }
+    if (socket_ready_for_write(s) && (events & NS_POLLOUT) != 0u) {
+      revents |= NS_POLLOUT;
+    }
+    if (revents_out != 0) {
+      *revents_out = revents;
+    }
+    return revents != 0u;
+  }
+
+  if (vfs_fcntl(fd, VFS_F_GETFL, 0) >= 0) {
+    if ((events & NS_POLLIN) != 0u) {
+      revents |= NS_POLLIN;
+    }
+    if ((events & NS_POLLOUT) != 0u) {
+      revents |= NS_POLLOUT;
+    }
+    if (revents_out != 0) {
+      *revents_out = revents;
+    }
+    return revents != 0u;
+  }
+
+  if (revents_out != 0) {
+    *revents_out = NS_POLLERR;
+  }
+  return 0;
+}
+
+static int poll_socket_array(NsPollFd *fds, uint32_t count) {
+  int ready = 0;
+
+  for (uint32_t i = 0; i < count; i++) {
+    fds[i].revents = 0;
+    (void)fd_poll_revents(fds[i].fd, fds[i].events, &fds[i].revents);
+    if (fds[i].revents != 0u) {
+      ready++;
+    }
+  }
+
+  return ready;
+}
+
+static int poll_socket_array_wait(NsPollFd *fds, uint32_t count, uint32_t timeout_ticks) {
+  uint32_t deadline = 0;
+
+  if (timeout_ticks != 0u) {
+    deadline = scheduler_now_ticks() + timeout_ticks;
+  }
+
+  while (1) {
+    int ready = poll_socket_array(fds, count);
+    if (ready > 0 || timeout_ticks == 0u) {
+      return ready;
+    }
+    if (scheduler_now_ticks() >= deadline) {
+      return 0;
+    }
+    task_sleep(1);
+  }
+}
+
+static int epoll_ctl_apply(NsEpollObject *obj, const NsEpollCtlReq *req) {
+  int free_slot = -1;
+  int found_slot = -1;
+
+  if (obj == 0 || req == 0 || req->event.fd < 0) {
+    return (int)NS_ERR_INVALID_ARG;
+  }
+
+  for (int i = 0; i < NS_EPOLL_MAX_WATCH; i++) {
+    if (!obj->watches[i].used && free_slot < 0) {
+      free_slot = i;
+    }
+    if (obj->watches[i].used && obj->watches[i].fd == req->event.fd) {
+      found_slot = i;
+      break;
+    }
+  }
+
+  if (req->op == NS_EPOLL_CTL_ADD) {
+    if (found_slot >= 0) {
+      return (int)NS_ERR_INVALID_ARG;
+    }
+    if (free_slot < 0) {
+      return (int)VFS_ERR_NO_SPACE;
+    }
+    obj->watches[free_slot].used = 1;
+    obj->watches[free_slot].fd = req->event.fd;
+    obj->watches[free_slot].events = req->event.events;
+    return NS_OK;
+  }
+
+  if (req->op == NS_EPOLL_CTL_MOD) {
+    if (found_slot < 0) {
+      return (int)NS_ERR_INVALID_ARG;
+    }
+    obj->watches[found_slot].events = req->event.events;
+    return NS_OK;
+  }
+
+  if (req->op == NS_EPOLL_CTL_DEL) {
+    if (found_slot < 0) {
+      return (int)NS_ERR_INVALID_ARG;
+    }
+    obj->watches[found_slot].used = 0;
+    obj->watches[found_slot].fd = -1;
+    obj->watches[found_slot].events = 0;
+    return NS_OK;
+  }
+
+  return (int)NS_ERR_INVALID_ARG;
+}
+
+static int epoll_collect_ready(NsEpollObject *obj, NsPollFd *out, uint32_t maxevents) {
+  int ready = 0;
+
+  if (obj == 0 || out == 0 || maxevents == 0u) {
+    return 0;
+  }
+
+  for (int i = 0; i < NS_EPOLL_MAX_WATCH; i++) {
+    uint16_t revents = 0;
+
+    if (!obj->watches[i].used) {
+      continue;
+    }
+    (void)fd_poll_revents(obj->watches[i].fd, obj->watches[i].events, &revents);
+    if (revents == 0u) {
+      continue;
+    }
+
+    out[ready].fd = obj->watches[i].fd;
+    out[ready].events = obj->watches[i].events;
+    out[ready].revents = revents;
+    ready++;
+    if ((uint32_t)ready >= maxevents) {
+      break;
+    }
+  }
+
+  return ready;
+}
+
+static int epoll_wait_ready(NsEpollObject *obj, NsPollFd *out, uint32_t maxevents,
+                            uint32_t timeout_ticks) {
+  uint32_t deadline = 0;
+  int infinite = (timeout_ticks == 0xFFFFFFFFu);
+
+  if (!infinite && timeout_ticks != 0u) {
+    deadline = scheduler_now_ticks() + timeout_ticks;
+  }
+
+  while (1) {
+    int ready = epoll_collect_ready(obj, out, maxevents);
+    if (ready > 0 || timeout_ticks == 0u) {
+      return ready;
+    }
+    if (!infinite && scheduler_now_ticks() >= deadline) {
+      return 0;
+    }
+    task_sleep(1);
+  }
+}
+
+static void socket_close_all_for_task(int task_id) {
+  if (task_id < 0 || task_id >= MAX_TASKS) {
+    return;
+  }
+  for (int i = 0; i < NS_SOCKET_MAX_PER_TASK; i++) {
+    if (task_sockets[task_id][i].used) {
+      socket_close_entry(&task_sockets[task_id][i]);
+    }
+  }
+}
 
 static void mem_zero32(void *dst, uint32_t size) {
   uint8_t *d = (uint8_t *)dst;
@@ -562,6 +1007,9 @@ void syscall_handler(uint32_t *regs) {
     task_mmap_next[child] = task_mmap_next[parent];
     task_alarm_tick[child] = task_alarm_tick[parent];
 
+    socket_close_all_for_task(child);
+    epoll_close_all_for_task(child);
+
     vfs_clone_task_fds(parent, child);
     syscall_complete(regs, syscall_num, (uint32_t)child);
     break;
@@ -574,11 +1022,35 @@ void syscall_handler(uint32_t *regs) {
       void *buf = (void *)regs[6];
       uint32_t size = regs[5];
       int rc;
+      NsSocketEntry *s;
       if (cpl == 3 && !validate_user_ptr(buf, size)) {
         syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
         break;
       }
-      rc = vfs_read(fd, buf, size);
+      s = socket_entry_for_fd(os_current_task, fd);
+      if (s != 0) {
+        if (!socket_ready_for_read(s)) {
+          if (socket_is_nonblocking(s)) {
+            syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
+            break;
+          }
+          while (!socket_ready_for_read(s)) {
+            task_sleep(1);
+          }
+        }
+        if (s->type == NS_SOCK_STREAM && s->net_conn_id >= 0) {
+          rc = net_tcp_recv(s->net_conn_id, buf, (uint16_t)size);
+        } else if (s->type == NS_SOCK_DGRAM && s->bound) {
+          rc = net_udp_recv(s->local_port, 0, 0, buf, (uint16_t)size);
+        } else {
+          rc = (int)NS_ERR_INVALID_ARG;
+        }
+        if (rc == 0) {
+          rc = (int)NS_ERR_WOULD_BLOCK;
+        }
+      } else {
+        rc = vfs_read(fd, buf, size);
+      }
       syscall_complete(regs, syscall_num, (uint32_t)rc);
     }
     break;
@@ -587,7 +1059,18 @@ void syscall_handler(uint32_t *regs) {
   case SYS_CLOSE:
     {
       int fd = (int)regs[4];
-      int rc = vfs_close(fd);
+      int rc;
+      NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+      NsEpollObject *ep = epoll_object_for_fd(os_current_task, fd);
+      if (s != 0) {
+        socket_close_entry(s);
+        rc = NS_OK;
+      } else if (ep != 0) {
+        epoll_close_object(ep);
+        rc = NS_OK;
+      } else {
+        rc = vfs_close(fd);
+      }
       syscall_complete(regs, syscall_num, (uint32_t)rc);
     }
     break;
@@ -638,7 +1121,21 @@ void syscall_handler(uint32_t *regs) {
     int fd = (int)regs[4];
     int cmd = (int)regs[6];
     int arg = (int)regs[5];
-    int rc = vfs_fcntl(fd, cmd, arg);
+    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+    int rc;
+
+    if (s != 0) {
+      if (cmd == VFS_F_GETFL) {
+        rc = s->flags;
+      } else if (cmd == VFS_F_SETFL) {
+        s->flags = arg;
+        rc = NS_OK;
+      } else {
+        rc = NS_ERR_INVALID_ARG;
+      }
+    } else {
+      rc = vfs_fcntl(fd, cmd, arg);
+    }
     syscall_complete(regs, syscall_num, (uint32_t)rc);
     break;
   }
@@ -762,6 +1259,8 @@ void syscall_handler(uint32_t *regs) {
       syscall_complete(regs, syscall_num, NS_ERR_PERMISSION);
       break;
     }
+    socket_close_all_for_task(os_current_task);
+    epoll_close_all_for_task(os_current_task);
     syscall_complete(regs, syscall_num, NS_OK);
     task_terminate_current();
     break;
@@ -1398,12 +1897,441 @@ void syscall_handler(uint32_t *regs) {
     break;
   }
 
+  case SYS_SOCKET: {
+    int domain = (int)regs[4];
+    int type = (int)regs[5];
+    int protocol = (int)regs[6];
+    int fd;
+
+    if (domain != NS_AF_INET || (type != NS_SOCK_STREAM && type != NS_SOCK_DGRAM)) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+
+    fd = socket_alloc_fd(os_current_task, type, protocol);
+    if (fd < 0) {
+      syscall_complete(regs, syscall_num, (uint32_t)VFS_ERR_NO_SPACE);
+      break;
+    }
+    syscall_complete(regs, syscall_num, (uint32_t)fd);
+    break;
+  }
+
+  case SYS_BIND: {
+    int fd = (int)regs[4];
+    const NsSockAddrIn *addr = (const NsSockAddrIn *)regs[6];
+    NsSocketEntry *s;
+    uint16_t port;
+    int rc;
+
+    if (cpl == 3 && !validate_user_ptr(addr, sizeof(NsSockAddrIn))) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+
+    s = socket_entry_for_fd(os_current_task, fd);
+    if (s == 0 || addr == 0 || addr->sin_family != NS_AF_INET) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+
+    port = ns_bswap16(addr->sin_port);
+    if (port == 0u) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+
+    if (s->type == NS_SOCK_DGRAM) {
+      rc = net_udp_bind(port) ? (int)NS_OK : (int)VFS_ERR_NO_SPACE;
+      if (rc == NS_OK) {
+        s->bound = 1;
+        s->local_port = port;
+      }
+    } else {
+      s->bound = 1;
+      s->local_port = port;
+      rc = NS_OK;
+    }
+
+    syscall_complete(regs, syscall_num, (uint32_t)rc);
+    break;
+  }
+
+  case SYS_LISTEN: {
+    int fd = (int)regs[4];
+    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+    int conn_id;
+
+    if (s == 0 || s->type != NS_SOCK_STREAM || !s->bound) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+
+    conn_id = net_tcp_listen(s->local_port);
+    if (conn_id < 0) {
+      syscall_complete(regs, syscall_num, (uint32_t)VFS_ERR_NO_SPACE);
+      break;
+    }
+
+    s->listening = 1;
+    s->net_conn_id = conn_id;
+    syscall_complete(regs, syscall_num, NS_OK);
+    break;
+  }
+
+  case SYS_ACCEPT: {
+    int fd = (int)regs[4];
+    NsSockAddrIn *peer = (NsSockAddrIn *)regs[6];
+    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+    uint32_t peer_ip = 0;
+    uint16_t peer_port = 0;
+    int conn_id;
+    int newfd;
+    NsSocketEntry *child;
+
+    if (cpl == 3 && peer != 0 && !validate_user_ptr(peer, sizeof(NsSockAddrIn))) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+    if (s == 0 || s->type != NS_SOCK_STREAM || !s->listening) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+
+    if (!socket_ready_for_read(s)) {
+      if (socket_is_nonblocking(s)) {
+        syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
+        break;
+      }
+      while (!socket_ready_for_read(s)) {
+        task_sleep(1);
+      }
+    }
+
+    conn_id = net_tcp_accept(s->local_port, &peer_ip, &peer_port);
+    if (conn_id < 0) {
+      syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
+      break;
+    }
+
+    newfd = socket_alloc_fd(os_current_task, NS_SOCK_STREAM, 0);
+    if (newfd < 0) {
+      (void)net_tcp_close(conn_id);
+      syscall_complete(regs, syscall_num, (uint32_t)VFS_ERR_NO_SPACE);
+      break;
+    }
+
+    child = socket_entry_for_fd(os_current_task, newfd);
+    child->bound = 1;
+    child->local_port = s->local_port;
+    child->peer_ip = peer_ip;
+    child->peer_port = peer_port;
+    child->listening = 0;
+    child->net_conn_id = conn_id;
+    child->flags = s->flags;
+
+    if (peer != 0) {
+      peer->sin_family = NS_AF_INET;
+      peer->sin_port = ns_bswap16(peer_port);
+      peer->sin_addr = ns_bswap32(peer_ip);
+    }
+
+    syscall_complete(regs, syscall_num, (uint32_t)newfd);
+    break;
+  }
+
+  case SYS_CONNECT: {
+    int fd = (int)regs[4];
+    const NsSockAddrIn *addr = (const NsSockAddrIn *)regs[6];
+    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+    uint16_t port;
+    uint32_t ip;
+    int conn_id;
+
+    if (cpl == 3 && !validate_user_ptr(addr, sizeof(NsSockAddrIn))) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+    if (s == 0 || addr == 0 || addr->sin_family != NS_AF_INET) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+
+    port = ns_bswap16(addr->sin_port);
+    ip = ns_bswap32(addr->sin_addr);
+    if (port == 0u || ip == 0u) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+
+    if (s->type == NS_SOCK_DGRAM) {
+      s->peer_ip = ip;
+      s->peer_port = port;
+      syscall_complete(regs, syscall_num, NS_OK);
+      break;
+    }
+
+    if (!s->bound) {
+      s->bound = 1;
+      s->local_port = (uint16_t)(40000 + (os_current_task & 0x7F));
+    }
+
+    conn_id = net_tcp_connect(ip, port, s->local_port);
+    if (conn_id < 0) {
+      syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
+      break;
+    }
+
+    s->peer_ip = ip;
+    s->peer_port = port;
+    s->net_conn_id = conn_id;
+    s->listening = 0;
+    if (socket_is_nonblocking(s)) {
+      syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
+      break;
+    }
+
+    while (!net_tcp_is_established(conn_id)) {
+      task_sleep(1);
+    }
+    syscall_complete(regs, syscall_num, NS_OK);
+    break;
+  }
+
+  case SYS_SENDTO: {
+    int fd = (int)regs[4];
+    const void *buf = (const void *)regs[6];
+    uint32_t len = regs[5];
+    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+    int rc = (int)NS_ERR_INVALID_ARG;
+
+    if (cpl == 3 && !validate_user_ptr(buf, len)) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+    if (s == 0 || buf == 0 || len == 0u) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+
+    if (s->type == NS_SOCK_DGRAM) {
+      if (s->peer_ip != 0 && s->peer_port != 0) {
+        rc = net_udp_send(s->peer_ip,
+                          s->bound ? s->local_port : 40000u,
+                          s->peer_port,
+                          buf,
+                          (uint16_t)len);
+      }
+      rc = rc ? (int)len : (int)NS_ERR_WOULD_BLOCK;
+    } else if (s->type == NS_SOCK_STREAM && s->net_conn_id >= 0) {
+      if (!socket_ready_for_write(s)) {
+        if (socket_is_nonblocking(s)) {
+          syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
+          break;
+        }
+        while (!socket_ready_for_write(s)) {
+          task_sleep(1);
+        }
+      }
+      rc = net_tcp_send(s->net_conn_id, buf, (uint16_t)len);
+    }
+
+    syscall_complete(regs, syscall_num, (uint32_t)rc);
+    break;
+  }
+
+  case SYS_RECVFROM: {
+    int fd = (int)regs[4];
+    void *buf = (void *)regs[6];
+    uint32_t len = regs[5];
+    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+    int rc = (int)NS_ERR_INVALID_ARG;
+
+    if (cpl == 3 && !validate_user_ptr(buf, len)) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+    if (s == 0 || buf == 0 || len == 0u) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+
+    if (s->type == NS_SOCK_DGRAM && s->bound) {
+      uint32_t src_ip = 0;
+      uint16_t src_port = 0;
+      if (!socket_ready_for_read(s)) {
+        if (socket_is_nonblocking(s)) {
+          syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
+          break;
+        }
+        while (!socket_ready_for_read(s)) {
+          task_sleep(1);
+        }
+      }
+      rc = net_udp_recv(s->local_port, &src_ip, &src_port, buf, (uint16_t)len);
+      if (rc > 0 && (s->peer_ip == 0 || s->peer_port == 0)) {
+        s->peer_ip = src_ip;
+        s->peer_port = src_port;
+      }
+    } else if (s->type == NS_SOCK_STREAM && s->net_conn_id >= 0) {
+      if (!socket_ready_for_read(s)) {
+        if (socket_is_nonblocking(s)) {
+          syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
+          break;
+        }
+        while (!socket_ready_for_read(s)) {
+          task_sleep(1);
+        }
+      }
+      rc = net_tcp_recv(s->net_conn_id, buf, (uint16_t)len);
+    }
+
+    if (rc == 0) {
+      rc = (int)NS_ERR_WOULD_BLOCK;
+    }
+    syscall_complete(regs, syscall_num, (uint32_t)rc);
+    break;
+  }
+
+  case SYS_SELECT:
+  case SYS_POLL: {
+    NsPollFd *fds = (NsPollFd *)regs[4];
+    uint32_t count = regs[5];
+    uint32_t timeout_ticks = regs[6];
+    int rc;
+
+    if (count == 0u) {
+      syscall_complete(regs, syscall_num, NS_OK);
+      break;
+    }
+    if (count > TASK_MAX_FDS || fds == 0) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+    if (cpl == 3 && !validate_user_ptr(fds, sizeof(NsPollFd) * count)) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+
+    rc = poll_socket_array_wait(fds, count, timeout_ticks);
+    syscall_complete(regs, syscall_num, (uint32_t)rc);
+    break;
+  }
+
+  case SYS_EPOLL: {
+    int op = (int)regs[4];
+    int epfd = (int)regs[5];
+    uint32_t arg = regs[6];
+
+    if (op == NS_EPOLL_OP_CREATE) {
+      int newfd = epoll_alloc_fd(os_current_task);
+      if (newfd < 0) {
+        syscall_complete(regs, syscall_num, (uint32_t)VFS_ERR_NO_SPACE);
+      } else {
+        syscall_complete(regs, syscall_num, (uint32_t)newfd);
+      }
+      break;
+    }
+
+    if (op == NS_EPOLL_OP_CLOSE) {
+      NsEpollObject *obj = epoll_object_for_fd(os_current_task, epfd);
+      if (obj == 0) {
+        syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      } else {
+        epoll_close_object(obj);
+        syscall_complete(regs, syscall_num, NS_OK);
+      }
+      break;
+    }
+
+    if (op == NS_EPOLL_OP_CTL) {
+      NsEpollObject *obj = epoll_object_for_fd(os_current_task, epfd);
+      NsEpollCtlReq *req = (NsEpollCtlReq *)arg;
+      int rc;
+
+      if (obj == 0 || req == 0) {
+        syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+        break;
+      }
+      if (cpl == 3 && !validate_user_ptr(req, sizeof(NsEpollCtlReq))) {
+        syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+        break;
+      }
+
+      rc = epoll_ctl_apply(obj, req);
+      syscall_complete(regs, syscall_num, (uint32_t)rc);
+      break;
+    }
+
+    if (op == NS_EPOLL_OP_WAIT) {
+      NsEpollObject *obj = epoll_object_for_fd(os_current_task, epfd);
+      NsEpollWaitReq *req = (NsEpollWaitReq *)arg;
+      int rc;
+
+      if (obj == 0 || req == 0) {
+        syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+        break;
+      }
+      if (cpl == 3 && !validate_user_ptr(req, sizeof(NsEpollWaitReq))) {
+        syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+        break;
+      }
+      if (req->events == 0 || req->maxevents == 0u || req->maxevents > TASK_MAX_FDS) {
+        syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+        break;
+      }
+      if (cpl == 3 && !validate_user_ptr(req->events, sizeof(NsPollFd) * req->maxevents)) {
+        syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+        break;
+      }
+
+      rc = epoll_wait_ready(obj, req->events, req->maxevents, req->timeout_ticks);
+      syscall_complete(regs, syscall_num, (uint32_t)rc);
+      break;
+    }
+
+    syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+    break;
+  }
+
   /* ---- SYS_WRITE (4): write to FD or fallback to legacy gprint ---- */
   case SYS_WRITE: {
     int fd = (int)regs[4];
     const void *buf = (const void *)regs[6];
     uint32_t size = regs[5];
     int wrote = VFS_ERR_INVALID_ARG;
+    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+
+    if (s != 0 && buf != 0 && size > 0) {
+      if (cpl == 3 && !validate_user_ptr(buf, size)) {
+        syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+        break;
+      }
+
+      if (s->type == NS_SOCK_STREAM && s->net_conn_id >= 0) {
+        if (!socket_ready_for_write(s)) {
+          if (socket_is_nonblocking(s)) {
+            syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
+            break;
+          }
+          while (!socket_ready_for_write(s)) {
+            task_sleep(1);
+          }
+        }
+        wrote = net_tcp_send(s->net_conn_id, buf, (uint16_t)size);
+      } else if (s->type == NS_SOCK_DGRAM && s->peer_ip != 0 && s->peer_port != 0) {
+        wrote = net_udp_send(s->peer_ip,
+                             s->bound ? s->local_port : 40000u,
+                             s->peer_port,
+                             buf,
+                             (uint16_t)size)
+                    ? (int)size
+                    : (int)NS_ERR_WOULD_BLOCK;
+      }
+
+      syscall_complete(regs, syscall_num, (uint32_t)wrote);
+      break;
+    }
 
     if (fd >= 0 && buf != 0 && size > 0) {
       if (cpl == 3 && !validate_user_ptr(buf, size)) {
