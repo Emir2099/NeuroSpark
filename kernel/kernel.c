@@ -2344,6 +2344,7 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
   /* to allow the background graphics task to render the UI each cycle. */
   extern void schedule();
   while (1) {
+    net_rx_poll();
     schedule();
     __asm__ volatile("hlt");
   }

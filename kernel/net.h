@@ -3,10 +3,22 @@
 
 typedef unsigned int uint32_t;
 typedef unsigned char uint8_t;
+typedef unsigned short uint16_t;
+
+typedef struct {
+	uint32_t total_frames;
+	uint32_t ipv4_frames;
+	uint32_t arp_frames;
+	uint32_t neuro_frames;
+	uint32_t unknown_frames;
+	uint32_t dropped_frames;
+} NetRxStats;
 
 int net_init(void);
 int net_up(void);
 int net_is_ready(void);
+int net_rx_poll(void);
+void net_get_rx_stats(NetRxStats *out);
 int net_send_probe(void);
 int net_export_snapshot(int slot);
 int net_export_profile(void);
@@ -14,6 +26,13 @@ int net_export_manifest(void);
 
 int net_set_ipv4(uint32_t ip, uint32_t mask, uint32_t gw);
 void net_get_ipv4(uint32_t *ip, uint32_t *mask, uint32_t *gw);
+
+int net_udp_bind(uint16_t port);
+int net_udp_unbind(uint16_t port);
+int net_udp_send(uint32_t dst_ip, uint16_t src_port, uint16_t dst_port,
+				 const void *payload, uint16_t payload_len);
+int net_udp_recv(uint16_t port, uint32_t *src_ip, uint16_t *src_port,
+				 void *buf, uint16_t max_len);
 
 uint32_t net_nic_io_base(void);
 int net_nic_index(void);
