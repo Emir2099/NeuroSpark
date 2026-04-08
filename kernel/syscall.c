@@ -39,6 +39,16 @@ enum {
 #define SYS_DUP 15
 #define SYS_DUP2 16
 #define SYS_FCNTL 17
+#define SYS_WAIT4 18
+#define SYS_WAITPID 19
+#define SYS_SIGNAL 20
+#define SYS_SIGACTION 21
+#define SYS_SIGPROCMASK 22
+#define SYS_KILL 23
+
+#define SIGKILL 9
+#define SIGTERM 15
+#define WNOHANG 1
 
 /* ============================================================
  * Syscall Validation and Error Codes
@@ -83,6 +93,95 @@ extern volatile int kb_tail;
 extern void task_yield(void);
 extern int ipc_send(int channel, int value);
 extern int ipc_recv(int channel, int *out_value);
+extern void enter_user_mode_retval(uint32_t entry_eip, uint32_t user_stack,
+                                   uint32_t page_dir, uint32_t eax_ret);
+
+typedef struct {
+  uint32_t entry;
+  uint32_t stack;
+  uint32_t retval;
+} ForkStartCtx;
+
+static ForkStartCtx fork_start_ctx[MAX_TASKS];
+
+static void fork_child_entry(void) {
+  int tid = os_current_task;
+  if (tid >= 0 && tid < MAX_TASKS) {
+    enter_user_mode_retval(fork_start_ctx[tid].entry, fork_start_ctx[tid].stack,
+                           os_tasks[tid].page_dir, fork_start_ctx[tid].retval);
+  }
+  task_terminate_current();
+}
+
+static int pick_unmasked_signal(uint32_t pending_mask, uint32_t blocked_mask) {
+  uint32_t active = pending_mask & ~blocked_mask;
+  for (int sig = 1; sig < TASK_SIGNAL_MAX; sig++) {
+    if (active & (1u << sig)) {
+      return sig;
+    }
+  }
+  return 0;
+}
+
+static void syscall_dispatch_pending_signals(uint32_t *regs, uint32_t cpl) {
+  TCB *task;
+  int sig;
+  uint32_t handler;
+  uint32_t *iret_frame;
+
+  if (cpl != 3 || os_current_task < 0 || os_current_task >= MAX_TASKS) {
+    return;
+  }
+
+  task = &os_tasks[os_current_task];
+  sig = pick_unmasked_signal(task->signal_pending, task->signal_mask);
+  if (sig == 0) {
+    return;
+  }
+
+  task->signal_pending &= ~(1u << sig);
+  handler = task->signal_handler[sig];
+
+  if (sig == SIGKILL || sig == SIGTERM || handler == 0 ||
+      !is_user_range((const void *)handler, 1)) {
+    task_exit_with_code(128 + sig);
+    return;
+  }
+
+  iret_frame = (uint32_t *)((uint8_t *)regs + (8 * sizeof(uint32_t)));
+  iret_frame[0] = handler; /* Override return EIP to signal handler. */
+  regs[7] = (uint32_t)sig;
+}
+
+static int task_has_unreaped_child(int parent_pid) {
+  for (int i = 0; i < MAX_TASKS; i++) {
+    if (os_tasks[i].parent_pid == parent_pid && !os_tasks[i].waited) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int reap_child_for_parent(int parent_pid, int wanted_pid, int *status_out) {
+  for (int i = 0; i < MAX_TASKS; i++) {
+    if (i == 0) {
+      continue;
+    }
+    if (os_tasks[i].parent_pid != parent_pid || os_tasks[i].waited || !os_tasks[i].exited) {
+      continue;
+    }
+    if (wanted_pid > 0 && i != wanted_pid) {
+      continue;
+    }
+
+    os_tasks[i].waited = 1;
+    if (status_out != 0) {
+      *status_out = os_tasks[i].exit_status;
+    }
+    return i;
+  }
+  return -1;
+}
 
 static irq_lock_t kb_lock = {0};
 extern int os_current_task;
@@ -190,10 +289,47 @@ void syscall_handler(uint32_t *regs) {
 
   switch (syscall_num) {
 
-  /* ---- SYS_FORK (2): not yet implemented ---- */
-  case SYS_FORK:
-    syscall_complete(regs, syscall_num, NS_ERR_INVALID_SYSCALL);
+  /* ---- SYS_FORK (2): clone current user task and return child pid ---- */
+  case SYS_FORK: {
+    int parent = os_current_task;
+    int child;
+    uint32_t child_pd;
+    uint32_t *iret_frame = (uint32_t *)((uint8_t *)regs + (8 * sizeof(uint32_t)));
+    uint32_t ret_eip = iret_frame[0];
+    uint32_t ret_esp = iret_frame[3];
+
+    if (cpl != 3) {
+      syscall_complete(regs, syscall_num, NS_ERR_PERMISSION);
+      break;
+    }
+
+    child = task_alloc_slot();
+    if (child < 0) {
+      syscall_complete(regs, syscall_num, (uint32_t)VFS_ERR_NO_SPACE);
+      break;
+    }
+
+    child_pd = clone_user_address_space(os_tasks[parent].page_dir);
+    if (child_pd == 0) {
+      syscall_complete(regs, syscall_num, (uint32_t)VFS_ERR_IO);
+      break;
+    }
+
+    create_task(child, fork_child_entry, child_pd);
+    os_tasks[child].parent_pid = parent;
+    os_tasks[child].signal_mask = os_tasks[parent].signal_mask;
+    for (int s = 0; s < TASK_SIGNAL_MAX; s++) {
+      os_tasks[child].signal_handler[s] = os_tasks[parent].signal_handler[s];
+    }
+
+    fork_start_ctx[child].entry = ret_eip;
+    fork_start_ctx[child].stack = ret_esp;
+    fork_start_ctx[child].retval = 0;
+
+    vfs_clone_task_fds(parent, child);
+    syscall_complete(regs, syscall_num, (uint32_t)child);
     break;
+  }
 
   /* ---- SYS_READ (3): read from VFS FD ---- */
   case SYS_READ:
@@ -268,6 +404,118 @@ void syscall_handler(uint32_t *regs) {
     int arg = (int)regs[5];
     int rc = vfs_fcntl(fd, cmd, arg);
     syscall_complete(regs, syscall_num, (uint32_t)rc);
+    break;
+  }
+
+  /* ---- SYS_WAIT4 (18): wait for child exit with optional WNOHANG ---- */
+  case SYS_WAIT4:
+  case SYS_WAITPID: {
+    int wanted_pid = (int)regs[4];
+    int *status_ptr = (int *)regs[6];
+    int options = (int)regs[5];
+    int status = 0;
+    int child = -1;
+
+    if (cpl == 3 && status_ptr != 0 && !validate_user_int_ptr(status_ptr)) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+
+    while (1) {
+      child = reap_child_for_parent(os_current_task, wanted_pid, &status);
+      if (child >= 0) {
+        if (status_ptr != 0) {
+          *status_ptr = status;
+        }
+        syscall_complete(regs, syscall_num, (uint32_t)child);
+        break;
+      }
+
+      if (!task_has_unreaped_child(os_current_task)) {
+        syscall_complete(regs, syscall_num, NS_ERR_INVALID_SYSCALL);
+        break;
+      }
+
+      if (options & WNOHANG) {
+        syscall_complete(regs, syscall_num, 0);
+        break;
+      }
+
+      task_sleep(1);
+    }
+    break;
+  }
+
+  /* ---- SYS_SIGNAL (20): register basic signal handler ---- */
+  case SYS_SIGNAL:
+  case SYS_SIGACTION: {
+    int sig = (int)regs[4];
+    uint32_t handler = regs[6];
+    uint32_t old;
+
+    if (sig <= 0 || sig >= TASK_SIGNAL_MAX || sig == SIGKILL) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+
+    if (cpl == 3 && handler != 0 && !is_user_range((const void *)handler, 1)) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+
+    old = os_tasks[os_current_task].signal_handler[sig];
+    os_tasks[os_current_task].signal_handler[sig] = handler;
+    syscall_complete(regs, syscall_num, old);
+    break;
+  }
+
+  /* ---- SYS_SIGPROCMASK (22): set/block/unblock signal mask ---- */
+  case SYS_SIGPROCMASK: {
+    int how = (int)regs[4];
+    uint32_t set_mask = regs[6];
+    uint32_t *old_mask_ptr = (uint32_t *)regs[5];
+    uint32_t old_mask = os_tasks[os_current_task].signal_mask;
+
+    if (cpl == 3 && old_mask_ptr != 0 && !validate_user_ptr(old_mask_ptr, sizeof(uint32_t))) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+
+    if (how == 0) {
+      os_tasks[os_current_task].signal_mask = set_mask;
+    } else if (how == 1) {
+      os_tasks[os_current_task].signal_mask |= set_mask;
+    } else if (how == 2) {
+      os_tasks[os_current_task].signal_mask &= ~set_mask;
+    } else {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+
+    if (old_mask_ptr != 0) {
+      *old_mask_ptr = old_mask;
+    }
+    syscall_complete(regs, syscall_num, NS_OK);
+    break;
+  }
+
+  /* ---- SYS_KILL (23): queue signal to target process ---- */
+  case SYS_KILL: {
+    int pid = (int)regs[4];
+    int sig = (int)regs[6];
+
+    if (pid < 0 || pid >= MAX_TASKS || sig <= 0 || sig >= TASK_SIGNAL_MAX) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+
+    if (sig == SIGKILL) {
+      int rc = task_kill(pid, 128 + SIGKILL);
+      syscall_complete(regs, syscall_num, rc ? NS_OK : NS_ERR_INVALID_SYSCALL);
+    } else {
+      os_tasks[pid].signal_pending |= (1u << sig);
+      syscall_complete(regs, syscall_num, NS_OK);
+    }
     break;
   }
 
@@ -430,4 +678,6 @@ void syscall_handler(uint32_t *regs) {
     syscall_complete(regs, syscall_num, NS_ERR_INVALID_SYSCALL);
     break;
   }
+
+  syscall_dispatch_pending_signals(regs, cpl);
 }

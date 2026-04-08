@@ -234,14 +234,16 @@ void task_sleep(unsigned int ticks) {
   scheduler_select_and_switch(0);
 }
 
-void task_terminate_current(void) {
+void task_exit_with_code(int code) {
   unsigned int flags;
   uint32_t task_pd = 0;
   int current = 0;
   int has_fault = 0;
+  int parent = -1;
 
   irq_lock_acquire(&scheduler_lock, &flags);
   current = os_current_task;
+  parent = os_tasks[current].parent_pid;
   task_pd = os_tasks[current].page_dir;
   has_fault = (os_tasks[current].fault_code != 0 ||
                os_tasks[current].fault_addr != 0 ||
@@ -251,6 +253,20 @@ void task_terminate_current(void) {
   }
   os_tasks[os_current_task].state = TASK_STATE_TERMINATED;
   os_tasks[os_current_task].wake_tick = 0;
+  os_tasks[os_current_task].exit_status = code;
+  os_tasks[os_current_task].exited = 1;
+
+  if (parent >= 0 && parent < os_task_count &&
+      os_tasks[parent].state == TASK_STATE_BLOCKED &&
+      os_tasks[parent].wait_reason == TASK_WAIT_CHILD) {
+    int target = os_tasks[parent].wait_target;
+    if (target < 0 || target == current) {
+      os_tasks[parent].state = TASK_STATE_READY;
+      os_tasks[parent].wake_tick = 0;
+      os_tasks[parent].wait_reason = TASK_WAIT_NONE;
+      os_tasks[parent].wait_target = -1;
+    }
+  }
   irq_lock_release(&scheduler_lock, flags);
 
   vfs_close_all_for_task(current);
@@ -264,6 +280,56 @@ void task_terminate_current(void) {
   while (1) {
     __asm__ volatile("hlt");
   }
+}
+
+void task_terminate_current(void) { task_exit_with_code(0); }
+
+int task_kill(int task_id, int code) {
+  unsigned int flags;
+  uint32_t task_pd;
+  int parent;
+
+  if (task_id < 0 || task_id >= os_task_count) {
+    return 0;
+  }
+
+  if (task_id == os_current_task) {
+    task_exit_with_code(code);
+    return 1;
+  }
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+  if (os_tasks[task_id].state == TASK_STATE_TERMINATED) {
+    irq_lock_release(&scheduler_lock, flags);
+    return 0;
+  }
+
+  parent = os_tasks[task_id].parent_pid;
+  task_pd = os_tasks[task_id].page_dir;
+  os_tasks[task_id].state = TASK_STATE_TERMINATED;
+  os_tasks[task_id].wake_tick = 0;
+  os_tasks[task_id].exit_status = code;
+  os_tasks[task_id].exited = 1;
+
+  if (parent >= 0 && parent < os_task_count &&
+      os_tasks[parent].state == TASK_STATE_BLOCKED &&
+      os_tasks[parent].wait_reason == TASK_WAIT_CHILD) {
+    int target = os_tasks[parent].wait_target;
+    if (target < 0 || target == task_id) {
+      os_tasks[parent].state = TASK_STATE_READY;
+      os_tasks[parent].wake_tick = 0;
+      os_tasks[parent].wait_reason = TASK_WAIT_NONE;
+      os_tasks[parent].wait_target = -1;
+    }
+  }
+  irq_lock_release(&scheduler_lock, flags);
+
+  vfs_close_all_for_task(task_id);
+  if (task_pd != 0 && task_pd != (uint32_t)page_directory) {
+    destroy_user_address_space(task_pd);
+    os_tasks[task_id].page_dir = 0;
+  }
+  return 1;
 }
 
 void scheduler_timer_tick(void) {

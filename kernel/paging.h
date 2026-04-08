@@ -16,6 +16,7 @@ int map_user_page(uint32_t pd_phys, uint32_t phys_addr, uint32_t virt_addr);
 int is_user_range(const void *ptr, uint32_t size);
 int is_user_range_accessible(uint32_t pd_phys, const void *ptr, uint32_t size);
 uint32_t resolve_user_phys(uint32_t pd_phys, uint32_t virt_addr);
+uint32_t clone_user_address_space(uint32_t src_pd_phys);
 void destroy_user_address_space(uint32_t pd_phys);
 
 #endif

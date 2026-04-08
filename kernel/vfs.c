@@ -1058,6 +1058,26 @@ void vfs_close_all_for_task(int task_id) {
   }
 }
 
+int vfs_clone_task_fds(int src_task_id, int dst_task_id) {
+  if (src_task_id < 0 || src_task_id >= MAX_TASKS || dst_task_id < 0 || dst_task_id >= MAX_TASKS) {
+    return VFS_ERR_INVALID_ARG;
+  }
+
+  for (int i = 0; i < TASK_MAX_FDS; i++) {
+    task_fd_map[dst_task_id][i] = -1;
+  }
+
+  for (int i = 0; i < TASK_MAX_FDS; i++) {
+    int gfd = task_fd_map[src_task_id][i];
+    if (gfd >= 0 && gfd < VFS_MAX_GLOBAL_FDS && fd_table[gfd].used) {
+      task_fd_map[dst_task_id][i] = gfd;
+      fd_table[gfd].ref_count++;
+    }
+  }
+
+  return VFS_OK;
+}
+
 int vfs_read_file(const char *path, void *buf, uint32_t max_size) {
   int fd = vfs_open(path, VFS_O_RDONLY);
   int total = 0;

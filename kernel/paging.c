@@ -1,4 +1,5 @@
 typedef unsigned int uint32_t;
+typedef unsigned char uint8_t;
 
 #define PAGE_PRESENT 0x1
 #define PAGE_RW 0x2
@@ -7,6 +8,8 @@ typedef unsigned int uint32_t;
 
 #define USER_VADDR_MIN 0x40000000U
 #define USER_VADDR_MAX 0xBFFFFFFFU
+#define KERNEL_TEMP_MAP_VA 0x3FF00000U
+#define KERNEL_TEMP_MAP_VA2 0x3FEFF000U
 
 // Page Directory and TWO Page Tables (mapping 8MB total)
 // Aligned to 4096 bytes as required by x86 hardware
@@ -19,6 +22,7 @@ extern void *pmm_alloc_page();
 extern void pmm_free_page(uint32_t page_addr);
 extern void loadPageDirectory(unsigned int *);
 extern void enablePaging();
+void destroy_user_address_space(uint32_t pd_phys);
 
 /* The VBE framebuffer physical address (set early in kernel_main
    from the bootloader's saved value BEFORE BSS is touched).       */
@@ -207,6 +211,80 @@ uint32_t resolve_user_phys(uint32_t pd_phys, uint32_t virt_addr) {
   }
 
   return (pte & PAGE_MASK) | (virt_addr & 0xFFF);
+}
+
+uint32_t clone_user_address_space(uint32_t src_pd_phys) {
+  uint32_t *src_pd = (uint32_t *)(src_pd_phys & PAGE_MASK);
+  uint32_t dst_pd_phys;
+  uint32_t *dst_pd;
+
+  if (src_pd == (uint32_t *)0) {
+    return 0;
+  }
+
+  dst_pd_phys = create_user_page_directory();
+  if (dst_pd_phys == 0) {
+    return 0;
+  }
+  dst_pd = (uint32_t *)(dst_pd_phys & PAGE_MASK);
+
+  for (uint32_t pdi = (USER_VADDR_MIN >> 22); pdi <= (USER_VADDR_MAX >> 22); pdi++) {
+    uint32_t src_pde = src_pd[pdi];
+    uint32_t *src_pt;
+    uint32_t *dst_pt;
+    uint32_t dst_pt_phys;
+
+    if ((src_pde & PAGE_PRESENT) == 0 || (src_pde & PAGE_USER) == 0) {
+      continue;
+    }
+
+    src_pt = (uint32_t *)(src_pde & PAGE_MASK);
+    dst_pt_phys = (uint32_t)pmm_alloc_page();
+    if (dst_pt_phys == 0) {
+      destroy_user_address_space(dst_pd_phys);
+      return 0;
+    }
+
+    dst_pt = (uint32_t *)(dst_pt_phys & PAGE_MASK);
+    for (int i = 0; i < 1024; i++) {
+      dst_pt[i] = 0;
+    }
+    dst_pd[pdi] = (dst_pt_phys & PAGE_MASK) | PAGE_PRESENT | PAGE_RW | PAGE_USER;
+
+    for (uint32_t pti = 0; pti < 1024; pti++) {
+      uint32_t src_pte = src_pt[pti];
+      uint32_t src_phys;
+      uint32_t dst_phys;
+      uint8_t *src_map;
+      uint8_t *dst_map;
+
+      if ((src_pte & PAGE_PRESENT) == 0 || (src_pte & PAGE_USER) == 0) {
+        continue;
+      }
+
+      src_phys = src_pte & PAGE_MASK;
+      dst_phys = (uint32_t)pmm_alloc_page();
+      if (dst_phys == 0) {
+        destroy_user_address_space(dst_pd_phys);
+        return 0;
+      }
+
+      map_page(src_phys, KERNEL_TEMP_MAP_VA);
+      map_page(dst_phys, KERNEL_TEMP_MAP_VA2);
+      src_map = (uint8_t *)KERNEL_TEMP_MAP_VA;
+      dst_map = (uint8_t *)KERNEL_TEMP_MAP_VA2;
+
+      for (int b = 0; b < 4096; b++) {
+        dst_map[b] = src_map[b];
+      }
+
+      unmap_kernel_page(KERNEL_TEMP_MAP_VA);
+      unmap_kernel_page(KERNEL_TEMP_MAP_VA2);
+      dst_pt[pti] = (dst_phys & PAGE_MASK) | PAGE_PRESENT | PAGE_RW | PAGE_USER;
+    }
+  }
+
+  return dst_pd_phys;
 }
 
 void destroy_user_address_space(uint32_t pd_phys) {

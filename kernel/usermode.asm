@@ -1,6 +1,7 @@
 [bits 32]
 
 global enter_user_mode
+global enter_user_mode_retval
 global user_program_start
 global user_program_end
 
@@ -20,6 +21,30 @@ enter_user_mode:
     mov fs, ax
     mov gs, ax
 
+    push dword 0x23
+    push ebx
+    pushfd
+    or dword [esp], 0x200
+    push dword 0x1B
+    push edx
+    iretd
+
+enter_user_mode_retval:
+    ; enter_user_mode_retval(entry_eip, user_stack, page_dir, eax_ret)
+    mov eax, [esp + 12]
+    mov cr3, eax
+
+    mov edx, [esp + 4]
+    mov ebx, [esp + 8]
+    mov ecx, [esp + 16]
+
+    mov ax, 0x23
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    mov eax, ecx
     push dword 0x23
     push ebx
     pushfd

@@ -52,6 +52,7 @@ int vfs_dup(int fd);
 int vfs_dup2(int fd, int newfd);
 int vfs_fcntl(int fd, int cmd, int arg);
 void vfs_close_all_for_task(int task_id);
+int vfs_clone_task_fds(int src_task_id, int dst_task_id);
 
 typedef struct {
   char mount_path[24];

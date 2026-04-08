@@ -56,6 +56,8 @@ void task_yield(void);
 void task_sleep(unsigned int ticks);
 int task_sleep_timeout(unsigned int ticks, unsigned int max_ticks);
 void task_terminate_current(void);
+void task_exit_with_code(int code);
+int task_kill(int task_id, int code);
 
 void wait_queue_init(wait_queue_t *queue);
 void wait_queue_wait(wait_queue_t *queue);

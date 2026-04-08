@@ -11,8 +11,15 @@ enum {
   TASK_STATE_TERMINATED = 4,
 };
 
-#define MAX_TASKS 3
+#define MAX_TASKS 8
 #define TASK_MAX_FDS 256
+
+#define TASK_SIGNAL_MAX 32
+
+enum {
+  TASK_WAIT_NONE = 0,
+  TASK_WAIT_CHILD = 1,
+};
 
 enum {
   WORKLOAD_CLASS_SIM = 0,
@@ -51,6 +58,17 @@ typedef struct {
   uint32_t fault_code;
   uint32_t fault_addr;
   uint32_t fault_eip;
+  uint32_t user_entry;
+  uint32_t user_stack;
+  uint32_t user_retval;
+  uint32_t signal_pending;
+  uint32_t signal_mask;
+  uint32_t signal_handler[TASK_SIGNAL_MAX];
+  int parent_pid;
+  int exit_status;
+  int exited;
+  int waited;
+  int wait_target;
   int fd_table[TASK_MAX_FDS];
   int wait_reason;
   int task_id;
@@ -62,6 +80,7 @@ extern int os_task_count;
 
 void create_task(int index, void (*func_ptr)(), uint32_t page_dir);
 int task_is_valid(int task_id);
+int task_alloc_slot(void);
 void task_trace_event(int task_id, uint32_t event, uint32_t arg);
 void task_trace_syscall(int task_id, uint32_t syscall_num, uint32_t result);
 
