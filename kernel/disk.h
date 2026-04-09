@@ -78,6 +78,28 @@ typedef struct {
     uint32_t cached_writes;
 } DiskIoStats;
 
+typedef struct {
+    uint32_t total_sectors_low;
+    uint32_t total_sectors_high;
+    uint32_t sector_size;
+    uint32_t backend;
+    char model[41];
+} DiskGeometryInfo;
+
+typedef struct {
+    uint32_t available;
+    uint32_t backend;
+    uint32_t preferred_backend;
+    uint32_t ahci_ready_ports;
+    uint32_t smart_supported;
+    uint32_t smart_enabled;
+    uint32_t temperature_c;
+    uint32_t life_percent;
+    uint32_t read_error_count;
+    uint32_t write_error_count;
+    uint32_t last_error_code;
+} DiskHealthInfo;
+
 // Disk driver functions
 int  ata_detect_disk(void);
 void ata_wait_ready(void);
@@ -93,5 +115,7 @@ const char *disk_read_error_string(int code);
 int  find_free_slot(FileEntry *dir);
 void disk_get_io_stats(DiskIoStats *out_stats);
 void disk_reset_io_stats(void);
+int  disk_get_geometry(DiskGeometryInfo *out_info);
+int  disk_get_health(DiskHealthInfo *out_info);
 
 #endif

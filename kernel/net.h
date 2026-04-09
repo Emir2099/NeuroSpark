@@ -7,17 +7,23 @@ typedef unsigned short uint16_t;
 
 typedef struct {
 	uint32_t total_frames;
+	uint32_t total_bytes;
 	uint32_t ipv4_frames;
 	uint32_t arp_frames;
 	uint32_t neuro_frames;
 	uint32_t unknown_frames;
 	uint32_t dropped_frames;
+	uint32_t irq_count;
+	uint32_t irq_rx_events;
+	uint32_t tx_probe_ok;
+	uint32_t tx_probe_fail;
 } NetRxStats;
 
 int net_init(void);
 int net_up(void);
 int net_is_ready(void);
 int net_rx_poll(void);
+int net_irq_handler(void);
 void net_get_rx_stats(NetRxStats *out);
 int net_send_probe(void);
 int net_export_snapshot(int slot);
@@ -52,6 +58,10 @@ uint32_t net_nic_io_base(void);
 int net_nic_index(void);
 const char *net_driver_name(void);
 void net_get_mac(uint8_t out[6]);
+int net_set_mac(const uint8_t mac[6]);
+int net_link_speed_mbps(void);
+uint16_t net_mtu_bytes(void);
+int net_supports_jumbo(void);
 
 void remote_set_enabled(int enabled);
 int remote_is_enabled(void);

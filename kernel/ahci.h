@@ -30,6 +30,8 @@ typedef struct {
   uint8_t port_no;
   uint8_t ata_device;
   uint8_t atapi_device;
+  uint8_t smart_supported;
+  uint8_t smart_enabled;
   uint32_t signature;
   uint32_t lba28_sectors;
   uint32_t lba48_sectors_low;
@@ -64,5 +66,8 @@ int ahci_identify_first_ready(AhciIdentifyInfo *out_info);
 int ahci_read_sector(uint8_t port_no, uint32_t lba, uint16_t *out_sector);
 int ahci_read_first_ready_sector(uint32_t lba, uint8_t *out_port,
                                  uint16_t *out_sector);
+int ahci_write_sector(uint8_t port_no, uint32_t lba, const uint16_t *in_sector);
+int ahci_write_first_ready_sector(uint32_t lba, uint8_t *out_port,
+                                  const uint16_t *in_sector);
 
 #endif

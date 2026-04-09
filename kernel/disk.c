@@ -31,6 +31,55 @@ static inline uint16_t inw(uint16_t port) {
 volatile int ata_disk_available = 0;
 static uint8_t disk_preferred_backend = DISK_BACKEND_AUTO;
 static DiskIoStats disk_io_stats = {0, 0, 0, 0};
+static uint32_t disk_read_errors = 0;
+static uint32_t disk_write_errors = 0;
+static int disk_last_error = DISK_IO_OK;
+
+#define DISK_READ_RETRY_COUNT 3
+
+static void copy_text(char *dst, const char *src, uint32_t cap) {
+    uint32_t i = 0;
+    if (dst == 0 || src == 0 || cap == 0) {
+        return;
+    }
+    while (i + 1 < cap && src[i] != '\0') {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+static int ahci_reset_first_available_port(void) {
+    AhciProbeReport report;
+
+    if (!ahci_get_runtime_report(&report) || !report.controller_found ||
+        report.implemented_ports == 0) {
+        return 0;
+    }
+
+    for (uint8_t port = 0; port < AHCI_MAX_PORTS; port++) {
+        AhciPortReport ignored;
+        if (!report.ports[port].implemented) {
+            continue;
+        }
+        if (ahci_port_reset_and_start(port, &ignored)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void disk_note_error(int rc, int is_write) {
+    if (rc == DISK_IO_OK) {
+        return;
+    }
+    disk_last_error = rc;
+    if (is_write) {
+        disk_write_errors++;
+    } else {
+        disk_read_errors++;
+    }
+}
 
 void disk_get_io_stats(DiskIoStats *out_stats) {
     if (out_stats == 0) {
@@ -44,6 +93,9 @@ void disk_reset_io_stats(void) {
     disk_io_stats.uncached_writes = 0;
     disk_io_stats.cached_reads = 0;
     disk_io_stats.cached_writes = 0;
+    disk_read_errors = 0;
+    disk_write_errors = 0;
+    disk_last_error = DISK_IO_OK;
 }
 
 void disk_set_preferred_backend(uint8_t backend) {
@@ -200,32 +252,114 @@ static int ahci_read_sector_ex(uint32_t lba, uint16_t *buffer) {
     }
 
     for (uint8_t port = 0; port < AHCI_MAX_PORTS; port++) {
-        int rc;
         if (!report.ports[port].implemented || !report.ports[port].ready ||
             !report.ports[port].sata) {
             continue;
         }
-        rc = ahci_read_sector(port, lba, buffer);
-        if (rc == AHCI_READ_OK) {
-            return DISK_IO_OK;
+
+        for (int attempt = 0; attempt < DISK_READ_RETRY_COUNT; attempt++) {
+            int rc = ahci_read_sector(port, lba, buffer);
+            if (rc == AHCI_READ_OK) {
+                return DISK_IO_OK;
+            }
+            if (rc == AHCI_READ_ERR_TIMEOUT || rc == AHCI_READ_ERR_TFES) {
+                (void)ahci_port_reset_and_start(port, 0);
+                continue;
+            }
+            if (rc == AHCI_READ_ERR_NO_READY_PORT) {
+                break;
+            }
+            return DISK_IO_ERR_NO_DEVICE;
         }
-        if (rc == AHCI_READ_ERR_TIMEOUT) {
-            return DISK_IO_ERR_TIMEOUT;
+    }
+
+    return DISK_IO_ERR_NO_READY_PORT;
+}
+
+static int ahci_write_sector_ex(uint32_t lba, const uint16_t *buffer) {
+    AhciProbeReport report;
+
+    if (buffer == 0) {
+        return DISK_IO_ERR_UNSUPPORTED;
+    }
+
+    if (!ahci_get_runtime_report(&report) || !report.controller_found ||
+        report.ready_ports == 0) {
+        return DISK_IO_ERR_NO_READY_PORT;
+    }
+
+    for (uint8_t port = 0; port < AHCI_MAX_PORTS; port++) {
+        if (!report.ports[port].implemented || !report.ports[port].ready ||
+            !report.ports[port].sata) {
+            continue;
         }
-        if (rc == AHCI_READ_ERR_TFES) {
-            return DISK_IO_ERR_TFES;
+
+        for (int attempt = 0; attempt < DISK_READ_RETRY_COUNT; attempt++) {
+            int rc = ahci_write_sector(port, lba, buffer);
+            if (rc == AHCI_READ_OK) {
+                return DISK_IO_OK;
+            }
+            if (rc == AHCI_READ_ERR_TIMEOUT || rc == AHCI_READ_ERR_TFES) {
+                (void)ahci_port_reset_and_start(port, 0);
+                continue;
+            }
+            if (rc == AHCI_READ_ERR_NO_READY_PORT) {
+                break;
+            }
+            return DISK_IO_ERR_NO_DEVICE;
         }
-        if (rc == AHCI_READ_ERR_NO_READY_PORT) {
-            return DISK_IO_ERR_NO_READY_PORT;
-        }
-        return DISK_IO_ERR_NO_DEVICE;
     }
 
     return DISK_IO_ERR_NO_READY_PORT;
 }
 
 void disk_write_sector_uncached(uint32_t lba, const uint16_t *buffer) {
+    int rc = DISK_IO_OK;
+
     disk_io_stats.uncached_writes++;
+
+    if (buffer == 0) {
+        disk_note_error(DISK_IO_ERR_UNSUPPORTED, 1);
+        return;
+    }
+
+    if (disk_preferred_backend == DISK_BACKEND_AHCI) {
+        rc = ahci_write_sector_ex(lba, buffer);
+        if (rc == DISK_IO_OK) {
+            return;
+        }
+        if (rc == DISK_IO_ERR_TIMEOUT || rc == DISK_IO_ERR_TFES) {
+            (void)ahci_reset_first_available_port();
+            rc = ahci_write_sector_ex(lba, buffer);
+            if (rc == DISK_IO_OK) {
+                return;
+            }
+        }
+        if (!ata_disk_available) {
+            disk_note_error(rc, 1);
+            return;
+        }
+    }
+
+    if (disk_preferred_backend == DISK_BACKEND_AUTO) {
+        rc = ahci_write_sector_ex(lba, buffer);
+        if (rc == DISK_IO_OK) {
+            return;
+        }
+        if (rc == DISK_IO_ERR_TIMEOUT || rc == DISK_IO_ERR_TFES) {
+            (void)ahci_reset_first_available_port();
+            rc = ahci_write_sector_ex(lba, buffer);
+            if (rc == DISK_IO_OK) {
+                return;
+            }
+        }
+    }
+
+    if (!ata_disk_available) {
+        disk_note_error((rc == DISK_IO_OK) ? DISK_IO_ERR_NO_DEVICE : rc, 1);
+        return;
+    }
+
     ata_wait_ready();
 
     outb(PORT_DEVICE, 0xE0 | ((lba >> 24) & 0x0F));
@@ -261,24 +395,120 @@ int disk_read_sector_uncached(uint32_t lba, uint16_t *buffer) {
     int rc;
 
     if (disk_preferred_backend == DISK_BACKEND_ATA) {
-        return ata_read_sector_ex(lba, buffer);
+        rc = ata_read_sector_ex(lba, buffer);
+        if (rc != DISK_IO_OK) {
+            disk_note_error(rc, 0);
+        }
+        return rc;
     }
     if (disk_preferred_backend == DISK_BACKEND_AHCI) {
-        return ahci_read_sector_ex(lba, buffer);
+        rc = ahci_read_sector_ex(lba, buffer);
+        if (rc != DISK_IO_OK) {
+            disk_note_error(rc, 0);
+        }
+        return rc;
     }
 
     rc = ahci_read_sector_ex(lba, buffer);
     if (rc == DISK_IO_OK) {
         return DISK_IO_OK;
     }
-    if (ata_disk_available) {
-        int ata_rc = ata_read_sector_ex(lba, buffer);
-        if (ata_rc == DISK_IO_OK) {
+
+    if (rc == DISK_IO_ERR_TIMEOUT || rc == DISK_IO_ERR_TFES) {
+        (void)ahci_reset_first_available_port();
+        rc = ahci_read_sector_ex(lba, buffer);
+        if (rc == DISK_IO_OK) {
             return DISK_IO_OK;
         }
+    }
+
+    if (ata_disk_available) {
+        int ata_rc = DISK_IO_ERR_TIMEOUT;
+        for (int attempt = 0; attempt < DISK_READ_RETRY_COUNT; attempt++) {
+            ata_rc = ata_read_sector_ex(lba, buffer);
+            if (ata_rc == DISK_IO_OK) {
+                return DISK_IO_OK;
+            }
+        }
+        disk_note_error(ata_rc, 0);
         return ata_rc;
     }
+    disk_note_error(rc, 0);
     return rc;
+}
+
+int disk_get_geometry(DiskGeometryInfo *out_info) {
+    AhciIdentifyInfo ahci_info;
+
+    if (out_info == 0) {
+        return 0;
+    }
+
+    out_info->total_sectors_low = 0;
+    out_info->total_sectors_high = 0;
+    out_info->sector_size = 512;
+    out_info->backend = disk_preferred_backend;
+    out_info->model[0] = '\0';
+
+    if (ahci_identify_first_ready(&ahci_info) && ahci_info.success) {
+        out_info->backend = DISK_BACKEND_AHCI;
+        out_info->total_sectors_low = ahci_info.lba48_sectors_low;
+        out_info->total_sectors_high = ahci_info.lba48_sectors_high;
+        copy_text(out_info->model, ahci_info.model, sizeof(out_info->model));
+        return 1;
+    }
+
+    if (ata_disk_available) {
+        out_info->backend = DISK_BACKEND_ATA;
+        copy_text(out_info->model, "ATA-LEGACY", sizeof(out_info->model));
+        return 1;
+    }
+
+    copy_text(out_info->model, "NO-DISK", sizeof(out_info->model));
+    return 0;
+}
+
+int disk_get_health(DiskHealthInfo *out_info) {
+    AhciProbeReport report;
+    AhciIdentifyInfo id;
+
+    if (out_info == 0) {
+        return 0;
+    }
+
+    out_info->available = 0u;
+    out_info->backend = DISK_BACKEND_AUTO;
+    out_info->preferred_backend = disk_preferred_backend;
+    out_info->ahci_ready_ports = 0u;
+    out_info->smart_supported = 0u;
+    out_info->smart_enabled = 0u;
+    out_info->temperature_c = 0u;
+    out_info->life_percent = 100u;
+    out_info->read_error_count = disk_read_errors;
+    out_info->write_error_count = disk_write_errors;
+    out_info->last_error_code = (uint32_t)disk_last_error;
+
+    if (ahci_get_runtime_report(&report) && report.controller_found) {
+        out_info->ahci_ready_ports = report.ready_ports;
+        if (report.ready_ports > 0u) {
+            out_info->available = 1u;
+            out_info->backend = DISK_BACKEND_AHCI;
+        }
+    }
+
+    if (ahci_identify_first_ready(&id) && id.success) {
+        out_info->available = 1u;
+        out_info->backend = DISK_BACKEND_AHCI;
+        out_info->smart_supported = id.smart_supported ? 1u : 0u;
+        out_info->smart_enabled = id.smart_enabled ? 1u : 0u;
+    } else if (ata_disk_available) {
+        out_info->available = 1u;
+        if (out_info->backend == DISK_BACKEND_AUTO) {
+            out_info->backend = DISK_BACKEND_ATA;
+        }
+    }
+
+    return out_info->available != 0u;
 }
 
 int disk_read_sector_ex(uint32_t lba, uint16_t *buffer) {

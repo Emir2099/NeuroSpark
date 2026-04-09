@@ -92,6 +92,10 @@ int wm_focused = -1;
 static int z_order[WM_MAX_WINDOWS];
 static int z_count = 0;
 static int power_menu_open = 0;
+static uint32_t wm_frames_total = 0;
+static uint32_t wm_last_fps_tick = 0;
+static uint32_t wm_last_fps_frames = 0;
+static uint32_t wm_fps_x10 = 0;
 
 
 /* Taskbar icon labels */
@@ -1245,4 +1249,27 @@ void wm_render(void) {
 
     /* 5. Mouse cursor on very top */
     wm_draw_cursor();
+
+    wm_frames_total++;
+    if (wm_last_fps_tick == 0) {
+        wm_last_fps_tick = tick;
+        wm_last_fps_frames = wm_frames_total;
+    } else {
+        uint32_t dt = tick - wm_last_fps_tick;
+        if (dt >= 20u) {
+            uint32_t df = wm_frames_total - wm_last_fps_frames;
+            wm_fps_x10 = (df * 1000u) / dt;
+            wm_last_fps_tick = tick;
+            wm_last_fps_frames = wm_frames_total;
+        }
+    }
+}
+
+void wm_get_runtime_metrics(uint32_t *frames_total, uint32_t *fps_x10) {
+    if (frames_total != 0) {
+        *frames_total = wm_frames_total;
+    }
+    if (fps_x10 != 0) {
+        *fps_x10 = wm_fps_x10;
+    }
 }

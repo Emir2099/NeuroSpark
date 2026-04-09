@@ -16,8 +16,12 @@ typedef unsigned short uint16_t;
 #define RTL_REG_CAPR 0x38
 #define RTL_REG_CBR 0x3A
 #define RTL_REG_IMR 0x3C
+#define RTL_REG_ISR 0x3E
 #define RTL_REG_RCR 0x44
 #define RTL_REG_CONFIG1 0x52
+#define RTL_REG_MSR 0x58
+
+#define RTL_MSR_SPEED_10 0x08u
 
 #define RTL_CMD_RESET 0x10
 #define RTL_CMD_RX_ENABLE 0x08
@@ -27,6 +31,13 @@ typedef unsigned short uint16_t;
 #define RTL_RCR_AM 0x00000004
 #define RTL_RCR_APM 0x00000002
 #define RTL_RCR_AAP 0x00000001
+
+#define RTL_INT_RX_OK 0x0001u
+#define RTL_INT_RX_ERR 0x0002u
+#define RTL_INT_TX_OK 0x0004u
+#define RTL_INT_TX_ERR 0x0008u
+#define RTL_INT_RX_OVW 0x0010u
+#define RTL_INT_MASK (RTL_INT_RX_OK | RTL_INT_RX_ERR | RTL_INT_TX_OK | RTL_INT_TX_ERR | RTL_INT_RX_OVW)
 
 #define ETH_TYPE_NEURO 0x88B5
 #define ETH_TYPE_IPV4 0x0800
@@ -57,6 +68,14 @@ typedef unsigned short uint16_t;
 #define TCP_MAX_PAYLOAD 1200
 #define TCP_RETX_TICKS 20u
 #define TCP_RETX_MAX 5u
+
+#define IPV4_ETH_MTU 1500u
+#define IPV4_MAX_HEADER 60u
+#define IPV4_REASS_MAX_PAYLOAD 4096u
+#define IPV4_REASS_SLOT_MAX 4
+#define IPV4_REASS_TIMEOUT_TICKS 300u
+
+#define ROUTE_TABLE_MAX 8
 
 #define TCP_FLAG_FIN 0x01u
 #define TCP_FLAG_SYN 0x02u
@@ -132,6 +151,31 @@ typedef struct {
 
 typedef struct {
   int used;
+  uint32_t network;
+  uint32_t mask;
+  uint32_t gateway;
+  uint8_t prefix_len;
+  uint8_t metric;
+} RouteEntry;
+
+typedef struct {
+  int used;
+  uint32_t src_ip;
+  uint32_t dst_ip;
+  uint16_t ident;
+  uint8_t proto;
+  uint8_t header_len;
+  uint8_t have_first;
+  uint8_t total_known;
+  uint16_t total_payload_len;
+  uint32_t last_tick;
+  uint8_t header[IPV4_MAX_HEADER];
+  uint8_t payload[IPV4_REASS_MAX_PAYLOAD];
+  uint8_t present[(IPV4_REASS_MAX_PAYLOAD / 8u + 7u) / 8u];
+} Ipv4ReassSlot;
+
+typedef struct {
+  int used;
   int listening;
   int parent_listen;
   int accepted;
@@ -162,7 +206,8 @@ enum {
   TCP_STATE_SYN_SENT = 2,
   TCP_STATE_SYN_RCVD = 3,
   TCP_STATE_ESTABLISHED = 4,
-  TCP_STATE_CLOSE_WAIT = 5
+  TCP_STATE_CLOSE_WAIT = 5,
+  TCP_STATE_CLOSING = 6
 };
 
 extern volatile int ata_disk_available;
@@ -188,7 +233,11 @@ static uint8_t rtl_rx_buffer[8192 + 16 + 1500] __attribute__((aligned(16)));
 static uint8_t rtl_tx_buffer[4][1600] __attribute__((aligned(16)));
 static int rtl_tx_slot = 0;
 static uint32_t rtl_rx_offset = 0;
-static NetRxStats net_rx_stats = {0, 0, 0, 0, 0, 0};
+static NetRxStats net_rx_stats = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+static RouteEntry route_table[ROUTE_TABLE_MAX];
+static int route_count = 0;
+static Ipv4ReassSlot ipv4_reass[IPV4_REASS_SLOT_MAX];
+static uint16_t ipv4_tx_ident = 1u;
 static uint32_t arp_cache_ip = 0;
 static uint8_t arp_cache_mac[6] = {0, 0, 0, 0, 0, 0};
 static int arp_cache_valid = 0;
@@ -201,6 +250,135 @@ static uint16_t internet_checksum(const uint8_t *data, uint32_t len);
 static int tcp_send_segment(uint32_t dst_ip, uint16_t src_port, uint16_t dst_port,
                             uint32_t seq, uint32_t ack, uint8_t flags,
                             const uint8_t *payload, uint16_t payload_len);
+static int net_rx_poll_budget(uint32_t max_packets);
+static int route_table_set(uint32_t network, uint32_t mask, uint32_t gateway,
+                           uint8_t metric);
+static void route_table_clear(void);
+static void route_table_refresh_defaults(void);
+static int route_lookup(uint32_t dst_ip, uint32_t *next_hop);
+static int net_send_ipv4_raw(uint32_t dst_ip, uint8_t protocol,
+                             const uint8_t *payload, uint16_t payload_len,
+                             uint8_t ttl, uint16_t ident);
+static int net_forward_ipv4_packet(const uint8_t *ip_packet, uint16_t total_len);
+static int ipv4_reassemble_packet(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
+                                  uint16_t ident, uint16_t frag_off_flags,
+                                  const uint8_t *ip_header, uint8_t header_len,
+                                  const uint8_t *payload, uint16_t payload_len,
+                                  uint8_t *out_packet, uint16_t *out_total_len);
+static void ipv4_reassembly_gc(void);
+
+static int prefix_len_from_mask(uint32_t mask) {
+  int bits = 0;
+  while ((mask & 0x80000000u) != 0u) {
+    bits++;
+    mask <<= 1;
+  }
+  return bits;
+}
+
+static void route_table_clear(void) {
+  route_count = 0;
+  for (int i = 0; i < ROUTE_TABLE_MAX; i++) {
+    route_table[i].used = 0;
+    route_table[i].network = 0;
+    route_table[i].mask = 0;
+    route_table[i].gateway = 0;
+    route_table[i].prefix_len = 0;
+    route_table[i].metric = 0;
+  }
+}
+
+static int route_table_set(uint32_t network, uint32_t mask, uint32_t gateway,
+                           uint8_t metric) {
+  int idx = -1;
+
+  if (mask != 0u) {
+    network &= mask;
+  } else {
+    network = 0u;
+  }
+
+  for (int i = 0; i < ROUTE_TABLE_MAX; i++) {
+    if (route_table[i].used && route_table[i].network == network &&
+        route_table[i].mask == mask) {
+      idx = i;
+      break;
+    }
+  }
+
+  if (idx < 0) {
+    for (int i = 0; i < ROUTE_TABLE_MAX; i++) {
+      if (!route_table[i].used) {
+        idx = i;
+        route_table[i].used = 1;
+        route_count++;
+        break;
+      }
+    }
+  }
+
+  if (idx < 0) {
+    return 0;
+  }
+
+  route_table[idx].network = network;
+  route_table[idx].mask = mask;
+  route_table[idx].gateway = gateway;
+  route_table[idx].prefix_len = (uint8_t)prefix_len_from_mask(mask);
+  route_table[idx].metric = metric;
+  return 1;
+}
+
+static void route_table_refresh_defaults(void) {
+  route_table_clear();
+  (void)route_table_set(net_ip & net_mask, net_mask, 0u, 10u);
+  if (net_gw != 0u) {
+    (void)route_table_set(0u, 0u, net_gw, 100u);
+  }
+}
+
+static int route_lookup(uint32_t dst_ip, uint32_t *next_hop) {
+  int best_idx = -1;
+  int best_prefix = -1;
+  uint8_t best_metric = 0xFFu;
+
+  for (int i = 0; i < ROUTE_TABLE_MAX; i++) {
+    if (!route_table[i].used) {
+      continue;
+    }
+    if ((dst_ip & route_table[i].mask) != route_table[i].network) {
+      continue;
+    }
+    if ((int)route_table[i].prefix_len > best_prefix ||
+        ((int)route_table[i].prefix_len == best_prefix &&
+         route_table[i].metric < best_metric)) {
+      best_idx = i;
+      best_prefix = (int)route_table[i].prefix_len;
+      best_metric = route_table[i].metric;
+    }
+  }
+
+  if (best_idx < 0) {
+    return 0;
+  }
+
+  if (next_hop != 0) {
+    uint32_t gw = route_table[best_idx].gateway;
+    *next_hop = (gw != 0u) ? gw : dst_ip;
+  }
+  return 1;
+}
+
+static uint32_t net_route_next_hop(uint32_t dst_ip) {
+  uint32_t next_hop = dst_ip;
+  if (dst_ip == 0u || dst_ip == 0xFFFFFFFFu) {
+    return dst_ip;
+  }
+  if (route_lookup(dst_ip, &next_hop)) {
+    return next_hop;
+  }
+  return dst_ip;
+}
 
 static inline void outb(uint16_t port, uint8_t val) {
   __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
@@ -232,25 +410,9 @@ static inline uint16_t inw(uint16_t port) {
   return ret;
 }
 
-static uint16_t be16(uint16_t v) {
-  return (uint16_t)((v << 8) | (v >> 8));
-}
-
 static uint32_t be32(uint32_t v) {
   return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |
          ((v & 0x00FF0000u) >> 8) | ((v & 0xFF000000u) >> 24);
-}
-
-static uint16_t ipv4_checksum(const uint8_t *hdr, int len) {
-  uint32_t sum = 0;
-  for (int i = 0; i + 1 < len; i += 2) {
-    uint16_t word = (uint16_t)((hdr[i] << 8) | hdr[i + 1]);
-    sum += word;
-  }
-  while (sum >> 16) {
-    sum = (sum & 0xFFFFu) + (sum >> 16);
-  }
-  return (uint16_t)(~sum & 0xFFFFu);
 }
 
 static void mem_copy(uint8_t *dst, const uint8_t *src, uint32_t len) {
@@ -483,7 +645,7 @@ static int tcp_send_segment(uint32_t dst_ip, uint16_t src_port, uint16_t dst_por
                             const uint8_t *payload, uint16_t payload_len) {
   uint8_t frame[1514];
   uint8_t dst_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-  uint32_t arp_target_ip = dst_ip;
+  uint32_t arp_target_ip = net_route_next_hop(dst_ip);
   uint16_t ip_len;
   uint16_t tcp_len;
   uint16_t frame_len;
@@ -496,9 +658,6 @@ static int tcp_send_segment(uint32_t dst_ip, uint16_t src_port, uint16_t dst_por
   }
 
   if (dst_ip != 0xFFFFFFFFu) {
-    if ((dst_ip & net_mask) != (net_ip & net_mask) && net_gw != 0) {
-      arp_target_ip = net_gw;
-    }
     if (!arp_cache_lookup(arp_target_ip, dst_mac)) {
       (void)net_send_arp_request(arp_target_ip);
     }
@@ -649,6 +808,30 @@ static int net_handle_tcp_segment(uint32_t src_ip, uint32_t dst_ip,
     c->state = TCP_STATE_CLOSED;
     c->used = 0;
     return 1;
+  }
+
+  if (c->state == TCP_STATE_CLOSING) {
+    if ((flags & TCP_FLAG_ACK) != 0u && ack >= c->snd_nxt) {
+      c->snd_una = ack;
+      c->waiting_ack = 0;
+      c->state = TCP_STATE_CLOSED;
+      c->used = 0;
+      return 1;
+    }
+    if ((flags & TCP_FLAG_FIN) != 0u) {
+      if (seq == c->rcv_nxt) {
+        c->rcv_nxt++;
+      }
+      (void)tcp_send_segment(c->remote_ip, c->local_port, c->remote_port,
+                             c->snd_nxt, c->rcv_nxt, TCP_FLAG_ACK, 0, 0);
+      if ((flags & TCP_FLAG_ACK) != 0u && ack >= c->snd_nxt) {
+        c->snd_una = ack;
+        c->waiting_ack = 0;
+        c->state = TCP_STATE_CLOSED;
+        c->used = 0;
+      }
+      return 1;
+    }
   }
 
   if (c->state == TCP_STATE_SYN_SENT) {
@@ -825,68 +1008,350 @@ static uint16_t internet_checksum(const uint8_t *data, uint32_t len) {
   return (uint16_t)(~sum & 0xFFFFu);
 }
 
-static int net_send_icmp_echo_reply(const uint8_t dst_mac[6], uint32_t dst_ip,
-                                    const uint8_t *icmp_request, uint16_t icmp_len) {
-  uint8_t frame[1514];
-  uint16_t ip_len;
-  uint16_t frame_len;
-  uint16_t checksum;
-  static uint16_t ipv4_ident = 1;
+static void ipv4_reassembly_gc(void) {
+  for (int i = 0; i < IPV4_REASS_SLOT_MAX; i++) {
+    if (!ipv4_reass[i].used) {
+      continue;
+    }
+    if ((tick - ipv4_reass[i].last_tick) > IPV4_REASS_TIMEOUT_TICKS) {
+      ipv4_reass[i].used = 0;
+    }
+  }
+}
 
-  if (!net_ready || dst_mac == 0 || icmp_request == 0) {
+static int ipv4_reass_present_get(const Ipv4ReassSlot *slot, uint16_t block_idx) {
+  uint16_t byte_idx = (uint16_t)(block_idx >> 3);
+  uint8_t bit = (uint8_t)(1u << (block_idx & 7u));
+  if (slot == 0 || byte_idx >= (uint16_t)sizeof(slot->present)) {
     return 0;
   }
-  if (icmp_len < 8u || icmp_len > 1400u) {
+  return (slot->present[byte_idx] & bit) != 0u;
+}
+
+static void ipv4_reass_present_set(Ipv4ReassSlot *slot, uint16_t block_idx) {
+  uint16_t byte_idx = (uint16_t)(block_idx >> 3);
+  uint8_t bit = (uint8_t)(1u << (block_idx & 7u));
+  if (slot == 0 || byte_idx >= (uint16_t)sizeof(slot->present)) {
+    return;
+  }
+  slot->present[byte_idx] |= bit;
+}
+
+static int ipv4_reassemble_packet(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
+                                  uint16_t ident, uint16_t frag_off_flags,
+                                  const uint8_t *ip_header, uint8_t header_len,
+                                  const uint8_t *payload, uint16_t payload_len,
+                                  uint8_t *out_packet, uint16_t *out_total_len) {
+  uint16_t frag_units = (uint16_t)(frag_off_flags & 0x1FFFu);
+  uint16_t frag_offset = (uint16_t)(frag_units * 8u);
+  int more_frags = (frag_off_flags & 0x2000u) != 0u;
+  int slot_idx = -1;
+  uint32_t oldest_tick = 0xFFFFFFFFu;
+  int oldest_idx = -1;
+  Ipv4ReassSlot *slot;
+
+  if (payload == 0 || ip_header == 0 || out_packet == 0 || out_total_len == 0) {
     return 0;
+  }
+  if (header_len < 20u || header_len > IPV4_MAX_HEADER) {
+    return 0;
+  }
+  if ((uint32_t)frag_offset + (uint32_t)payload_len > IPV4_REASS_MAX_PAYLOAD) {
+    return 0;
+  }
+
+  ipv4_reassembly_gc();
+
+  for (int i = 0; i < IPV4_REASS_SLOT_MAX; i++) {
+    if (!ipv4_reass[i].used) {
+      if (slot_idx < 0) {
+        slot_idx = i;
+      }
+      continue;
+    }
+    if (ipv4_reass[i].src_ip == src_ip && ipv4_reass[i].dst_ip == dst_ip &&
+        ipv4_reass[i].ident == ident && ipv4_reass[i].proto == proto) {
+      slot_idx = i;
+      break;
+    }
+    if (ipv4_reass[i].last_tick < oldest_tick) {
+      oldest_tick = ipv4_reass[i].last_tick;
+      oldest_idx = i;
+    }
+  }
+
+  if (slot_idx < 0) {
+    slot_idx = (oldest_idx >= 0) ? oldest_idx : 0;
+  }
+
+  slot = &ipv4_reass[slot_idx];
+  if (!slot->used || slot->src_ip != src_ip || slot->dst_ip != dst_ip ||
+      slot->ident != ident || slot->proto != proto) {
+    slot->used = 1;
+    slot->src_ip = src_ip;
+    slot->dst_ip = dst_ip;
+    slot->ident = ident;
+    slot->proto = proto;
+    slot->header_len = 0;
+    slot->have_first = 0;
+    slot->total_known = 0;
+    slot->total_payload_len = 0;
+    mem_set(slot->present, 0, (uint32_t)sizeof(slot->present));
+  }
+
+  slot->last_tick = tick;
+
+  if (frag_offset == 0u) {
+    slot->header_len = header_len;
+    slot->have_first = 1;
+    mem_copy(slot->header, ip_header, header_len);
+  }
+
+  if (payload_len > 0u) {
+    mem_copy(&slot->payload[frag_offset], payload, payload_len);
+    {
+      uint16_t first_block = (uint16_t)(frag_offset / 8u);
+      uint16_t last_block = (uint16_t)(((uint32_t)frag_offset + payload_len + 7u) / 8u);
+      for (uint16_t b = first_block; b < last_block; b++) {
+        ipv4_reass_present_set(slot, b);
+      }
+    }
+  }
+
+  if (!more_frags) {
+    slot->total_known = 1;
+    slot->total_payload_len = (uint16_t)(frag_offset + payload_len);
+  }
+
+  if (!slot->have_first || !slot->total_known) {
+    return 0;
+  }
+
+  {
+    uint16_t blocks_needed = (uint16_t)((slot->total_payload_len + 7u) / 8u);
+    for (uint16_t b = 0; b < blocks_needed; b++) {
+      if (!ipv4_reass_present_get(slot, b)) {
+        return 0;
+      }
+    }
+  }
+
+  mem_copy(out_packet, slot->header, slot->header_len);
+  write_be16(&out_packet[2], (uint16_t)(slot->header_len + slot->total_payload_len));
+  write_be16(&out_packet[6], 0u);
+  write_be16(&out_packet[10], 0u);
+  write_be16(&out_packet[10], internet_checksum(out_packet, slot->header_len));
+  if (slot->total_payload_len > 0u) {
+    mem_copy(&out_packet[slot->header_len], slot->payload, slot->total_payload_len);
+  }
+  *out_total_len = (uint16_t)(slot->header_len + slot->total_payload_len);
+  slot->used = 0;
+  return 1;
+}
+
+static int net_send_ipv4_raw(uint32_t dst_ip, uint8_t protocol,
+                             const uint8_t *payload, uint16_t payload_len,
+                             uint8_t ttl, uint16_t ident) {
+  uint8_t dst_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  uint32_t next_hop = net_route_next_hop(dst_ip);
+  uint16_t header_len = 20u;
+  uint16_t mtu_payload = (uint16_t)((IPV4_ETH_MTU - header_len) & ~7u);
+
+  if (!net_ready || payload == 0) {
+    return 0;
+  }
+
+  if (dst_ip != 0xFFFFFFFFu) {
+    if (!arp_cache_lookup(next_hop, dst_mac)) {
+      (void)net_send_arp_request(next_hop);
+    }
+  }
+
+  if ((uint16_t)(header_len + payload_len) <= IPV4_ETH_MTU) {
+    uint8_t frame[1514];
+    uint16_t total_len = (uint16_t)(header_len + payload_len);
+    uint16_t frame_len = (uint16_t)(14u + total_len);
+
+    mem_set(frame, 0, sizeof(frame));
+    mac_copy(&frame[0], dst_mac);
+    mac_copy(&frame[6], rtl_mac);
+    write_be16(&frame[12], ETH_TYPE_IPV4);
+
+    frame[14] = 0x45;
+    frame[15] = 0x00;
+    write_be16(&frame[16], total_len);
+    write_be16(&frame[18], ident);
+    write_be16(&frame[20], 0x0000u);
+    frame[22] = ttl;
+    frame[23] = protocol;
+    write_be16(&frame[24], 0);
+    write_be32(&frame[26], net_ip);
+    write_be32(&frame[30], dst_ip);
+    write_be16(&frame[24], internet_checksum(&frame[14], header_len));
+
+    if (payload_len > 0u) {
+      mem_copy(&frame[34], payload, payload_len);
+    }
+
+    if (frame_len < 60u) {
+      frame_len = 60u;
+    }
+    return rtl8139_send_frame(frame, frame_len);
+  }
+
+  if (mtu_payload == 0u) {
+    return 0;
+  }
+
+  {
+    uint16_t offset = 0;
+    while (offset < payload_len) {
+      uint8_t frame[1514];
+      uint16_t remain = (uint16_t)(payload_len - offset);
+      uint16_t frag_payload = (remain > mtu_payload) ? mtu_payload : remain;
+      uint16_t flags_off;
+      uint16_t total_len;
+      uint16_t frame_len;
+
+      if (frag_payload != remain) {
+        frag_payload &= (uint16_t)~7u;
+      }
+      if (frag_payload == 0u) {
+        return 0;
+      }
+
+      flags_off = (uint16_t)((offset / 8u) & 0x1FFFu);
+      if ((uint16_t)(offset + frag_payload) < payload_len) {
+        flags_off |= 0x2000u;
+      }
+
+      total_len = (uint16_t)(header_len + frag_payload);
+      frame_len = (uint16_t)(14u + total_len);
+
+      mem_set(frame, 0, sizeof(frame));
+      mac_copy(&frame[0], dst_mac);
+      mac_copy(&frame[6], rtl_mac);
+      write_be16(&frame[12], ETH_TYPE_IPV4);
+
+      frame[14] = 0x45;
+      frame[15] = 0x00;
+      write_be16(&frame[16], total_len);
+      write_be16(&frame[18], ident);
+      write_be16(&frame[20], flags_off);
+      frame[22] = ttl;
+      frame[23] = protocol;
+      write_be16(&frame[24], 0);
+      write_be32(&frame[26], net_ip);
+      write_be32(&frame[30], dst_ip);
+      write_be16(&frame[24], internet_checksum(&frame[14], header_len));
+      mem_copy(&frame[34], &payload[offset], frag_payload);
+
+      if (frame_len < 60u) {
+        frame_len = 60u;
+      }
+      if (!rtl8139_send_frame(frame, frame_len)) {
+        return 0;
+      }
+      offset = (uint16_t)(offset + frag_payload);
+    }
+  }
+
+  return 1;
+}
+
+static int net_forward_ipv4_packet(const uint8_t *ip_packet, uint16_t total_len) {
+  uint8_t frame[1514];
+  uint8_t dst_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  uint8_t ihl;
+  uint8_t ttl;
+  uint32_t dst_ip;
+  uint32_t next_hop;
+  uint16_t frame_len;
+
+  if (!net_ready || ip_packet == 0 || total_len < 20u || total_len > IPV4_ETH_MTU) {
+    return 0;
+  }
+
+  ihl = (uint8_t)((ip_packet[0] & 0x0Fu) * 4u);
+  if (ihl < 20u || ihl > total_len) {
+    return 0;
+  }
+
+  ttl = ip_packet[8];
+  if (ttl <= 1u) {
+    return 0;
+  }
+
+  dst_ip = read_be32(&ip_packet[16]);
+  if (!route_lookup(dst_ip, &next_hop)) {
+    return 0;
+  }
+  if (!arp_cache_lookup(next_hop, dst_mac)) {
+    (void)net_send_arp_request(next_hop);
   }
 
   mem_set(frame, 0, sizeof(frame));
   mac_copy(&frame[0], dst_mac);
   mac_copy(&frame[6], rtl_mac);
   write_be16(&frame[12], ETH_TYPE_IPV4);
+  mem_copy(&frame[14], ip_packet, total_len);
+  frame[22] = (uint8_t)(ttl - 1u);
+  write_be16(&frame[24], 0);
+  write_be16(&frame[24], internet_checksum(&frame[14], ihl));
 
-  ip_len = (uint16_t)(20u + icmp_len);
-  frame[14] = 0x45;
-  frame[15] = 0x00;
-  write_be16(&frame[16], ip_len);
-  write_be16(&frame[18], ipv4_ident++);
-  write_be16(&frame[20], 0x0000u);
-  frame[22] = 64;
-  frame[23] = (uint8_t)IP_PROTO_ICMP;
-  write_be16(&frame[24], 0x0000u);
-  write_be32(&frame[26], net_ip);
-  write_be32(&frame[30], dst_ip);
-  checksum = internet_checksum(&frame[14], 20u);
-  write_be16(&frame[24], checksum);
-
-  mem_copy(&frame[34], icmp_request, icmp_len);
-  frame[34] = ICMP_TYPE_ECHO_REPLY;
-  frame[35] = 0x00;
-  write_be16(&frame[36], 0x0000u);
-  checksum = internet_checksum(&frame[34], icmp_len);
-  write_be16(&frame[36], checksum);
-
-  frame_len = (uint16_t)(14u + ip_len);
+  frame_len = (uint16_t)(14u + total_len);
   if (frame_len < 60u) {
     frame_len = 60u;
   }
   return rtl8139_send_frame(frame, frame_len);
 }
 
+static int net_send_icmp_echo_reply(const uint8_t dst_mac[6], uint32_t dst_ip,
+                                    const uint8_t *icmp_request, uint16_t icmp_len) {
+  uint8_t icmp[IPV4_REASS_MAX_PAYLOAD];
+  uint16_t checksum;
+
+  (void)dst_mac;
+
+  if (!net_ready || icmp_request == 0) {
+    return 0;
+  }
+  if (icmp_len < 8u || icmp_len > IPV4_REASS_MAX_PAYLOAD) {
+    return 0;
+  }
+
+  mem_copy(icmp, icmp_request, icmp_len);
+  icmp[0] = ICMP_TYPE_ECHO_REPLY;
+  icmp[1] = 0x00;
+  write_be16(&icmp[2], 0x0000u);
+  checksum = internet_checksum(icmp, icmp_len);
+  write_be16(&icmp[2], checksum);
+
+  return net_send_ipv4_raw(dst_ip, (uint8_t)IP_PROTO_ICMP, icmp, icmp_len,
+                           64u, ipv4_tx_ident++);
+}
+
 static int net_handle_ipv4_frame(const uint8_t *frame, uint16_t len) {
   uint8_t version_ihl;
   uint16_t header_len;
   uint16_t total_len;
+  uint16_t ident;
+  uint16_t frag_off_flags;
   uint32_t src_ip;
   uint32_t dst_ip;
   uint8_t protocol;
   const uint8_t *src_mac;
   const uint8_t *payload;
+  uint8_t assembled[IPV4_MAX_HEADER + IPV4_REASS_MAX_PAYLOAD];
+  uint16_t assembled_len = 0;
+  const uint8_t *ip = &frame[14];
 
   if (frame == 0 || len < 34u) {
     net_rx_stats.dropped_frames++;
     return 0;
   }
+
+  ipv4_reassembly_gc();
 
   version_ihl = frame[14];
   if ((version_ihl >> 4) != 4u) {
@@ -913,8 +1378,35 @@ static int net_handle_ipv4_frame(const uint8_t *frame, uint16_t len) {
   protocol = frame[23];
   src_ip = read_be32(&frame[26]);
   dst_ip = read_be32(&frame[30]);
+  ident = read_be16(&frame[18]);
+  frag_off_flags = read_be16(&frame[20]);
   src_mac = &frame[6];
   arp_cache_update(src_ip, src_mac);
+
+  if (dst_ip != net_ip && dst_ip != 0xFFFFFFFFu) {
+    return net_forward_ipv4_packet(&frame[14], total_len);
+  }
+
+  if ((frag_off_flags & 0x3FFFu) != 0u) {
+    if (!ipv4_reassemble_packet(src_ip, dst_ip, protocol, ident, frag_off_flags,
+                                &frame[14], (uint8_t)header_len,
+                                &frame[14u + header_len],
+                                (uint16_t)(total_len - header_len),
+                                assembled, &assembled_len)) {
+      return 1;
+    }
+
+    ip = assembled;
+    version_ihl = ip[0];
+    header_len = (uint16_t)((version_ihl & 0x0Fu) * 4u);
+    if (assembled_len < header_len) {
+      return 0;
+    }
+    total_len = assembled_len;
+    protocol = ip[9];
+    src_ip = read_be32(&ip[12]);
+    dst_ip = read_be32(&ip[16]);
+  }
 
   if (dst_ip != net_ip && dst_ip != 0xFFFFFFFFu) {
     return 1;
@@ -926,7 +1418,7 @@ static int net_handle_ipv4_frame(const uint8_t *frame, uint16_t len) {
       return 0;
     }
 
-    payload = &frame[14u + header_len];
+    payload = &ip[header_len];
     if (payload[0] == ICMP_TYPE_ECHO_REQUEST && payload[1] == 0x00) {
       return net_send_icmp_echo_reply(src_mac, src_ip, payload, icmp_len);
     }
@@ -935,14 +1427,14 @@ static int net_handle_ipv4_frame(const uint8_t *frame, uint16_t len) {
     if (udp_len < 8u) {
       return 0;
     }
-    payload = &frame[14u + header_len];
+    payload = &ip[header_len];
     return net_handle_udp_datagram(src_ip, dst_ip, payload, udp_len);
   } else if (protocol == IP_PROTO_TCP) {
     uint16_t tcp_len = (uint16_t)(total_len - header_len);
     if (tcp_len < 20u) {
       return 0;
     }
-    payload = &frame[14u + header_len];
+    payload = &ip[header_len];
     return net_handle_tcp_segment(src_ip, dst_ip, payload, tcp_len);
   }
 
@@ -993,6 +1485,7 @@ static int net_handle_eth_frame(const uint8_t *frame, uint16_t len) {
     return 0;
   }
 
+  net_rx_stats.total_bytes += len;
   ethertype = read_be16(&frame[12]);
   net_count_ethertype(ethertype);
   if (ethertype == ETH_TYPE_IPV4) {
@@ -1084,7 +1577,8 @@ static int rtl8139_hw_init(uint32_t iobase) {
   outl((uint16_t)(iobase + RTL_REG_RBSTART), (uint32_t)rtl_rx_buffer);
   rtl_rx_offset = 0;
   outw((uint16_t)(iobase + RTL_REG_CAPR), 0xFFF0u);
-  outw((uint16_t)(iobase + RTL_REG_IMR), 0x0000);
+  outw((uint16_t)(iobase + RTL_REG_IMR), RTL_INT_MASK);
+  outw((uint16_t)(iobase + RTL_REG_ISR), 0xFFFFu);
   outl((uint16_t)(iobase + RTL_REG_RCR),
        RTL_RCR_AAP | RTL_RCR_APM | RTL_RCR_AM | RTL_RCR_AB);
 
@@ -1097,7 +1591,7 @@ static int rtl8139_hw_init(uint32_t iobase) {
   return 1;
 }
 
-int net_rx_poll(void) {
+static int net_rx_poll_budget(uint32_t max_packets) {
   uint32_t guard = 0;
   int processed = 0;
 
@@ -1105,13 +1599,13 @@ int net_rx_poll(void) {
     return 0;
   }
 
-  while (guard < 32u) {
+  while (guard < max_packets) {
     uint32_t hw_offset = (uint32_t)inw((uint16_t)(rtl_iobase + RTL_REG_CBR)) & RTL_RX_BUFFER_MASK;
     uint8_t hdr[4];
     uint16_t status;
     uint16_t pkt_len;
     uint32_t frame_len;
-    uint8_t frame[1600];
+    uint8_t frame[2048];
 
     if (rtl_rx_offset == hw_offset) {
       break;
@@ -1137,6 +1631,34 @@ int net_rx_poll(void) {
     outw((uint16_t)(rtl_iobase + RTL_REG_CAPR), (uint16_t)((rtl_rx_offset - 0x10u) & 0xFFFFu));
     processed++;
     guard++;
+  }
+
+  return processed;
+}
+
+int net_rx_poll(void) {
+  return net_rx_poll_budget(32u);
+}
+
+int net_irq_handler(void) {
+  uint16_t isr;
+  int processed = 0;
+
+  if (!net_ready || rtl_iobase == 0) {
+    return 0;
+  }
+
+  isr = inw((uint16_t)(rtl_iobase + RTL_REG_ISR));
+  if ((isr & RTL_INT_MASK) == 0u) {
+    return 0;
+  }
+  net_rx_stats.irq_count++;
+
+  outw((uint16_t)(rtl_iobase + RTL_REG_ISR), isr);
+
+  if ((isr & (RTL_INT_RX_OK | RTL_INT_RX_ERR | RTL_INT_RX_OVW)) != 0u) {
+    net_rx_stats.irq_rx_events++;
+    processed = net_rx_poll_budget(96u);
   }
 
   return processed;
@@ -1174,67 +1696,27 @@ static int rtl8139_send_frame(const uint8_t *frame, uint32_t len) {
 
 static int net_send_udp(uint32_t dst_ip, uint16_t src_port, uint16_t dst_port,
                         const uint8_t *payload, uint16_t payload_len) {
-  uint8_t frame[1514];
-  uint8_t dst_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-  uint32_t arp_target_ip = dst_ip;
-  uint16_t ip_len;
+  uint8_t udp_packet[IPV4_REASS_MAX_PAYLOAD + 8u];
   uint16_t udp_len;
-  uint16_t frame_len;
-  uint16_t csum;
 
   if (!net_ready || payload == 0) {
     return 0;
   }
-  if (payload_len > 1400) {
+  if ((uint32_t)payload_len > IPV4_REASS_MAX_PAYLOAD) {
     return 0;
   }
 
-  if (dst_ip != 0xFFFFFFFFu) {
-    if ((dst_ip & net_mask) != (net_ip & net_mask) && net_gw != 0) {
-      arp_target_ip = net_gw;
-    }
-    if (!arp_cache_lookup(arp_target_ip, dst_mac)) {
-      (void)net_send_arp_request(arp_target_ip);
-    }
-  }
-
-  mem_set(frame, 0, sizeof(frame));
-
-  for (int i = 0; i < 6; i++) {
-    frame[i] = dst_mac[i];
-    frame[6 + i] = rtl_mac[i];
-  }
-  write_be16(&frame[12], ETH_TYPE_IPV4);
-
-  ip_len = (uint16_t)(20 + 8 + payload_len);
   udp_len = (uint16_t)(8 + payload_len);
-
-  frame[14] = 0x45;
-  frame[15] = 0x00;
-  *((uint16_t *)&frame[16]) = be16(ip_len);
-  *((uint16_t *)&frame[18]) = be16((uint16_t)(remote_seq & 0xFFFFu));
-  *((uint16_t *)&frame[20]) = 0x0000;
-  frame[22] = 64;
-  frame[23] = 17;
-  *((uint16_t *)&frame[24]) = 0;
-  *((uint32_t *)&frame[26]) = be32(net_ip);
-  *((uint32_t *)&frame[30]) = be32(dst_ip);
-
-  csum = ipv4_checksum(&frame[14], 20);
-  *((uint16_t *)&frame[24]) = be16(csum);
-
-  *((uint16_t *)&frame[34]) = be16(src_port);
-  *((uint16_t *)&frame[36]) = be16(dst_port);
-  *((uint16_t *)&frame[38]) = be16(udp_len);
-  *((uint16_t *)&frame[40]) = 0;
-
-  mem_copy(&frame[42], payload, payload_len);
-
-  frame_len = (uint16_t)(14 + ip_len);
-  if (frame_len < 60) {
-    frame_len = 60;
+  write_be16(&udp_packet[0], src_port);
+  write_be16(&udp_packet[2], dst_port);
+  write_be16(&udp_packet[4], udp_len);
+  write_be16(&udp_packet[6], 0u);
+  if (payload_len > 0u) {
+    mem_copy(&udp_packet[8], payload, payload_len);
   }
-  return rtl8139_send_frame(frame, frame_len);
+
+  return net_send_ipv4_raw(dst_ip, (uint8_t)IP_PROTO_UDP, udp_packet, udp_len,
+                           64u, ipv4_tx_ident++);
 }
 
 static int remote_send_payload(uint8_t type, const uint8_t *data, uint16_t len,
@@ -1375,11 +1857,21 @@ int net_init(void) {
   rtl8139_enable_busmaster(net_idx);
   rtl_rx_offset = 0;
   net_rx_stats.total_frames = 0;
+  net_rx_stats.total_bytes = 0;
   net_rx_stats.ipv4_frames = 0;
   net_rx_stats.arp_frames = 0;
   net_rx_stats.neuro_frames = 0;
   net_rx_stats.unknown_frames = 0;
   net_rx_stats.dropped_frames = 0;
+  net_rx_stats.irq_count = 0;
+  net_rx_stats.irq_rx_events = 0;
+  net_rx_stats.tx_probe_ok = 0;
+  net_rx_stats.tx_probe_fail = 0;
+  route_table_refresh_defaults();
+  ipv4_tx_ident = 1u;
+  for (int i = 0; i < IPV4_REASS_SLOT_MAX; i++) {
+    ipv4_reass[i].used = 0;
+  }
   for (int i = 0; i < UDP_MAX_BINDINGS; i++) {
     udp_bindings[i].used = 0;
     udp_bindings[i].port = 0;
@@ -1444,6 +1936,35 @@ void net_get_mac(uint8_t out[6]) {
     out[i] = rtl_mac[i];
 }
 
+int net_set_mac(const uint8_t mac[6]) {
+  if (mac == 0 || !net_ready) {
+    return 0;
+  }
+  for (int i = 0; i < 6; i++) {
+    rtl_mac[i] = mac[i];
+    outb((uint16_t)(rtl_iobase + RTL_REG_IDR0 + i), mac[i]);
+  }
+  return 1;
+}
+
+int net_link_speed_mbps(void) {
+  uint8_t msr;
+
+  if (!net_ready) {
+    return 0;
+  }
+
+  msr = inb((uint16_t)(rtl_iobase + RTL_REG_MSR));
+  if ((msr & RTL_MSR_SPEED_10) != 0u) {
+    return 10;
+  }
+  return 100;
+}
+
+uint16_t net_mtu_bytes(void) { return 1500u; }
+
+int net_supports_jumbo(void) { return 0; }
+
 int net_set_ipv4(uint32_t ip, uint32_t mask, uint32_t gw) {
   if (ip == 0 || mask == 0) {
     return 0;
@@ -1451,6 +1972,7 @@ int net_set_ipv4(uint32_t ip, uint32_t mask, uint32_t gw) {
   net_ip = ip;
   net_mask = mask;
   net_gw = gw;
+  route_table_refresh_defaults();
   return 1;
 }
 
@@ -1709,8 +2231,16 @@ int net_tcp_close(int conn_id) {
   if (!c->used) {
     return 0;
   }
-  if (!c->listening && (c->state == TCP_STATE_ESTABLISHED || c->state == TCP_STATE_CLOSE_WAIT)) {
-    (void)tcp_send_and_track(c, TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0);
+  if (c->listening) {
+    c->used = 0;
+    c->state = TCP_STATE_CLOSED;
+    return 1;
+  }
+  if (c->state == TCP_STATE_ESTABLISHED || c->state == TCP_STATE_CLOSE_WAIT) {
+    if (tcp_send_and_track(c, TCP_FLAG_FIN | TCP_FLAG_ACK, 0, 0)) {
+      c->state = TCP_STATE_CLOSING;
+      return 1;
+    }
   }
   c->used = 0;
   c->state = TCP_STATE_CLOSED;
@@ -1744,9 +2274,12 @@ void net_get_ipv4(uint32_t *ip, uint32_t *mask, uint32_t *gw) {
 
 int net_send_probe(void) {
   uint8_t p[24];
+  int sent;
 
-  if (!net_ready)
+  if (!net_ready) {
+    net_rx_stats.tx_probe_fail++;
     return 0;
+  }
 
   p[0] = 'N';
   p[1] = 'S';
@@ -1761,7 +2294,13 @@ int net_send_probe(void) {
   *((uint32_t *)&p[16]) = be32(net_gw);
   *((uint32_t *)&p[20]) = be32(remote_session);
 
-  return net_send_udp(0xFFFFFFFFu, UDP_CTRL_PORT, UDP_CTRL_PORT, p, sizeof(p));
+  sent = net_send_udp(0xFFFFFFFFu, UDP_CTRL_PORT, UDP_CTRL_PORT, p, sizeof(p));
+  if (sent) {
+    net_rx_stats.tx_probe_ok++;
+  } else {
+    net_rx_stats.tx_probe_fail++;
+  }
+  return sent;
 }
 
 int net_export_snapshot(int slot) {

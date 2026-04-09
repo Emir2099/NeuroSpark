@@ -26,6 +26,7 @@
 
 #define ATA_CMD_IDENTIFY 0xEC
 #define ATA_CMD_READ_DMA_EXT 0x25
+#define ATA_CMD_WRITE_DMA_EXT 0x35
 
 #define ATA_TFD_BSY 0x80
 #define ATA_TFD_DRQ 0x08
@@ -491,6 +492,9 @@ int ahci_identify_port(uint8_t port_no, AhciIdentifyInfo *out_info) {
   out_info->lba48_sectors_high =
       (uint32_t)g_identify_buf[102] | ((uint32_t)g_identify_buf[103] << 16);
 
+  out_info->smart_supported = (uint8_t)((g_identify_buf[82] & 0x0001U) != 0U);
+  out_info->smart_enabled = (uint8_t)((g_identify_buf[85] & 0x0001U) != 0U);
+
   ata_string_from_words(g_identify_buf, 10, 10, out_info->serial,
                         (int)sizeof(out_info->serial));
   ata_string_from_words(g_identify_buf, 23, 4, out_info->firmware,
@@ -639,6 +643,126 @@ int ahci_read_first_ready_sector(uint32_t lba, uint8_t *out_port,
       *out_port = port;
     }
     return ahci_read_sector(port, lba, out_sector);
+  }
+
+  return AHCI_READ_ERR_NO_READY_PORT;
+}
+
+int ahci_write_sector(uint8_t port_no, uint32_t lba, const uint16_t *in_sector) {
+  HbaCmdHeader *hdr;
+  FisRegH2D *fis;
+
+  if (in_sector == 0) {
+    return AHCI_READ_ERR_NO_READY_PORT;
+  }
+
+  if (!ahci_select_controller() || port_no >= AHCI_MAX_PORTS) {
+    return AHCI_READ_ERR_NO_CONTROLLER;
+  }
+  if ((g_pi_mask & (1U << port_no)) == 0) {
+    return AHCI_READ_ERR_NO_READY_PORT;
+  }
+
+  {
+    AhciPortReport pr;
+    ahci_fill_port_report(port_no, &pr);
+    if (!pr.ready || !pr.sata) {
+      return AHCI_READ_ERR_NO_READY_PORT;
+    }
+  }
+
+  if (!ahci_prepare_io_structures(port_no)) {
+    return AHCI_READ_ERR_TIMEOUT;
+  }
+
+  copy_words(g_read_buf, in_sector, 256U);
+
+  hdr = &g_cmd_list[0];
+  hdr->cfl = (uint8_t)(sizeof(FisRegH2D) / sizeof(uint32_t));
+  hdr->pm_flags = (1U << 6); /* Write */
+  hdr->prdtl = 1;
+  hdr->prdbc = 0;
+  hdr->ctba = (uint32_t)&g_cmd_table;
+  hdr->ctbau = 0;
+
+  g_cmd_table.prdt[0].dba = (uint32_t)g_read_buf;
+  g_cmd_table.prdt[0].dbau = 0;
+  g_cmd_table.prdt[0].reserved = 0;
+  g_cmd_table.prdt[0].dbc_i = 511U;
+
+  fis = (FisRegH2D *)&g_cmd_table.cfis[0];
+  zero_bytes(fis, (uint32_t)sizeof(FisRegH2D));
+  fis->fis_type = FIS_TYPE_REG_H2D;
+  fis->pmport_c = (1U << 7);
+  fis->command = ATA_CMD_WRITE_DMA_EXT;
+  fis->device = 0x40;
+  fis->lba0 = (uint8_t)(lba & 0xFFU);
+  fis->lba1 = (uint8_t)((lba >> 8) & 0xFFU);
+  fis->lba2 = (uint8_t)((lba >> 16) & 0xFFU);
+  fis->lba3 = (uint8_t)((lba >> 24) & 0xFFU);
+  fis->lba4 = 0;
+  fis->lba5 = 0;
+  fis->countl = 1;
+  fis->counth = 0;
+
+  {
+    uint32_t timeout = 500000U;
+    while (timeout--) {
+      uint32_t tfd = g_abar[ahci_port_reg_index(port_no, 0x20U)];
+      if ((tfd & (ATA_TFD_BSY | ATA_TFD_DRQ)) == 0) {
+        break;
+      }
+    }
+    if (timeout == 0) {
+      return AHCI_READ_ERR_TIMEOUT;
+    }
+  }
+
+  g_abar[ahci_port_reg_index(port_no, 0x10U)] = 0xFFFFFFFFU;
+  g_abar[ahci_port_reg_index(port_no, 0x30U)] = 0xFFFFFFFFU;
+  g_abar[ahci_port_reg_index(port_no, 0x38U)] = 1U;
+
+  {
+    uint32_t timeout = 1000000U;
+    while (timeout--) {
+      uint32_t ci = g_abar[ahci_port_reg_index(port_no, 0x38U)];
+      uint32_t is = g_abar[ahci_port_reg_index(port_no, 0x10U)];
+      if ((is & HBA_PxIS_TFES) != 0) {
+        return AHCI_READ_ERR_TFES;
+      }
+      if ((ci & 1U) == 0) {
+        break;
+      }
+    }
+    if (timeout == 0) {
+      return AHCI_READ_ERR_TIMEOUT;
+    }
+  }
+
+  return AHCI_READ_OK;
+}
+
+int ahci_write_first_ready_sector(uint32_t lba, uint8_t *out_port,
+                                  const uint16_t *in_sector) {
+  AhciProbeReport report;
+
+  if (in_sector == 0) {
+    return AHCI_READ_ERR_NO_READY_PORT;
+  }
+
+  if (!ahci_probe_and_enumerate(&report)) {
+    return AHCI_READ_ERR_NO_CONTROLLER;
+  }
+
+  for (uint8_t port = 0; port < AHCI_MAX_PORTS; port++) {
+    if (!report.ports[port].implemented || !report.ports[port].ready ||
+        !report.ports[port].sata) {
+      continue;
+    }
+    if (out_port != 0) {
+      *out_port = port;
+    }
+    return ahci_write_sector(port, lba, in_sector);
   }
 
   return AHCI_READ_ERR_NO_READY_PORT;

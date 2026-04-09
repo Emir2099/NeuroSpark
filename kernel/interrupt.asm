@@ -44,6 +44,21 @@ mouse_wrapper:
     popa
     iretd
 
+global rtl8139_wrapper
+extern net_irq_handler
+
+rtl8139_wrapper:
+    pusha
+    call net_irq_handler
+
+    ; IRQ11 comes from slave PIC: EOI slave first, then master
+    mov al, 0x20
+    out 0xA0, al
+    out 0x20, al
+
+    popa
+    iretd
+
 extern schedule ; Defined in task.c
 
 irq0_handler:

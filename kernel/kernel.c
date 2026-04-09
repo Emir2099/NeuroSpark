@@ -7,6 +7,7 @@ typedef unsigned int uint32_t;
 extern void timer_wrapper(void);
 extern void keyboard_wrapper(void);
 extern void mouse_wrapper(void);
+extern void rtl8139_wrapper(void);
 
 // External PMM functions
 extern void init_pmm();
@@ -585,15 +586,16 @@ void init_idt() {
   /* Now mask (disable) only the IRQs we don't want,
    * keeping IRQ0(timer), IRQ1(keyboard), IRQ2(cascade) unmasked.
    * Master PIC (0x21): IRQ0, IRQ1, IRQ2 enabled = 11111000 = 0xF8
-   * Slave PIC (0xA1): IRQ12 (mouse) enabled = 11101111 = 0xEF
+   * Slave PIC (0xA1): IRQ11 (NIC) + IRQ12 (mouse) enabled = 11100111 = 0xE7
    */
   outb(0x21, 0xF8);
-  outb(0xA1, 0xEF);
+  outb(0xA1, 0xE7);
 
   /* Register our timer wrapper (IRQ0 -> Index 32) */
   set_idt_gate(32, (uint32_t)timer_wrapper, 0x08, 0x8E);
 
   set_idt_gate(33, (uint32_t)keyboard_wrapper, 0x08, 0x8E); // Keyboard
+  set_idt_gate(43, (uint32_t)rtl8139_wrapper, 0x08, 0x8E);  // RTL8139 IRQ11
   set_idt_gate(44, (uint32_t)mouse_wrapper, 0x08, 0x8E);    // Mouse IRQ12
 
   /* Load the IDT into the CPU and enable interrupts */

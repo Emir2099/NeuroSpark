@@ -8,6 +8,7 @@ typedef unsigned char uint8_t;
 #include "scheduler.h"
 #include "vfs.h"
 #include "net.h"
+#include "disk.h"
 
 extern int is_user_range(const void *ptr, uint32_t size);
 
@@ -142,6 +143,16 @@ enum {
 
 #define PROT_WRITE 0x2
 
+#define NS_IOCTL_DISK_GET_GEOMETRY 0x1001
+#define NS_IOCTL_DISK_GET_HEALTH 0x1002
+#define NS_IOCTL_DISK_SET_BACKEND 0x1003
+#define NS_IOCTL_DISK_GET_BACKEND 0x1004
+#define NS_IOCTL_DISK_RESET_IO_STATS 0x1005
+#define NS_IOCTL_DISK_GET_IO_STATS 0x1006
+
+#define NS_IOCTL_NIC_GET_INFO 0x2001
+#define NS_IOCTL_NIC_SET_MAC 0x2002
+
 #define NS_BOOT_EPOCH_SECONDS 1767225600u /* 2026-01-01T00:00:00Z */
 #define NS_TICKS_PER_SECOND 100u
 #define NS_NSEC_PER_SEC 1000000000u
@@ -216,6 +227,44 @@ typedef struct {
   uint32_t ru_maxrss;
   uint32_t ru_nvcsw;
 } NsRusage;
+
+typedef struct {
+  uint32_t total_sectors_low;
+  uint32_t total_sectors_high;
+  uint32_t sector_size;
+  uint32_t backend;
+  char model[41];
+} NsDiskGeometry;
+
+typedef struct {
+  uint32_t available;
+  uint32_t backend;
+  uint32_t preferred_backend;
+  uint32_t ahci_ready_ports;
+  uint32_t smart_supported;
+  uint32_t smart_enabled;
+  uint32_t temperature_c;
+  uint32_t life_percent;
+  uint32_t read_error_count;
+  uint32_t write_error_count;
+  uint32_t last_error_code;
+} NsDiskHealth;
+
+typedef struct {
+  uint32_t uncached_reads;
+  uint32_t uncached_writes;
+  uint32_t cached_reads;
+  uint32_t cached_writes;
+} NsDiskIoStats;
+
+typedef struct {
+  uint32_t ready;
+  uint32_t nic_index;
+  uint32_t io_base;
+  uint32_t link_mbps;
+  uint8_t mac[6];
+  char driver[16];
+} NsNicInfo;
 
 typedef struct {
   char sysname[32];
@@ -1378,7 +1427,146 @@ void syscall_handler(uint32_t *regs) {
     break;
   }
 
-  case SYS_IOCTL:
+  case SYS_IOCTL: {
+    int fd = (int)regs[4];
+    int cmd = (int)regs[5];
+    uint32_t arg = regs[6];
+    (void)fd;
+
+    if (cmd == NS_IOCTL_DISK_GET_GEOMETRY) {
+      NsDiskGeometry *out = (NsDiskGeometry *)arg;
+      DiskGeometryInfo info;
+
+      if (out == 0) {
+        syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+        break;
+      }
+      if (cpl == 3 && !validate_user_ptr(out, sizeof(NsDiskGeometry))) {
+        syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+        break;
+      }
+
+      (void)disk_get_geometry(&info);
+      out->total_sectors_low = info.total_sectors_low;
+      out->total_sectors_high = info.total_sectors_high;
+      out->sector_size = info.sector_size;
+      out->backend = info.backend;
+      copy_text32(out->model, sizeof(out->model), info.model);
+      syscall_complete(regs, syscall_num, NS_OK);
+      break;
+    }
+
+    if (cmd == NS_IOCTL_DISK_GET_HEALTH) {
+      NsDiskHealth *out = (NsDiskHealth *)arg;
+      DiskHealthInfo info;
+
+      if (out == 0) {
+        syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+        break;
+      }
+      if (cpl == 3 && !validate_user_ptr(out, sizeof(NsDiskHealth))) {
+        syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+        break;
+      }
+
+      (void)disk_get_health(&info);
+      out->available = info.available;
+      out->backend = info.backend;
+      out->preferred_backend = info.preferred_backend;
+      out->ahci_ready_ports = info.ahci_ready_ports;
+      out->smart_supported = info.smart_supported;
+      out->smart_enabled = info.smart_enabled;
+      out->temperature_c = info.temperature_c;
+      out->life_percent = info.life_percent;
+      out->read_error_count = info.read_error_count;
+      out->write_error_count = info.write_error_count;
+      out->last_error_code = info.last_error_code;
+      syscall_complete(regs, syscall_num, NS_OK);
+      break;
+    }
+
+    if (cmd == NS_IOCTL_DISK_SET_BACKEND) {
+      uint8_t backend = (uint8_t)arg;
+      disk_set_preferred_backend(backend);
+      syscall_complete(regs, syscall_num, NS_OK);
+      break;
+    }
+
+    if (cmd == NS_IOCTL_DISK_GET_BACKEND) {
+      syscall_complete(regs, syscall_num, (uint32_t)disk_get_preferred_backend());
+      break;
+    }
+
+    if (cmd == NS_IOCTL_DISK_RESET_IO_STATS) {
+      disk_reset_io_stats();
+      syscall_complete(regs, syscall_num, NS_OK);
+      break;
+    }
+
+    if (cmd == NS_IOCTL_DISK_GET_IO_STATS) {
+      NsDiskIoStats *out = (NsDiskIoStats *)arg;
+      DiskIoStats info;
+
+      if (out == 0) {
+        syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+        break;
+      }
+      if (cpl == 3 && !validate_user_ptr(out, sizeof(NsDiskIoStats))) {
+        syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+        break;
+      }
+
+      disk_get_io_stats(&info);
+      out->uncached_reads = info.uncached_reads;
+      out->uncached_writes = info.uncached_writes;
+      out->cached_reads = info.cached_reads;
+      out->cached_writes = info.cached_writes;
+      syscall_complete(regs, syscall_num, NS_OK);
+      break;
+    }
+
+    if (cmd == NS_IOCTL_NIC_GET_INFO) {
+      NsNicInfo *out = (NsNicInfo *)arg;
+
+      if (out == 0) {
+        syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+        break;
+      }
+      if (cpl == 3 && !validate_user_ptr(out, sizeof(NsNicInfo))) {
+        syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+        break;
+      }
+
+      out->ready = net_is_ready() ? 1u : 0u;
+      out->nic_index = (uint32_t)net_nic_index();
+      out->io_base = net_nic_io_base();
+      out->link_mbps = (uint32_t)net_link_speed_mbps();
+      net_get_mac(out->mac);
+      copy_text32(out->driver, sizeof(out->driver), net_driver_name());
+      syscall_complete(regs, syscall_num, NS_OK);
+      break;
+    }
+
+    if (cmd == NS_IOCTL_NIC_SET_MAC) {
+      uint8_t *mac = (uint8_t *)arg;
+
+      if (mac == 0) {
+        syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+        break;
+      }
+      if (cpl == 3 && !validate_user_ptr(mac, 6)) {
+        syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+        break;
+      }
+      syscall_complete(regs, syscall_num,
+                       net_set_mac(mac) ? NS_OK : NS_ERR_INVALID_SYSCALL);
+      break;
+    }
+
+    syscall_complete(regs, syscall_num, NS_ERR_NOT_IMPLEMENTED);
+    break;
+  }
+
   case SYS_TIMER_CREATE:
     syscall_complete(regs, syscall_num, NS_ERR_NOT_IMPLEMENTED);
     break;

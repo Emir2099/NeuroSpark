@@ -53,8 +53,13 @@ typedef struct {
 extern volatile int current_shell_row;
 extern volatile char input_buffer[32];
 extern volatile int buffer_idx;
+extern volatile int mouse_x;
+extern volatile int mouse_y;
+extern volatile int mouse_buttons;
 extern int zoom_level;
 extern int zoom_offset;
+extern uint32_t tick;
+extern uint32_t render_frame;
 extern int potentials[16];
 extern TaskControlBlock task_list[2];
 extern NeuralPixel os_memory_map[2];
@@ -511,7 +516,7 @@ void list_files_gfx(void) { list_files(); }
 
 static void cmd_help(const char *args) {
   (void)args;
-  gprint("commands: help save load ls stat mount umount pcache clear delete eval stim mall free map\n", 0xFFFFFF);
+  gprint("commands: help save load ls stat mount umount pcache diag clear delete eval stim mall free map\n", 0xFFFFFF);
     gprint("          tsave tload pci pci bar ahci [show|backend|reset|identify|read|smoke]\n", 0xFFFFFF);
     gprint("          exec <path> mkdemo net up|cfg|status|tx|export|profile|manifest remote ...\n", 0xFFFFFF);
   gprint("phase8:   manifest save|load|show  replay rec on|off|run|show|clear\n", 0x88E0FF);
@@ -1353,6 +1358,7 @@ static void cmd_net(const char *args) {
   char a[24];
   char b[24];
   char c[24];
+  NetRxStats rx;
   uint32_t ip = 0, mask = 0, gw = 0;
   args = next_token(args, sub, sizeof(sub));
   args = next_token(args, a, sizeof(a));
@@ -1383,7 +1389,12 @@ static void cmd_net(const char *args) {
 
   if (sub[0] == '\0' || str_eq(sub, "status")) {
     uint8_t mac[6];
+    int link_mbps;
+    uint16_t mtu = net_mtu_bytes();
+    int jumbo = net_supports_jumbo();
+    net_get_rx_stats(&rx);
     net_get_ipv4(&ip, &mask, &gw);
+    link_mbps = net_link_speed_mbps();
     gprint("NET: ", 0x99EEFF);
     gprint(net_is_ready() ? "ONLINE" : "OFFLINE", net_is_ready() ? 0x44FF88 : 0xFF5555);
     gprint(" DRV:", 0x99EEFF);
@@ -1418,6 +1429,36 @@ static void cmd_net(const char *args) {
       }
       gprint("\n", 0x000000);
     }
+
+    gprint("LINK:", 0x99EEFF);
+    gprint_dec(link_mbps, 0xFFFFFF);
+    gprint("Mbps MTU:", 0x99EEFF);
+    gprint_dec((int)mtu, 0xFFFFFF);
+    gprint(" JUMBO:", 0x99EEFF);
+    gprint(jumbo ? "YES" : "NO", jumbo ? 0x77FFAA : 0xFFAA66);
+    gprint("Mbps RX:", 0x99EEFF);
+    gprint_dec((int)rx.total_frames, 0xFFFFFF);
+    gprint(" frames ", 0x99EEFF);
+    gprint_dec((int)rx.total_bytes, 0xFFFFFF);
+    gprint(" bytes DROP:", 0x99EEFF);
+    gprint_dec((int)rx.dropped_frames, 0xFFAA66);
+    gprint(" IRQ:", 0x99EEFF);
+    gprint_dec((int)rx.irq_count, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("RX types IPv4/ARP/NEURO/UNK ", 0x99EEFF);
+    gprint_dec((int)rx.ipv4_frames, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)rx.arp_frames, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)rx.neuro_frames, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)rx.unknown_frames, 0xFFFFFF);
+    gprint(" PROBE OK/FAIL ", 0x99EEFF);
+    gprint_dec((int)rx.tx_probe_ok, 0x77FFAA);
+    gprint("/", 0x666666);
+    gprint_dec((int)rx.tx_probe_fail, 0xFFAA66);
+    gprint("\n", 0x000000);
     return;
   }
 
@@ -1464,6 +1505,219 @@ static void cmd_net(const char *args) {
   }
 
   set_cmd_output("USAGE: net up|cfg|status|tx|export <slot>|manifest|profile");
+}
+
+static void cmd_diag(const char *args) {
+  char sub[16];
+  char a[16];
+  uint32_t wm_frames = 0;
+  uint32_t fps_x10 = 0;
+  NetRxStats before;
+  NetRxStats after;
+  int loops = 128;
+
+  args = next_token(args, sub, sizeof(sub));
+  next_token(args, a, sizeof(a));
+
+  if (sub[0] == '\0' || str_eq(sub, "show")) {
+    net_get_rx_stats(&after);
+    wm_get_runtime_metrics(&wm_frames, &fps_x10);
+
+    gprint("DISPLAY FR(task/wm): ", 0x99EEFF);
+    gprint_dec((int)render_frame, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)wm_frames, 0xFFFFFF);
+    gprint(" FPS:", 0x99EEFF);
+    gprint_dec((int)(fps_x10 / 10u), 0x77FFAA);
+    gprint(".", 0x666666);
+    gprint_dec((int)(fps_x10 % 10u), 0x77FFAA);
+    gprint(" TICK:", 0x99EEFF);
+    gprint_dec((int)tick, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("CURSOR X:", 0x99EEFF);
+    gprint_dec(mouse_x, 0xFFFFFF);
+    gprint(" Y:", 0x99EEFF);
+    gprint_dec(mouse_y, 0xFFFFFF);
+    gprint(" BTN:", 0x99EEFF);
+    gprint_hex((uint32_t)(mouse_buttons & 0xFF), 2, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("NIC RX frames/bytes/drop ", 0x99EEFF);
+    gprint_dec((int)after.total_frames, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)after.total_bytes, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)after.dropped_frames, 0xFFAA66);
+    gprint(" IRQ:", 0x99EEFF);
+    gprint_dec((int)after.irq_count, 0xFFFFFF);
+    gprint(" RX-IRQ:", 0x99EEFF);
+    gprint_dec((int)after.irq_rx_events, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    set_cmd_output("DIAG SHOW OK");
+    return;
+  }
+
+  if (str_eq(sub, "cursor")) {
+    gprint("CURSOR X:", 0x99EEFF);
+    gprint_dec(mouse_x, 0xFFFFFF);
+    gprint(" Y:", 0x99EEFF);
+    gprint_dec(mouse_y, 0xFFFFFF);
+    gprint(" BTN:", 0x99EEFF);
+    gprint_hex((uint32_t)(mouse_buttons & 0xFF), 2, 0xFFFFFF);
+    gprint("\n", 0x000000);
+    set_cmd_output("DIAG CURSOR OK");
+    return;
+  }
+
+  if (str_eq(sub, "netstress")) {
+    uint32_t t0;
+    uint32_t elapsed;
+    int sent = 0;
+
+    if (is_dec_number(a)) {
+      loops = parse_u32_dec(a);
+    }
+    loops = clamp_i32(loops, 1, 4096);
+
+    net_get_rx_stats(&before);
+    t0 = tick;
+    for (int i = 0; i < loops; i++) {
+      if (net_send_probe()) {
+        sent++;
+      }
+    }
+
+    for (int k = 0; k < 96; k++) {
+      (void)net_rx_poll();
+    }
+
+    net_get_rx_stats(&after);
+    elapsed = tick - t0;
+    if (elapsed == 0u) {
+      elapsed = 1u;
+    }
+
+    gprint("NETSTRESS sent/ok ", 0x99EEFF);
+    gprint_dec(loops, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec(sent, 0x77FFAA);
+    gprint(" ticks:", 0x99EEFF);
+    gprint_dec((int)elapsed, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("RX dFrames dBytes dDrop dIRQ ", 0x99EEFF);
+    gprint_dec((int)(after.total_frames - before.total_frames), 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)(after.total_bytes - before.total_bytes), 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)(after.dropped_frames - before.dropped_frames), 0xFFAA66);
+    gprint("/", 0x666666);
+    gprint_dec((int)(after.irq_count - before.irq_count), 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("RX rate fps(pkt/s) ", 0x99EEFF);
+    gprint_dec((int)(((after.total_frames - before.total_frames) * 100u) / elapsed), 0x77FFAA);
+    gprint("\n", 0x000000);
+
+    set_cmd_output("DIAG NETSTRESS OK");
+    return;
+  }
+
+  if (str_eq(sub, "phase24")) {
+    uint32_t t0;
+    uint32_t elapsed;
+    uint32_t d_frames;
+    uint32_t d_drop;
+    int sent = 0;
+    int fps_ok;
+    int cursor_ok;
+    int nic_ok;
+    int stress_ok;
+    int disk_ok;
+    int overall_ok;
+
+    wm_get_runtime_metrics(&wm_frames, &fps_x10);
+    fps_ok = (fps_x10 >= 300u);
+    cursor_ok = (mouse_x >= 0 && mouse_x < 800 && mouse_y >= 0 && mouse_y < 600);
+    nic_ok = net_is_ready() && net_link_speed_mbps() >= 10;
+
+    loops = 64;
+    net_get_rx_stats(&before);
+    t0 = tick;
+    for (int i = 0; i < loops; i++) {
+      if (net_send_probe()) {
+        sent++;
+      }
+    }
+
+    for (int k = 0; k < 96; k++) {
+      (void)net_rx_poll();
+    }
+    net_get_rx_stats(&after);
+    elapsed = tick - t0;
+    if (elapsed == 0u) {
+      elapsed = 1u;
+    }
+
+    d_frames = after.total_frames - before.total_frames;
+    d_drop = after.dropped_frames - before.dropped_frames;
+    stress_ok = (sent > 0) && (d_drop == 0u);
+    disk_ok = ata_disk_available ? 1 : 0;
+    overall_ok = fps_ok && cursor_ok && nic_ok && stress_ok && disk_ok;
+
+    gprint("PH24 CHECK ", 0x99EEFF);
+    gprint(overall_ok ? "PASS" : "PARTIAL", overall_ok ? 0x44FF88 : 0xFFAA66);
+    gprint("\n", 0x000000);
+
+    gprint(" display_fps>=30: ", 0x99EEFF);
+    gprint(fps_ok ? "PASS" : "FAIL", fps_ok ? 0x44FF88 : 0xFF5555);
+    gprint(" fps=", 0x99EEFF);
+    gprint_dec((int)(fps_x10 / 10u), 0xFFFFFF);
+    gprint(".", 0x666666);
+    gprint_dec((int)(fps_x10 % 10u), 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint(" cursor_tracking: ", 0x99EEFF);
+    gprint(cursor_ok ? "PASS" : "FAIL", cursor_ok ? 0x44FF88 : 0xFF5555);
+    gprint(" x=", 0x99EEFF);
+    gprint_dec(mouse_x, 0xFFFFFF);
+    gprint(" y=", 0x99EEFF);
+    gprint_dec(mouse_y, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint(" nic_link+cap: ", 0x99EEFF);
+    gprint(nic_ok ? "PASS" : "FAIL", nic_ok ? 0x44FF88 : 0xFF5555);
+    gprint(" link=", 0x99EEFF);
+    gprint_dec(net_link_speed_mbps(), 0xFFFFFF);
+    gprint(" mtu=", 0x99EEFF);
+    gprint_dec((int)net_mtu_bytes(), 0xFFFFFF);
+    gprint(" jumbo=", 0x99EEFF);
+    gprint(net_supports_jumbo() ? "YES" : "NO", net_supports_jumbo() ? 0x77FFAA : 0xFFAA66);
+    gprint("\n", 0x000000);
+
+    gprint(" nic_stress(no_drop): ", 0x99EEFF);
+    gprint(stress_ok ? "PASS" : "FAIL", stress_ok ? 0x44FF88 : 0xFF5555);
+    gprint(" sent=", 0x99EEFF);
+    gprint_dec(sent, 0xFFFFFF);
+    gprint(" dFrames=", 0x99EEFF);
+    gprint_dec((int)d_frames, 0xFFFFFF);
+    gprint(" dDrop=", 0x99EEFF);
+    gprint_dec((int)d_drop, 0xFFFFFF);
+    gprint(" rate=", 0x99EEFF);
+    gprint_dec((int)((d_frames * 100u) / elapsed), 0xFFFFFF);
+    gprint(" pkt/s\n", 0x000000);
+
+    gprint(" disk_path_ready: ", 0x99EEFF);
+    gprint(disk_ok ? "PASS" : "WARN", disk_ok ? 0x44FF88 : 0xFFAA66);
+    gprint("\n", 0x000000);
+
+    set_cmd_output(overall_ok ? "PH24 CHECK PASS" : "PH24 CHECK PARTIAL");
+    return;
+  }
+
+  set_cmd_output("USAGE: diag show|cursor|netstress [count]|phase24");
 }
 
 static void cmd_remote(const char *args) {
@@ -2754,6 +3008,7 @@ static const CommandEntry command_table[] = {
     {"dataset", cmd_dataset},
     {"replay", cmd_replay},
     {"pcache", cmd_pcache},
+    {"diag", cmd_diag},
     {"mount", cmd_mount},
     {"umount", cmd_umount},
     {"stat", cmd_stat},
