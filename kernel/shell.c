@@ -15,6 +15,7 @@
 #include "wm.h"
 #include "ext2fs.h"
 #include "page_cache.h"
+#include "module_loader.h"
 
 typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
@@ -531,6 +532,7 @@ static void cmd_help(const char *args) {
   gprint("          viz compare <a> <b>  viz export <path>\n", 0x88E0FF);
   gprint("phase6:   synview synset synrule synpreset syncmp\n", 0x77C8FF);
   gprint("          sbrowse spreview stag sdiff\n", 0x77C8FF);
+  gprint("phase25:  insmod <path>  rmmod <path|handle>  lsmod\n", 0x77C8FF);
   gprint("system:   tz show | tz set <+HH[:MM]|-HH[:MM]>\n", 0x77C8FF);
 }
 
@@ -2142,6 +2144,72 @@ static void cmd_exec(const char *args) {
   }
 }
 
+static void cmd_insmod(const char *args) {
+  if (args == 0 || args[0] == '\0') {
+    set_cmd_output("USAGE: INSMOD <PATH>");
+    return;
+  }
+
+  if (module_insmod(args) == 0) {
+    set_cmd_output("INSMOD OK");
+  } else {
+    const char *err = module_dlerror();
+    if (err != 0 && err[0] != '\0') {
+      gprint((char *)err, 0xFF7777);
+      gprint("\n", 0x000000);
+    }
+    set_cmd_output("INSMOD FAIL");
+  }
+}
+
+static void cmd_rmmod(const char *args) {
+  if (args == 0 || args[0] == '\0') {
+    set_cmd_output("USAGE: RMMOD <PATH|HANDLE>");
+    return;
+  }
+
+  if (module_rmmod(args) == 0) {
+    set_cmd_output("RMMOD OK");
+  } else {
+    const char *err = module_dlerror();
+    if (err != 0 && err[0] != '\0') {
+      gprint((char *)err, 0xFF7777);
+      gprint("\n", 0x000000);
+    }
+    set_cmd_output("RMMOD FAIL");
+  }
+}
+
+static void cmd_lsmod(const char *args) {
+  NsModuleInfo mods[12];
+  int count;
+  (void)args;
+
+  count = module_list(mods, 12);
+  if (count <= 0) {
+    set_cmd_output("NO MODULES");
+    return;
+  }
+
+  gprint("HANDLE REF TYPE EXPORT PATH\n", 0x99EEFF);
+  for (int i = 0; i < count; i++) {
+    gprint_dec(mods[i].handle, 0xFFFFFF);
+    gprint(" ", 0x000000);
+    gprint_dec(mods[i].ref_count, 0xFFFFFF);
+    gprint(" ", 0x000000);
+    if (mods[i].kind == NS_MODULE_KIND_KERNEL) {
+      gprint("KMOD ", 0xFFCC66);
+    } else {
+      gprint("DLIB ", 0x77FFAA);
+    }
+    gprint_dec(mods[i].exported_symbols, 0xFFFFFF);
+    gprint(" ", 0x000000);
+    gprint(mods[i].path, 0xFFFFFF);
+    gprint("\n", 0x000000);
+  }
+  set_cmd_output("LSMOD OK");
+}
+
 static void cmd_delete(const char *args) {
   if (args == 0 || args[0] == '\0') {
     set_cmd_output("USAGE: DELETE <PATH>");
@@ -3014,6 +3082,9 @@ static const CommandEntry command_table[] = {
     {"stat", cmd_stat},
     {"delete", cmd_delete},
     {"exec", cmd_exec},
+    {"insmod", cmd_insmod},
+    {"rmmod", cmd_rmmod},
+    {"lsmod", cmd_lsmod},
     {"mkdemo", cmd_mkdemo},
     {"synview", cmd_synview},
     {"synset", cmd_synset},

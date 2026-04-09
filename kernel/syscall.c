@@ -9,6 +9,7 @@ typedef unsigned char uint8_t;
 #include "vfs.h"
 #include "net.h"
 #include "disk.h"
+#include "module_loader.h"
 
 extern int is_user_range(const void *ptr, uint32_t size);
 
@@ -95,6 +96,12 @@ enum {
 #define SYS_SELECT 69
 #define SYS_POLL 70
 #define SYS_EPOLL 71
+#define SYS_DLOPEN 72
+#define SYS_DLSYM 73
+#define SYS_INSMOD 74
+#define SYS_RMMOD 75
+#define SYS_DLCLOSE 76
+#define SYS_DLERROR 77
 
 #define SIGKILL 9
 #define SIGTERM 15
@@ -2479,6 +2486,101 @@ void syscall_handler(uint32_t *regs) {
     }
 
     syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+    break;
+  }
+
+  case SYS_DLOPEN: {
+    const char *path = (const char *)regs[4];
+    int handle;
+
+    if (cpl == 3 && !validate_user_string(path)) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+
+    handle = module_dlopen_for_task(os_current_task, path);
+    if (handle < 0) {
+      syscall_complete(regs, syscall_num, NS_ERR_NOT_IMPLEMENTED);
+    } else {
+      syscall_complete(regs, syscall_num, (uint32_t)handle);
+    }
+    break;
+  }
+
+  case SYS_DLSYM: {
+    int handle = (int)regs[4];
+    const char *symbol = (const char *)regs[6];
+    uint32_t addr;
+
+    if (cpl == 3 && !validate_user_string(symbol)) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+
+    addr = module_dlsym(handle, symbol);
+    if (addr == 0) {
+      syscall_complete(regs, syscall_num, NS_ERR_NOT_IMPLEMENTED);
+    } else {
+      syscall_complete(regs, syscall_num, addr);
+    }
+    break;
+  }
+
+  case SYS_INSMOD: {
+    const char *path = (const char *)regs[4];
+    int rc;
+
+    if (cpl == 3 && !validate_user_string(path)) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+
+    rc = module_insmod(path);
+    syscall_complete(regs, syscall_num,
+                     rc == 0 ? NS_OK : NS_ERR_NOT_IMPLEMENTED);
+    break;
+  }
+
+  case SYS_RMMOD: {
+    const char *path_or_handle = (const char *)regs[4];
+    int rc;
+
+    if (cpl == 3 && !validate_user_string(path_or_handle)) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+
+    rc = module_rmmod(path_or_handle);
+    syscall_complete(regs, syscall_num,
+                     rc == 0 ? NS_OK : NS_ERR_NOT_IMPLEMENTED);
+    break;
+  }
+
+  case SYS_DLCLOSE: {
+    int handle = (int)regs[4];
+    int rc = module_dlclose_for_task(os_current_task, handle);
+    syscall_complete(regs, syscall_num,
+                     rc == 0 ? NS_OK : NS_ERR_NOT_IMPLEMENTED);
+    break;
+  }
+
+  case SYS_DLERROR: {
+    char *buf = (char *)regs[4];
+    uint32_t cap = regs[6];
+    int copied;
+
+    if (buf == 0 || cap == 0u) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+    if (cpl == 3 && !validate_user_ptr(buf, cap)) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+
+    copied = module_copy_dlerror_for_task(os_current_task, buf, cap);
+    syscall_complete(regs, syscall_num,
+                     copied >= 0 ? (uint32_t)copied : NS_ERR_NOT_IMPLEMENTED);
     break;
   }
 
