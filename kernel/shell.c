@@ -23,6 +23,26 @@ typedef unsigned short uint16_t;
 typedef unsigned char uint8_t;
 
 typedef struct {
+  uint32_t total_pages;
+  uint32_t used_pages;
+  uint32_t free_pages;
+  uint32_t largest_free_run;
+  uint32_t free_runs;
+  uint32_t fragmentation_permille;
+  uint32_t alloc_calls;
+  uint32_t free_calls;
+} PmmStats;
+
+typedef struct {
+  uint32_t obj_size;
+  uint32_t pages;
+  uint32_t allocs;
+  uint32_t frees;
+  uint32_t in_use;
+  uint32_t free_objects;
+} SlabClassStats;
+
+typedef struct {
   int voltage;
   int spike_count;
   int id;
@@ -74,6 +94,8 @@ extern void clear_region(int x0, int y0, int x1, int y1, uint32_t color);
 extern void pmm_print_map(void);
 extern void pmm_free_page(uint32_t page_addr);
 extern void *pmm_alloc_page(void);
+extern void pmm_get_stats(void *out_stats);
+extern int slab_get_stats(int class_index, void *out_stats);
 extern void map_mmio_region(uint32_t phys, uint32_t size);
 extern int sys_load_task(int task_id, int slot);
 extern void sys_save_task(int task_id, int slot);
@@ -540,14 +562,15 @@ static void cmd_help(const char *args) {
   (void)args;
   gprint("commands: help save load ls stat mount umount pcache diag clear delete eval stim mall free map\n", 0xFFFFFF);
     gprint("          tsave tload pci pci bar ahci [show|backend|reset|identify|read|smoke]\n", 0xFFFFFF);
-    gprint("          exec <path> mkdemo net up|cfg|status|tx|export|profile|manifest remote ...\n", 0xFFFFFF);
+    gprint("          exec <path> mkdemo net up|cfg|status|coalesce|tx|export|profile|manifest remote ...\n", 0xFFFFFF);
   gprint("phase8:   manifest save|load|show  replay rec on|off|run|show|clear\n", 0x88E0FF);
   gprint("          dataset export <path>  dataset import <path>\n", 0x88E0FF);
   gprint("phase9:   profile on|off|show|reset|export <path>|hud compact|detail\n", 0x88E0FF);
   gprint("phase10:  model show|select|param ...  stdp on|off\n", 0x88E0FF);
-  gprint("phase11:  ps  kill <pid>  nice <pid> <0..3>  trace <pid> on|off|show\n", 0x88E0FF);
+  gprint("phase11:  ps  kill <pid>  nice <pid> <0..7>  trace <pid> on|off|show\n", 0x88E0FF);
   gprint("phase11.1: ipc send <ch> <val> | ipc recv <ch> | ipc stat <ch>\n", 0x88E0FF);
-  gprint("phase12:  net up  net cfg <ip> <mask> <gw>  net export manifest\n", 0x88E0FF);
+  gprint("phase12:  net up  net cfg <ip> <mask> <gw>  net coalesce <poll> <irqpoll>\n", 0x88E0FF);
+  gprint("          net export manifest\n", 0x88E0FF);
   gprint("          remote on|off|auth <hex> [ttl]|token <hex>\n", 0x88E0FF);
   gprint("phase13:  viz heatmap|raster|off|show  viz scrub <0..63|+|->  viz play on|off\n", 0x88E0FF);
   gprint("          viz compare <a> <b>  viz export <path>\n", 0x88E0FF);
@@ -557,6 +580,8 @@ static void cmd_help(const char *args) {
   gprint("phase26:  id [task]  chmod <path> <octal>  chown <path> <uid> <gid>\n", 0x77C8FF);
   gprint("          setuid <uid>  setgid <gid>  setpgid <task> <pgid>\n", 0x77C8FF);
   gprint("          jobs  fg <task>  bg <task>  tcsetpgrp <tty> <pgid>  tcgetpgrp <tty>\n", 0x77C8FF);
+  gprint("phase27:  sched show|reset  nice <pid> <0..7>  memstat\n", 0x77C8FF);
+  gprint("          net coalesce <poll> <irqpoll>\n", 0x77C8FF);
   gprint("system:   tz show | tz set <+HH[:MM]|-HH[:MM]>\n", 0x77C8FF);
 }
 
@@ -830,14 +855,14 @@ static void cmd_nice(const char *args) {
   next_token(args, t_prio, sizeof(t_prio));
 
   if (!is_dec_number(t_pid) || !is_dec_number(t_prio)) {
-    set_cmd_output("USAGE: nice <pid> <0..3>");
+    set_cmd_output("USAGE: nice <pid> <0..7>");
     return;
   }
 
   {
     int pid = parse_u32_dec(t_pid);
     int prio = parse_u32_dec(t_prio);
-    if (pid < 0 || pid >= os_task_count || prio < 0 || prio > 3) {
+    if (pid < 0 || pid >= os_task_count || prio < 0 || prio > 7) {
       set_cmd_output("NICE FAIL");
       return;
     }
@@ -902,6 +927,53 @@ static void cmd_trace(const char *args) {
   }
 
   set_cmd_output("USAGE: trace <pid> on|off|show");
+}
+
+static void cmd_sched(const char *args) {
+  char sub[16];
+  SchedulerMetrics m;
+
+  next_token(args, sub, sizeof(sub));
+
+  if (sub[0] == '\0' || str_eq(sub, "show")) {
+    scheduler_get_metrics(&m);
+
+    gprint("SCHED ticks=", 0x99EEFF);
+    gprint_dec((int)m.ticks, 0xFFFFFF);
+    gprint(" wake_boosts=", 0x99EEFF);
+    gprint_dec((int)m.io_wake_boosts, 0xFFFFFF);
+    gprint(" starve_fix=", 0x99EEFF);
+    gprint_dec((int)m.starvation_mitigations, 0xFFFFFF);
+    gprint(" inv_hint=", 0x99EEFF);
+    gprint_dec((int)m.inversion_hints, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("band  runtime  switches  max_wait\n", 0x77C8FF);
+    for (int b = 0; b < SCHED_PRIO_BANDS; b++) {
+      gprint_dec(b, 0xFFFFFF);
+      gprint("     ", 0x000000);
+      gprint_dec((int)m.band_runtime[b], 0xFFFFFF);
+      gprint("      ", 0x000000);
+      gprint_dec((int)m.band_switches[b], 0xFFFFFF);
+      gprint("      ", 0x000000);
+      gprint_dec((int)m.max_wait_ticks[b], 0xFFFFFF);
+      gprint("\n", 0x000000);
+    }
+
+    set_cmd_output("SCHED SHOW");
+    return;
+  }
+
+  if (str_eq(sub, "reset")) {
+    if (!require_admin_context()) {
+      return;
+    }
+    scheduler_reset_metrics();
+    set_cmd_output("SCHED RESET");
+    return;
+  }
+
+  set_cmd_output("USAGE: sched show|reset");
 }
 
 static void cmd_ipc(const char *args) {
@@ -1384,12 +1456,14 @@ static void cmd_net(const char *args) {
   char a[24];
   char b[24];
   char c[24];
+  char d[24];
   NetRxStats rx;
   uint32_t ip = 0, mask = 0, gw = 0;
   args = next_token(args, sub, sizeof(sub));
   args = next_token(args, a, sizeof(a));
   args = next_token(args, b, sizeof(b));
-  next_token(args, c, sizeof(c));
+  args = next_token(args, c, sizeof(c));
+  next_token(args, d, sizeof(d));
 
   if (str_eq(sub, "up")) {
     if (net_up()) {
@@ -1485,6 +1559,24 @@ static void cmd_net(const char *args) {
     gprint("/", 0x666666);
     gprint_dec((int)rx.tx_probe_fail, 0xFFAA66);
     gprint("\n", 0x000000);
+    gprint("RX coalesce poll/irq/batches ", 0x99EEFF);
+    gprint_dec((int)rx.poll_budget, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)rx.irq_poll_budget, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)rx.coalesced_batches, 0x77FFAA);
+    gprint("\n", 0x000000);
+    return;
+  }
+
+  if (str_eq(sub, "coalesce")) {
+    if (!is_dec_number(a) || !is_dec_number(b)) {
+      set_cmd_output("USAGE: net coalesce <poll> <irqpoll>");
+      return;
+    }
+    net_set_rx_coalesce((uint32_t)parse_u32_dec(a),
+                        (uint32_t)parse_u32_dec(b));
+    set_cmd_output("NET COALESCE OK");
     return;
   }
 
@@ -1530,7 +1622,73 @@ static void cmd_net(const char *args) {
     return;
   }
 
-  set_cmd_output("USAGE: net up|cfg|status|tx|export <slot>|manifest|profile");
+  set_cmd_output("USAGE: net up|cfg|status|coalesce <poll> <irqpoll>|tx|export <slot>|manifest|profile");
+}
+
+static void cmd_memstat(const char *args) {
+  PmmStats p;
+  SlabClassStats s;
+  (void)args;
+
+  pmm_get_stats(&p);
+  gprint("PMM total/used/free pages ", 0x99EEFF);
+  gprint_dec((int)p.total_pages, 0xFFFFFF);
+  gprint("/", 0x666666);
+  gprint_dec((int)p.used_pages, 0xFFFFFF);
+  gprint("/", 0x666666);
+  gprint_dec((int)p.free_pages, 0x77FFAA);
+  gprint("\n", 0x000000);
+
+  gprint("PMM largest_run/free_runs/frag_permil ", 0x99EEFF);
+  gprint_dec((int)p.largest_free_run, 0xFFFFFF);
+  gprint("/", 0x666666);
+  gprint_dec((int)p.free_runs, 0xFFFFFF);
+  gprint("/", 0x666666);
+  gprint_dec((int)p.fragmentation_permille, 0xFFE066);
+  gprint("\n", 0x000000);
+
+  gprint("PMM alloc/free calls ", 0x99EEFF);
+  gprint_dec((int)p.alloc_calls, 0xFFFFFF);
+  gprint("/", 0x666666);
+  gprint_dec((int)p.free_calls, 0xFFFFFF);
+  gprint("\n", 0x000000);
+
+  gprint("SLAB size pages in_use free alloc/free\n", 0x77C8FF);
+  for (int i = 0; i < 4; i++) {
+    if (!slab_get_stats(i, &s)) {
+      continue;
+    }
+    gprint_dec((int)s.obj_size, 0xFFFFFF);
+    gprint("   ", 0x000000);
+    gprint_dec((int)s.pages, 0xFFFFFF);
+    gprint("    ", 0x000000);
+    gprint_dec((int)s.in_use, 0x77FFAA);
+    gprint("    ", 0x000000);
+    gprint_dec((int)s.free_objects, 0xFFFFFF);
+    gprint("   ", 0x000000);
+    gprint_dec((int)s.allocs, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)s.frees, 0xFFFFFF);
+    gprint("\n", 0x000000);
+  }
+
+  {
+    DiskSchedulerStats ds;
+    disk_get_scheduler_stats(&ds);
+    gprint("DISK sched batches/req/reordered/maxdepth ", 0x99EEFF);
+    gprint_dec((int)ds.batches, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)ds.requests, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)ds.reordered_requests, 0xFFE066);
+    gprint("/", 0x666666);
+    gprint_dec((int)ds.max_batch_depth, 0xFFFFFF);
+    gprint(" LBA=", 0x99EEFF);
+    gprint_hex(ds.last_lba, 8, 0xFFFFFF);
+    gprint("\n", 0x000000);
+  }
+
+  set_cmd_output("MEMSTAT OK");
 }
 
 static void cmd_diag(const char *args) {
@@ -3397,6 +3555,8 @@ static const CommandEntry command_table[] = {
     {"jobs", cmd_jobs},
     {"fg", cmd_fg},
     {"bg", cmd_bg},
+    {"sched", cmd_sched},
+    {"memstat", cmd_memstat},
     {"tcsetpgrp", cmd_tcsetpgrp},
     {"tcgetpgrp", cmd_tcgetpgrp},
     {"mkdemo", cmd_mkdemo},

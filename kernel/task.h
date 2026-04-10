@@ -72,6 +72,9 @@ typedef struct {
   int fd_table[TASK_MAX_FDS];
   int wait_reason;
   int task_id;
+  uint32_t sched_wait_ticks;
+  uint32_t sched_wake_boost;
+  uint32_t sched_last_run_tick;
 } TCB;
 
 extern TCB os_tasks[MAX_TASKS];

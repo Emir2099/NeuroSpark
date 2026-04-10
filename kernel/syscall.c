@@ -105,6 +105,9 @@ enum {
 #define SYS_DLERROR 77
 #define SYS_TCSETPGRP 78
 #define SYS_TCGETPGRP 79
+#define SYS_IO_SETUP 80
+#define SYS_IO_SUBMIT 81
+#define SYS_IO_GETEVENTS 82
 
 #define SIGKILL 9
 #define SIGINT 2
@@ -166,6 +169,11 @@ enum {
 
 #define NS_IOCTL_NIC_GET_INFO 0x2001
 #define NS_IOCTL_NIC_SET_MAC 0x2002
+
+#define NS_AIO_MAX_CTX 4
+#define NS_AIO_MAX_REQ 64
+#define NS_AIO_OP_READ 0u
+#define NS_AIO_OP_WRITE 1u
 
 #define NS_BOOT_EPOCH_SECONDS 1767225600u /* 2026-01-01T00:00:00Z */
 #define NS_TICKS_PER_SECOND 100u
@@ -347,8 +355,43 @@ typedef struct {
   NsEpollWatch watches[NS_EPOLL_MAX_WATCH];
 } NsEpollObject;
 
+typedef struct {
+  uint32_t opcode;
+  uint32_t lba;
+  uint32_t buf;
+  uint32_t nbytes;
+  uint32_t user_data;
+} NsIoCb;
+
+typedef struct {
+  uint32_t user_data;
+  int result;
+} NsIoEvent;
+
+typedef struct {
+  int used;
+  uint32_t opcode;
+  uint32_t lba;
+  uint32_t user_buf;
+  uint32_t nbytes;
+  uint32_t user_data;
+  int result;
+  uint16_t sector[256];
+} NsAioReq;
+
+typedef struct {
+  int used;
+  int owner_task;
+  uint32_t maxevents;
+  uint32_t req_count;
+  NsAioReq reqs[NS_AIO_MAX_REQ];
+} NsAioCtx;
+
 static NsSocketEntry task_sockets[MAX_TASKS][NS_SOCKET_MAX_PER_TASK];
 static NsEpollObject task_epolls[MAX_TASKS][NS_EPOLL_MAX_PER_TASK];
+static NsAioCtx aio_contexts[NS_AIO_MAX_CTX];
+
+static int validate_user_ptr(const void *ptr, uint32_t size);
 
 static uint16_t ns_bswap16(uint16_t v) {
   return (uint16_t)((v << 8) | (v >> 8));
@@ -521,6 +564,121 @@ static void epoll_close_all_for_task(int task_id) {
       epoll_close_object(&task_epolls[task_id][i]);
     }
   }
+}
+
+static int aio_ctx_handle_to_slot(uint32_t handle) {
+  int slot = (int)handle - 1;
+  if (slot < 0 || slot >= NS_AIO_MAX_CTX) {
+    return -1;
+  }
+  return slot;
+}
+
+static NsAioCtx *aio_ctx_from_handle(uint32_t handle) {
+  int slot = aio_ctx_handle_to_slot(handle);
+  if (slot < 0) {
+    return 0;
+  }
+  if (!aio_contexts[slot].used || aio_contexts[slot].owner_task != os_current_task) {
+    return 0;
+  }
+  return &aio_contexts[slot];
+}
+
+static uint32_t aio_alloc_context(uint32_t maxevents) {
+  for (int i = 0; i < NS_AIO_MAX_CTX; i++) {
+    if (!aio_contexts[i].used) {
+      aio_contexts[i].used = 1;
+      aio_contexts[i].owner_task = os_current_task;
+      aio_contexts[i].maxevents = maxevents;
+      aio_contexts[i].req_count = 0;
+      for (int r = 0; r < NS_AIO_MAX_REQ; r++) {
+        aio_contexts[i].reqs[r].used = 0;
+        aio_contexts[i].reqs[r].result = NS_ERR_WOULD_BLOCK;
+      }
+      return (uint32_t)(i + 1);
+    }
+  }
+  return 0;
+}
+
+static int aio_submit_one(NsAioCtx *ctx, const NsIoCb *cb) {
+  NsAioReq *req;
+
+  if (ctx == 0 || cb == 0 || ctx->req_count >= NS_AIO_MAX_REQ) {
+    return 0;
+  }
+  if ((cb->opcode != NS_AIO_OP_READ && cb->opcode != NS_AIO_OP_WRITE) ||
+      cb->nbytes != 512u) {
+    return 0;
+  }
+  if (!validate_user_ptr((const void *)cb->buf, cb->nbytes)) {
+    return 0;
+  }
+
+  req = &ctx->reqs[ctx->req_count];
+  req->used = 1;
+  req->opcode = cb->opcode;
+  req->lba = cb->lba;
+  req->user_buf = cb->buf;
+  req->nbytes = cb->nbytes;
+  req->user_data = cb->user_data;
+  req->result = NS_ERR_WOULD_BLOCK;
+
+  if (cb->opcode == NS_AIO_OP_WRITE) {
+    const uint8_t *src = (const uint8_t *)(cb->buf);
+    uint8_t *dst = (uint8_t *)req->sector;
+    for (uint32_t i = 0; i < cb->nbytes; i++) {
+      dst[i] = src[i];
+    }
+  }
+
+  ctx->req_count++;
+  return 1;
+}
+
+static int aio_process_events(NsAioCtx *ctx, NsIoEvent *events, uint32_t maxevents) {
+  DiskBatchRequest batch[NS_AIO_MAX_REQ];
+  uint32_t to_process;
+
+  if (ctx == 0 || events == 0 || maxevents == 0u || ctx->req_count == 0u) {
+    return 0;
+  }
+
+  to_process = ctx->req_count;
+  if (to_process > maxevents) {
+    to_process = maxevents;
+  }
+
+  for (uint32_t i = 0; i < to_process; i++) {
+    batch[i].lba = ctx->reqs[i].lba;
+    batch[i].buffer = ctx->reqs[i].sector;
+    batch[i].write = (uint8_t)(ctx->reqs[i].opcode == NS_AIO_OP_WRITE);
+    batch[i].result = NS_ERR_WOULD_BLOCK;
+  }
+
+  (void)disk_process_batch(batch, to_process);
+
+  for (uint32_t i = 0; i < to_process; i++) {
+    NsAioReq *req = &ctx->reqs[i];
+    req->result = batch[i].result;
+    if (req->result == DISK_IO_OK && req->opcode == NS_AIO_OP_READ) {
+      uint8_t *dst = (uint8_t *)req->user_buf;
+      uint8_t *src = (uint8_t *)req->sector;
+      for (uint32_t k = 0; k < req->nbytes; k++) {
+        dst[k] = src[k];
+      }
+    }
+    events[i].user_data = req->user_data;
+    events[i].result = req->result;
+  }
+
+  for (uint32_t i = to_process; i < ctx->req_count; i++) {
+    ctx->reqs[i - to_process] = ctx->reqs[i];
+  }
+  ctx->req_count -= to_process;
+
+  return (int)to_process;
 }
 
 static int fd_poll_revents(int fd, uint16_t events, uint16_t *revents_out) {
@@ -702,6 +860,20 @@ static void socket_close_all_for_task(int task_id) {
   for (int i = 0; i < NS_SOCKET_MAX_PER_TASK; i++) {
     if (task_sockets[task_id][i].used) {
       socket_close_entry(&task_sockets[task_id][i]);
+    }
+  }
+}
+
+static void aio_close_all_for_task(int task_id) {
+  if (task_id < 0 || task_id >= MAX_TASKS) {
+    return;
+  }
+  for (int i = 0; i < NS_AIO_MAX_CTX; i++) {
+    if (aio_contexts[i].used && aio_contexts[i].owner_task == task_id) {
+      aio_contexts[i].used = 0;
+      aio_contexts[i].owner_task = -1;
+      aio_contexts[i].maxevents = 0;
+      aio_contexts[i].req_count = 0;
     }
   }
 }
@@ -1358,6 +1530,7 @@ void syscall_handler(uint32_t *regs) {
     }
     socket_close_all_for_task(os_current_task);
     epoll_close_all_for_task(os_current_task);
+    aio_close_all_for_task(os_current_task);
     posix_clear_task_fds(os_current_task);
     syscall_complete(regs, syscall_num, NS_OK);
     task_terminate_current();
@@ -2626,6 +2799,73 @@ void syscall_handler(uint32_t *regs) {
     int rc = posix_tty_tcgetpgrp(tty_id);
     syscall_complete(regs, syscall_num,
                      rc >= 0 ? (uint32_t)rc : NS_ERR_INVALID_ARG);
+    break;
+  }
+
+  case SYS_IO_SETUP: {
+    uint32_t maxevents = regs[4];
+    uint32_t *ctx_out = (uint32_t *)regs[6];
+    uint32_t handle;
+
+    if (maxevents == 0u || maxevents > NS_AIO_MAX_REQ ||
+        (cpl == 3 && !validate_user_ptr(ctx_out, sizeof(uint32_t)))) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+
+    handle = aio_alloc_context(maxevents);
+    if (handle == 0u) {
+      syscall_complete(regs, syscall_num, VFS_ERR_NO_SPACE);
+      break;
+    }
+
+    *ctx_out = handle;
+    syscall_complete(regs, syscall_num, NS_OK);
+    break;
+  }
+
+  case SYS_IO_SUBMIT: {
+    uint32_t handle = regs[4];
+    uint32_t nr = regs[5];
+    NsIoCb *iocb = (NsIoCb *)regs[6];
+    NsAioCtx *ctx = aio_ctx_from_handle(handle);
+    uint32_t accepted = 0;
+
+    if (ctx == 0 || nr == 0u || nr > NS_AIO_MAX_REQ ||
+        (cpl == 3 && !validate_user_ptr(iocb, nr * sizeof(NsIoCb)))) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+
+    for (uint32_t i = 0; i < nr; i++) {
+      if (!aio_submit_one(ctx, &iocb[i])) {
+        break;
+      }
+      accepted++;
+    }
+
+    syscall_complete(regs, syscall_num, accepted > 0u ? accepted : NS_ERR_WOULD_BLOCK);
+    break;
+  }
+
+  case SYS_IO_GETEVENTS: {
+    uint32_t handle = regs[4];
+    uint32_t maxevents = regs[5];
+    NsIoEvent *events = (NsIoEvent *)regs[6];
+    NsAioCtx *ctx = aio_ctx_from_handle(handle);
+    int done;
+
+    if (ctx == 0 || maxevents == 0u ||
+        (cpl == 3 && !validate_user_ptr(events, maxevents * sizeof(NsIoEvent)))) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+
+    if (maxevents > ctx->maxevents) {
+      maxevents = ctx->maxevents;
+    }
+    done = aio_process_events(ctx, events, maxevents);
+    syscall_complete(regs, syscall_num, (uint32_t)done);
     break;
   }
 

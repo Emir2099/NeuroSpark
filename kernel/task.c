@@ -120,6 +120,9 @@ void create_task(int index, void (*func_ptr)(), uint32_t page_dir) {
     }
     os_tasks[index].wait_reason = 0;
     os_tasks[index].task_id = index;
+    os_tasks[index].sched_wait_ticks = 0;
+    os_tasks[index].sched_wake_boost = 0;
+    os_tasks[index].sched_last_run_tick = 0;
 
     if (index >= os_task_count) {
         os_task_count = index + 1;

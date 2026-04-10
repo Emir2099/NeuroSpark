@@ -233,7 +233,9 @@ static uint8_t rtl_rx_buffer[8192 + 16 + 1500] __attribute__((aligned(16)));
 static uint8_t rtl_tx_buffer[4][1600] __attribute__((aligned(16)));
 static int rtl_tx_slot = 0;
 static uint32_t rtl_rx_offset = 0;
-static NetRxStats net_rx_stats = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+static uint32_t net_rx_poll_budget_cfg = 32u;
+static uint32_t net_irq_poll_budget_cfg = 96u;
+static NetRxStats net_rx_stats = {0};
 static RouteEntry route_table[ROUTE_TABLE_MAX];
 static int route_count = 0;
 static Ipv4ReassSlot ipv4_reass[IPV4_REASS_SLOT_MAX];
@@ -1636,8 +1638,38 @@ static int net_rx_poll_budget(uint32_t max_packets) {
   return processed;
 }
 
+void net_set_rx_coalesce(uint32_t poll_budget, uint32_t irq_budget) {
+  if (poll_budget < 4u) {
+    poll_budget = 4u;
+  }
+  if (poll_budget > 256u) {
+    poll_budget = 256u;
+  }
+  if (irq_budget < 8u) {
+    irq_budget = 8u;
+  }
+  if (irq_budget > 512u) {
+    irq_budget = 512u;
+  }
+  net_rx_poll_budget_cfg = poll_budget;
+  net_irq_poll_budget_cfg = irq_budget;
+}
+
+void net_get_rx_coalesce(uint32_t *poll_budget, uint32_t *irq_budget) {
+  if (poll_budget != 0) {
+    *poll_budget = net_rx_poll_budget_cfg;
+  }
+  if (irq_budget != 0) {
+    *irq_budget = net_irq_poll_budget_cfg;
+  }
+}
+
 int net_rx_poll(void) {
-  return net_rx_poll_budget(32u);
+  int processed = net_rx_poll_budget(net_rx_poll_budget_cfg);
+  if ((uint32_t)processed >= net_rx_poll_budget_cfg) {
+    net_rx_stats.coalesced_batches++;
+  }
+  return processed;
 }
 
 int net_irq_handler(void) {
@@ -1658,7 +1690,10 @@ int net_irq_handler(void) {
 
   if ((isr & (RTL_INT_RX_OK | RTL_INT_RX_ERR | RTL_INT_RX_OVW)) != 0u) {
     net_rx_stats.irq_rx_events++;
-    processed = net_rx_poll_budget(96u);
+    processed = net_rx_poll_budget(net_irq_poll_budget_cfg);
+    if ((uint32_t)processed >= net_irq_poll_budget_cfg) {
+      net_rx_stats.coalesced_batches++;
+    }
   }
 
   return processed;
@@ -1668,6 +1703,8 @@ void net_get_rx_stats(NetRxStats *out) {
   if (out == 0) {
     return;
   }
+  net_rx_stats.poll_budget = net_rx_poll_budget_cfg;
+  net_rx_stats.irq_poll_budget = net_irq_poll_budget_cfg;
   *out = net_rx_stats;
 }
 

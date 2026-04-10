@@ -31,6 +31,7 @@ static inline uint16_t inw(uint16_t port) {
 volatile int ata_disk_available = 0;
 static uint8_t disk_preferred_backend = DISK_BACKEND_AUTO;
 static DiskIoStats disk_io_stats = {0, 0, 0, 0};
+static DiskSchedulerStats disk_sched_stats = {0, 0, 0, 0, 0};
 static uint32_t disk_read_errors = 0;
 static uint32_t disk_write_errors = 0;
 static int disk_last_error = DISK_IO_OK;
@@ -97,6 +98,81 @@ void disk_reset_io_stats(void) {
     disk_write_errors = 0;
     disk_last_error = DISK_IO_OK;
 }
+
+    void disk_get_scheduler_stats(DiskSchedulerStats *out_stats) {
+        if (out_stats == 0) {
+            return;
+        }
+        *out_stats = disk_sched_stats;
+    }
+
+    void disk_reset_scheduler_stats(void) {
+        disk_sched_stats.batches = 0;
+        disk_sched_stats.requests = 0;
+        disk_sched_stats.reordered_requests = 0;
+        disk_sched_stats.max_batch_depth = 0;
+        disk_sched_stats.last_lba = 0;
+    }
+
+    int disk_process_batch(DiskBatchRequest *reqs, uint32_t count) {
+        uint32_t order[64];
+        uint32_t processed = 0;
+
+        if (reqs == 0 || count == 0) {
+            return 0;
+        }
+        if (count > 64u) {
+            count = 64u;
+        }
+
+        for (uint32_t i = 0; i < count; i++) {
+            reqs[i].result = DISK_IO_ERR_UNSUPPORTED;
+            if (reqs[i].buffer == 0) {
+                continue;
+            }
+            order[i] = i;
+        }
+
+        for (uint32_t i = 1; i < count; i++) {
+            uint32_t key = order[i];
+            uint32_t j = i;
+            while (j > 0 && reqs[order[j - 1]].lba > reqs[key].lba) {
+                order[j] = order[j - 1];
+                j--;
+            }
+            order[j] = key;
+        }
+
+        for (uint32_t pos = 0; pos < count; pos++) {
+            uint32_t idx = order[pos];
+            int rc;
+
+            if (reqs[idx].buffer == 0) {
+                continue;
+            }
+
+            if (reqs[idx].write) {
+                disk_write_sector_uncached(reqs[idx].lba, reqs[idx].buffer);
+                rc = DISK_IO_OK;
+            } else {
+                rc = disk_read_sector_uncached(reqs[idx].lba, reqs[idx].buffer);
+            }
+
+            reqs[idx].result = rc;
+            processed++;
+            disk_sched_stats.last_lba = reqs[idx].lba;
+            if (idx != pos) {
+                disk_sched_stats.reordered_requests++;
+            }
+        }
+
+        disk_sched_stats.batches++;
+        disk_sched_stats.requests += processed;
+        if (count > disk_sched_stats.max_batch_depth) {
+            disk_sched_stats.max_batch_depth = count;
+        }
+        return (int)processed;
+    }
 
 void disk_set_preferred_backend(uint8_t backend) {
     if (backend != DISK_BACKEND_AUTO && backend != DISK_BACKEND_ATA &&

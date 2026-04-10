@@ -79,6 +79,21 @@ typedef struct {
 } DiskIoStats;
 
 typedef struct {
+    uint32_t lba;
+    uint16_t *buffer;
+    uint8_t write;
+    int result;
+} DiskBatchRequest;
+
+typedef struct {
+    uint32_t batches;
+    uint32_t requests;
+    uint32_t reordered_requests;
+    uint32_t max_batch_depth;
+    uint32_t last_lba;
+} DiskSchedulerStats;
+
+typedef struct {
     uint32_t total_sectors_low;
     uint32_t total_sectors_high;
     uint32_t sector_size;
@@ -115,6 +130,9 @@ const char *disk_read_error_string(int code);
 int  find_free_slot(FileEntry *dir);
 void disk_get_io_stats(DiskIoStats *out_stats);
 void disk_reset_io_stats(void);
+int  disk_process_batch(DiskBatchRequest *reqs, uint32_t count);
+void disk_get_scheduler_stats(DiskSchedulerStats *out_stats);
+void disk_reset_scheduler_stats(void);
 int  disk_get_geometry(DiskGeometryInfo *out_info);
 int  disk_get_health(DiskHealthInfo *out_info);
 

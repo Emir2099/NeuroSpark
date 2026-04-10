@@ -6,6 +6,7 @@
 #define SCHED_TIME_SLICE_TICKS 5
 #define IPC_CHANNELS 4
 #define IPC_QUEUE_CAPACITY 16
+#define SCHED_PRIO_BANDS 4
 
 /* ============================================================
  * Locking Discipline and IRQ-Safe Annotations
@@ -37,6 +38,16 @@ typedef struct {
 	int tail;
 	int count;
 } wait_queue_t;
+
+typedef struct {
+	uint32_t ticks;
+	uint32_t io_wake_boosts;
+	uint32_t starvation_mitigations;
+	uint32_t inversion_hints;
+	uint32_t band_runtime[SCHED_PRIO_BANDS];
+	uint32_t band_switches[SCHED_PRIO_BANDS];
+	uint32_t max_wait_ticks[SCHED_PRIO_BANDS];
+} SchedulerMetrics;
 
 typedef struct {
 	wait_queue_t waiters;
@@ -81,5 +92,8 @@ int ipc_send_wait(int channel, int value);
 int ipc_send_timeout(int channel, int value, unsigned int max_ticks);
 int ipc_recv_wait(int channel, int *out_value);
 int ipc_recv_timeout(int channel, int *out_value, unsigned int max_ticks);
+
+void scheduler_get_metrics(SchedulerMetrics *out);
+void scheduler_reset_metrics(void);
 
 #endif

@@ -17,6 +17,9 @@ typedef struct {
 	uint32_t irq_rx_events;
 	uint32_t tx_probe_ok;
 	uint32_t tx_probe_fail;
+	uint32_t poll_budget;
+	uint32_t irq_poll_budget;
+	uint32_t coalesced_batches;
 } NetRxStats;
 
 int net_init(void);
@@ -25,6 +28,8 @@ int net_is_ready(void);
 int net_rx_poll(void);
 int net_irq_handler(void);
 void net_get_rx_stats(NetRxStats *out);
+void net_set_rx_coalesce(uint32_t poll_budget, uint32_t irq_budget);
+void net_get_rx_coalesce(uint32_t *poll_budget, uint32_t *irq_budget);
 int net_send_probe(void);
 int net_export_snapshot(int slot);
 int net_export_profile(void);

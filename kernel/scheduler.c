@@ -41,6 +41,13 @@ extern NeuralPixel os_memory_map[2];
 
 static irq_lock_t scheduler_lock = {0};
 static volatile uint32_t scheduler_ticks = 0;
+static SchedulerMetrics sched_metrics;
+
+#define SCHED_PRIO_MAX 7u
+#define SCHED_WAIT_BOOST_SHIFT 4u
+#define SCHED_WAIT_BOOST_MAX 3u
+#define SCHED_WAKE_BOOST_MAX 2u
+#define SCHED_STARVATION_WAIT_TICKS 120u
 
 typedef struct {
   int queue[IPC_QUEUE_CAPACITY];
@@ -69,6 +76,51 @@ static void ipc_init_once(void) {
     wait_queue_init(&ipc_recv_waiters[c]);
   }
   ipc_initialized = 1;
+}
+
+static int scheduler_prio_band(uint32_t prio) {
+  if (prio <= 1u) {
+    return 0;
+  }
+  if (prio <= 3u) {
+    return 1;
+  }
+  if (prio <= 5u) {
+    return 2;
+  }
+  return 3;
+}
+
+static uint32_t scheduler_effective_priority_locked(int task_id) {
+  uint32_t base;
+  uint32_t wait_boost;
+  uint32_t wake_boost;
+  uint32_t eff;
+
+  if (task_id < 0 || task_id >= os_task_count) {
+    return 0;
+  }
+
+  base = os_tasks[task_id].priority;
+  if (base > SCHED_PRIO_MAX) {
+    base = SCHED_PRIO_MAX;
+  }
+
+  wait_boost = os_tasks[task_id].sched_wait_ticks >> SCHED_WAIT_BOOST_SHIFT;
+  if (wait_boost > SCHED_WAIT_BOOST_MAX) {
+    wait_boost = SCHED_WAIT_BOOST_MAX;
+  }
+
+  wake_boost = os_tasks[task_id].sched_wake_boost;
+  if (wake_boost > SCHED_WAKE_BOOST_MAX) {
+    wake_boost = SCHED_WAKE_BOOST_MAX;
+  }
+
+  eff = base + wait_boost + wake_boost;
+  if (eff > (SCHED_PRIO_MAX + SCHED_WAIT_BOOST_MAX + SCHED_WAKE_BOOST_MAX)) {
+    eff = SCHED_PRIO_MAX + SCHED_WAIT_BOOST_MAX + SCHED_WAKE_BOOST_MAX;
+  }
+  return eff;
 }
 
 /* ============================================================
@@ -140,6 +192,8 @@ static void scheduler_wake_sleepers_locked(void) {
         os_tasks[i].wake_tick <= scheduler_ticks) {
       os_tasks[i].state = TASK_STATE_READY;
       os_tasks[i].wake_tick = 0;
+      os_tasks[i].sched_wake_boost = SCHED_WAKE_BOOST_MAX;
+      sched_metrics.io_wake_boosts++;
       task_trace_event(i, TASK_TRACE_EVT_WAKE, scheduler_ticks);
     }
   }
@@ -152,7 +206,7 @@ static int scheduler_pick_next_locked(int old_task) {
   for (int step = 1; step <= os_task_count; step++) {
     int idx = (old_task + step) % os_task_count;
     if (os_tasks[idx].state == TASK_STATE_READY) {
-      uint32_t prio = os_tasks[idx].priority;
+      uint32_t prio = scheduler_effective_priority_locked(idx);
       if (best_idx < 0 || prio > best_prio) {
         best_idx = idx;
         best_prio = prio;
@@ -161,6 +215,9 @@ static int scheduler_pick_next_locked(int old_task) {
   }
 
   if (best_idx >= 0) {
+    if (os_tasks[best_idx].sched_wait_ticks >= SCHED_STARVATION_WAIT_TICKS) {
+      sched_metrics.starvation_mitigations++;
+    }
     return best_idx;
   }
 
@@ -190,6 +247,7 @@ static void scheduler_select_and_switch(int force_current_ready) {
   old_task = os_current_task;
   if (force_current_ready && os_tasks[old_task].state == TASK_STATE_RUNNING) {
     os_tasks[old_task].state = TASK_STATE_READY;
+    os_tasks[old_task].sched_wait_ticks = 0;
   }
 
   scheduler_wake_sleepers_locked();
@@ -198,6 +256,10 @@ static void scheduler_select_and_switch(int force_current_ready) {
   os_current_task = new_task;
   os_tasks[new_task].state = TASK_STATE_RUNNING;
   os_tasks[new_task].time_slice = time_slice_for_priority(os_tasks[new_task].priority);
+  os_tasks[new_task].sched_last_run_tick = scheduler_ticks;
+  os_tasks[new_task].sched_wait_ticks = 0;
+  os_tasks[new_task].sched_wake_boost = 0;
+  sched_metrics.band_switches[scheduler_prio_band(os_tasks[new_task].priority)]++;
   if (new_task != old_task) {
     task_trace_event(old_task, TASK_TRACE_EVT_SWITCH_OUT, new_task);
     task_trace_event(new_task, TASK_TRACE_EVT_SWITCH_IN, old_task);
@@ -334,22 +396,60 @@ int task_kill(int task_id, int code) {
 
 void scheduler_timer_tick(void) {
   int should_preempt = 0;
+  int inversion_hint = 0;
+  int preempt_due_to_slice = 0;
   unsigned int flags;
   int current;
   uint32_t profile_stamp = profile_begin();
 
   irq_lock_acquire(&scheduler_lock, &flags);
   scheduler_ticks++;
+  sched_metrics.ticks = scheduler_ticks;
   scheduler_wake_sleepers_locked();
 
   current = os_current_task;
+
+  for (int i = 0; i < os_task_count; i++) {
+    if (i == current) {
+      continue;
+    }
+    if (os_tasks[i].state == TASK_STATE_READY) {
+      uint32_t band = (uint32_t)scheduler_prio_band(os_tasks[i].priority);
+      if (os_tasks[i].sched_wait_ticks < 0xFFFFFFFFu) {
+        os_tasks[i].sched_wait_ticks++;
+      }
+      if (os_tasks[i].sched_wait_ticks > sched_metrics.max_wait_ticks[band]) {
+        sched_metrics.max_wait_ticks[band] = os_tasks[i].sched_wait_ticks;
+      }
+    }
+  }
+
   if (os_tasks[current].state == TASK_STATE_RUNNING) {
+    sched_metrics.band_runtime[scheduler_prio_band(os_tasks[current].priority)]++;
     os_tasks[current].runtime_ticks++;
     if (os_tasks[current].time_slice > 0) {
       os_tasks[current].time_slice--;
     }
     if (os_tasks[current].time_slice == 0) {
       should_preempt = 1;
+      preempt_due_to_slice = 1;
+    }
+
+    {
+      uint32_t cur_eff = scheduler_effective_priority_locked(current);
+      for (int i = 0; i < os_task_count; i++) {
+        if (i == current || os_tasks[i].state != TASK_STATE_READY) {
+          continue;
+        }
+        if (scheduler_effective_priority_locked(i) > cur_eff) {
+          inversion_hint = 1;
+          break;
+        }
+      }
+      if (inversion_hint) {
+        sched_metrics.inversion_hints++;
+        should_preempt = 1;
+      }
     }
   }
 
@@ -362,7 +462,11 @@ void scheduler_timer_tick(void) {
      * Keep round-robin accounting and let normal task yield points switch. */
     irq_lock_acquire(&scheduler_lock, &flags);
     if (os_tasks[current].state == TASK_STATE_RUNNING) {
-      os_tasks[current].time_slice = time_slice_for_priority(os_tasks[current].priority);
+      if (preempt_due_to_slice) {
+        os_tasks[current].time_slice = time_slice_for_priority(os_tasks[current].priority);
+      } else if (os_tasks[current].time_slice > 1) {
+        os_tasks[current].time_slice = 1;
+      }
     }
     irq_lock_release(&scheduler_lock, flags);
   }
@@ -499,6 +603,9 @@ int wait_queue_wake_one(wait_queue_t *queue) {
     if (task_id >= 0 && task_id < os_task_count &&
         os_tasks[task_id].state == TASK_STATE_BLOCKED) {
       os_tasks[task_id].state = TASK_STATE_READY;
+      os_tasks[task_id].wake_tick = 0;
+      os_tasks[task_id].sched_wake_boost = SCHED_WAKE_BOOST_MAX;
+      sched_metrics.io_wake_boosts++;
       woken = 1;
       break;
     }
@@ -506,6 +613,34 @@ int wait_queue_wake_one(wait_queue_t *queue) {
   irq_lock_release(&scheduler_lock, flags);
 
   return woken;
+}
+
+void scheduler_get_metrics(SchedulerMetrics *out) {
+  unsigned int flags;
+
+  if (out == 0) {
+    return;
+  }
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+  *out = sched_metrics;
+  irq_lock_release(&scheduler_lock, flags);
+}
+
+void scheduler_reset_metrics(void) {
+  unsigned int flags;
+
+  irq_lock_acquire(&scheduler_lock, &flags);
+  sched_metrics.ticks = scheduler_ticks;
+  sched_metrics.io_wake_boosts = 0;
+  sched_metrics.starvation_mitigations = 0;
+  sched_metrics.inversion_hints = 0;
+  for (int i = 0; i < SCHED_PRIO_BANDS; i++) {
+    sched_metrics.band_runtime[i] = 0;
+    sched_metrics.band_switches[i] = 0;
+    sched_metrics.max_wait_ticks[i] = 0;
+  }
+  irq_lock_release(&scheduler_lock, flags);
 }
 
 int wait_queue_wake_all(wait_queue_t *queue) {
