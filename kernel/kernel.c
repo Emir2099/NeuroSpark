@@ -275,6 +275,7 @@ extern void gprint_hex(uint32_t val, int digits, uint32_t color);
 #include "profiling.h"
 #include "model_manager.h"
 #include "module_loader.h"
+#include "posix.h"
 
 volatile int current_shell_row = SHELL_START_ROW;
 
@@ -2238,6 +2239,7 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
 
   vfs_init();
   module_loader_init();
+  posix_init();
   profile_init();
   storage_manifest_load("/session.manifest");
 

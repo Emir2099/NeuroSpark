@@ -5,6 +5,7 @@
 #include "task.h"
 #include "vfs.h"
 #include "module_loader.h"
+#include "posix.h"
 
 typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
@@ -108,6 +109,7 @@ static uint32_t user_entry = USER_VA_CODE;
 static uint32_t user_stack_top = USER_VA_STACK_TOP - 16;
 
 static uint8_t exec_buffer[4096];
+static char last_exec_path[128];
 
 static void user_task_entry(void);
 
@@ -575,6 +577,10 @@ static int finalize_user_process(uint32_t pd, uint32_t entry) {
   // Replace existing user task slot with a fresh process image.
   os_tasks[2].state = TASK_STATE_TERMINATED;
   create_task(2, user_task_entry, user_page_dir);
+  posix_task_init(2, os_current_task);
+  if (last_exec_path[0] != '\0') {
+    (void)posix_apply_exec_credentials(2, last_exec_path);
+  }
   return 1;
 }
 
@@ -634,6 +640,15 @@ int exec_user_program(const char *path) {
 
   if (path == 0 || path[0] == '\0') {
     return 0;
+  }
+
+  {
+    int i = 0;
+    while (path[i] && i < (int)sizeof(last_exec_path) - 1) {
+      last_exec_path[i] = path[i];
+      i++;
+    }
+    last_exec_path[i] = '\0';
   }
 
   if (vfs_stat(path, &stat_buf) != VFS_OK || stat_buf.flags == 0 ||

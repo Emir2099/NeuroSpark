@@ -10,6 +10,7 @@ typedef unsigned char uint8_t;
 #include "net.h"
 #include "disk.h"
 #include "module_loader.h"
+#include "posix.h"
 
 extern int is_user_range(const void *ptr, uint32_t size);
 
@@ -102,8 +103,14 @@ enum {
 #define SYS_RMMOD 75
 #define SYS_DLCLOSE 76
 #define SYS_DLERROR 77
+#define SYS_TCSETPGRP 78
+#define SYS_TCGETPGRP 79
 
 #define SIGKILL 9
+#define SIGINT 2
+#define SIGCONT 18
+#define SIGSTOP 19
+#define SIGTSTP 20
 #define SIGTERM 15
 #define WNOHANG 1
 
@@ -288,8 +295,6 @@ typedef struct {
 } ForkStartCtx;
 
 static ForkStartCtx fork_start_ctx[MAX_TASKS];
-static uint32_t task_uid[MAX_TASKS];
-static uint32_t task_gid[MAX_TASKS];
 static uint32_t task_brk_base[MAX_TASKS];
 static uint32_t task_brk_current[MAX_TASKS];
 static uint32_t task_mmap_next[MAX_TASKS];
@@ -733,8 +738,7 @@ static void ensure_task_identity_defaults(int task_id) {
     return;
   }
   if (task_brk_base[task_id] == 0) {
-    task_uid[task_id] = 0;
-    task_gid[task_id] = 0;
+    posix_task_init(task_id, -1);
     task_brk_base[task_id] = BRK_DEFAULT_BASE;
     task_brk_current[task_id] = BRK_DEFAULT_BASE;
     task_mmap_next[task_id] = MMAP_ANON_BASE;
@@ -869,6 +873,21 @@ static void syscall_dispatch_pending_signals(uint32_t *regs, uint32_t cpl) {
 
   task->signal_pending &= ~(1u << sig);
   handler = task->signal_handler[sig];
+
+  if (sig == SIGCONT) {
+    if (task->state == TASK_STATE_BLOCKED && task->wait_reason == TASK_WAIT_NONE) {
+      task->state = TASK_STATE_READY;
+      task->wake_tick = 0;
+    }
+    return;
+  }
+
+  if (sig == SIGSTOP || sig == SIGTSTP) {
+    task->state = TASK_STATE_BLOCKED;
+    task->wake_tick = 0;
+    task->wait_reason = TASK_WAIT_NONE;
+    return;
+  }
 
   if (sig == SIGKILL || sig == SIGTERM || handler == 0 ||
       !is_user_range((const void *)handler, 1)) {
@@ -1056,8 +1075,7 @@ void syscall_handler(uint32_t *regs) {
 
     ensure_task_identity_defaults(parent);
     ensure_task_identity_defaults(child);
-    task_uid[child] = task_uid[parent];
-    task_gid[child] = task_gid[parent];
+    posix_task_on_fork(parent, child);
     task_brk_base[child] = task_brk_base[parent];
     task_brk_current[child] = task_brk_current[parent];
     task_mmap_next[child] = task_mmap_next[parent];
@@ -1067,6 +1085,7 @@ void syscall_handler(uint32_t *regs) {
     epoll_close_all_for_task(child);
 
     vfs_clone_task_fds(parent, child);
+    posix_clone_fd_rights(parent, child);
     syscall_complete(regs, syscall_num, (uint32_t)child);
     break;
   }
@@ -1105,6 +1124,10 @@ void syscall_handler(uint32_t *regs) {
           rc = (int)NS_ERR_WOULD_BLOCK;
         }
       } else {
+        if (posix_check_fd_permission(os_current_task, fd, POSIX_ACC_READ) != VFS_OK) {
+          syscall_complete(regs, syscall_num, NS_ERR_PERMISSION);
+          break;
+        }
         rc = vfs_read(fd, buf, size);
       }
       syscall_complete(regs, syscall_num, (uint32_t)rc);
@@ -1126,6 +1149,9 @@ void syscall_handler(uint32_t *regs) {
         rc = NS_OK;
       } else {
         rc = vfs_close(fd);
+        if (rc == VFS_OK) {
+          posix_track_fd_close(os_current_task, fd);
+        }
       }
       syscall_complete(regs, syscall_num, (uint32_t)rc);
     }
@@ -1136,11 +1162,26 @@ void syscall_handler(uint32_t *regs) {
     const char *path = (const char *)regs[4];
     int flags = (int)regs[6];
     int rc;
+    int access_mask = 0;
     if (cpl == 3 && !validate_user_string(path)) {
       syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
       break;
     }
+    if ((flags & VFS_O_WRONLY) != 0) {
+      access_mask = POSIX_ACC_WRITE;
+    } else if ((flags & VFS_O_RDWR) == VFS_O_RDWR) {
+      access_mask = POSIX_ACC_READ | POSIX_ACC_WRITE;
+    } else {
+      access_mask = POSIX_ACC_READ;
+    }
+    if (posix_check_path_permission(os_current_task, path, access_mask) != VFS_OK) {
+      syscall_complete(regs, syscall_num, NS_ERR_PERMISSION);
+      break;
+    }
     rc = vfs_open(path, flags);
+    if (rc >= 0) {
+      posix_track_fd_open(os_current_task, rc, path, flags);
+    }
     syscall_complete(regs, syscall_num, (uint32_t)rc);
     break;
   }
@@ -1317,6 +1358,7 @@ void syscall_handler(uint32_t *regs) {
     }
     socket_close_all_for_task(os_current_task);
     epoll_close_all_for_task(os_current_task);
+    posix_clear_task_fds(os_current_task);
     syscall_complete(regs, syscall_num, NS_OK);
     task_terminate_current();
     break;
@@ -1588,7 +1630,7 @@ void syscall_handler(uint32_t *regs) {
       break;
     }
 
-    rc = vfs_chmod(path, mode);
+    rc = posix_path_chmod(os_current_task, path, mode);
     syscall_complete(regs, syscall_num, (uint32_t)rc);
     break;
   }
@@ -1604,7 +1646,7 @@ void syscall_handler(uint32_t *regs) {
       break;
     }
 
-    rc = vfs_chown(path, uid, gid);
+    rc = posix_path_chown(os_current_task, path, uid, gid);
     syscall_complete(regs, syscall_num, (uint32_t)rc);
     break;
   }
@@ -1708,6 +1750,11 @@ void syscall_handler(uint32_t *regs) {
       break;
     }
 
+    if (posix_check_path_permission(os_current_task, path, POSIX_ACC_WRITE) != VFS_OK) {
+      syscall_complete(regs, syscall_num, NS_ERR_PERMISSION);
+      break;
+    }
+
     rc = vfs_delete(path);
     syscall_complete(regs, syscall_num, (uint32_t)rc);
     break;
@@ -1722,38 +1769,40 @@ void syscall_handler(uint32_t *regs) {
     break;
 
   case SYS_GETUID:
+    ensure_task_identity_defaults(os_current_task);
+    syscall_complete(regs, syscall_num, posix_get_uid(os_current_task));
+    break;
+
   case SYS_GETEUID:
     ensure_task_identity_defaults(os_current_task);
-    syscall_complete(regs, syscall_num, task_uid[os_current_task]);
+    syscall_complete(regs, syscall_num, posix_get_euid(os_current_task));
     break;
 
   case SYS_GETGID:
+    ensure_task_identity_defaults(os_current_task);
+    syscall_complete(regs, syscall_num, posix_get_gid(os_current_task));
+    break;
+
   case SYS_GETEGID:
     ensure_task_identity_defaults(os_current_task);
-    syscall_complete(regs, syscall_num, task_gid[os_current_task]);
+    syscall_complete(regs, syscall_num, posix_get_egid(os_current_task));
     break;
 
   case SYS_SETUID: {
     uint32_t uid = regs[4];
+    int rc;
     ensure_task_identity_defaults(os_current_task);
-    if (task_uid[os_current_task] != 0) {
-      syscall_complete(regs, syscall_num, NS_ERR_PERMISSION);
-      break;
-    }
-    task_uid[os_current_task] = uid;
-    syscall_complete(regs, syscall_num, NS_OK);
+    rc = posix_set_uid(os_current_task, uid);
+    syscall_complete(regs, syscall_num, rc == VFS_OK ? NS_OK : NS_ERR_PERMISSION);
     break;
   }
 
   case SYS_SETGID: {
     uint32_t gid = regs[4];
+    int rc;
     ensure_task_identity_defaults(os_current_task);
-    if (task_uid[os_current_task] != 0) {
-      syscall_complete(regs, syscall_num, NS_ERR_PERMISSION);
-      break;
-    }
-    task_gid[os_current_task] = gid;
-    syscall_complete(regs, syscall_num, NS_OK);
+    rc = posix_set_gid(os_current_task, gid);
+    syscall_complete(regs, syscall_num, rc == VFS_OK ? NS_OK : NS_ERR_PERMISSION);
     break;
   }
 
@@ -2564,6 +2613,22 @@ void syscall_handler(uint32_t *regs) {
     break;
   }
 
+  case SYS_TCSETPGRP: {
+    int tty_id = (int)regs[4];
+    int pgid = (int)regs[6];
+    int rc = posix_tty_tcsetpgrp(os_current_task, tty_id, pgid);
+    syscall_complete(regs, syscall_num, rc == VFS_OK ? NS_OK : NS_ERR_PERMISSION);
+    break;
+  }
+
+  case SYS_TCGETPGRP: {
+    int tty_id = (int)regs[4];
+    int rc = posix_tty_tcgetpgrp(tty_id);
+    syscall_complete(regs, syscall_num,
+                     rc >= 0 ? (uint32_t)rc : NS_ERR_INVALID_ARG);
+    break;
+  }
+
   case SYS_DLERROR: {
     char *buf = (char *)regs[4];
     uint32_t cap = regs[6];
@@ -2626,6 +2691,10 @@ void syscall_handler(uint32_t *regs) {
     if (fd >= 0 && buf != 0 && size > 0) {
       if (cpl == 3 && !validate_user_ptr(buf, size)) {
         syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+        break;
+      }
+      if (posix_check_fd_permission(os_current_task, fd, POSIX_ACC_WRITE) != VFS_OK) {
+        syscall_complete(regs, syscall_num, NS_ERR_PERMISSION);
         break;
       }
       wrote = vfs_write(fd, buf, size);

@@ -16,6 +16,7 @@
 #include "ext2fs.h"
 #include "page_cache.h"
 #include "module_loader.h"
+#include "posix.h"
 
 typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
@@ -138,6 +139,26 @@ static uint32_t parse_u32_hex(const char *s) {
       break;
   }
   return v;
+}
+
+static int parse_u32_octal(const char *s, uint32_t *out) {
+  uint32_t v = 0;
+  int i = 0;
+
+  if (s == 0 || out == 0 || s[0] == '\0') {
+    return 0;
+  }
+
+  while (s[i]) {
+    if (s[i] < '0' || s[i] > '7') {
+      return 0;
+    }
+    v = (v << 3) | (uint32_t)(s[i] - '0');
+    i++;
+  }
+
+  *out = v;
+  return 1;
 }
 
 static int str_ieq(const char *a, const char *b) {
@@ -533,6 +554,9 @@ static void cmd_help(const char *args) {
   gprint("phase6:   synview synset synrule synpreset syncmp\n", 0x77C8FF);
   gprint("          sbrowse spreview stag sdiff\n", 0x77C8FF);
   gprint("phase25:  insmod <path>  rmmod <path|handle>  lsmod\n", 0x77C8FF);
+  gprint("phase26:  id [task]  chmod <path> <octal>  chown <path> <uid> <gid>\n", 0x77C8FF);
+  gprint("          setuid <uid>  setgid <gid>  setpgid <task> <pgid>\n", 0x77C8FF);
+  gprint("          jobs  fg <task>  bg <task>  tcsetpgrp <tty> <pgid>  tcgetpgrp <tty>\n", 0x77C8FF);
   gprint("system:   tz show | tz set <+HH[:MM]|-HH[:MM]>\n", 0x77C8FF);
 }
 
@@ -2135,6 +2159,11 @@ static void cmd_exec(const char *args) {
     return;
   }
 
+  if (posix_check_path_permission(os_current_task, args, POSIX_ACC_EXEC) != VFS_OK) {
+    set_cmd_output("EXEC PERM DENIED");
+    return;
+  }
+
   /* Attempt to execute the program */
   if (exec_user_program(args)) {
     set_cmd_output("EXEC OK");
@@ -2208,6 +2237,280 @@ static void cmd_lsmod(const char *args) {
     gprint("\n", 0x000000);
   }
   set_cmd_output("LSMOD OK");
+}
+
+static void cmd_id(const char *args) {
+  char tok[16];
+  int tid = os_current_task;
+  uint32_t uid;
+  uint32_t euid;
+  uint32_t gid;
+  uint32_t egid;
+  int pgid;
+  char user_name[POSIX_NAME_MAX];
+  char group_name[POSIX_NAME_MAX];
+
+  next_token(args, tok, sizeof(tok));
+  if (tok[0] != '\0') {
+    if (!is_dec_number(tok)) {
+      set_cmd_output("USAGE: id [task]");
+      return;
+    }
+    tid = parse_u32_dec(tok);
+  }
+
+  if (!task_is_valid(tid) || os_tasks[tid].state == TASK_STATE_TERMINATED) {
+    set_cmd_output("ID: TASK INVALID");
+    return;
+  }
+
+  uid = posix_get_uid(tid);
+  euid = posix_get_euid(tid);
+  gid = posix_get_gid(tid);
+  egid = posix_get_egid(tid);
+  pgid = posix_task_get_pgid(tid);
+  (void)posix_lookup_user_name(uid, user_name, sizeof(user_name));
+  (void)posix_lookup_group_name(gid, group_name, sizeof(group_name));
+
+  gprint("TASK ", 0x99EEFF);
+  gprint_dec(tid, 0xFFFFFF);
+  gprint(" UID=", 0x99EEFF);
+  gprint_dec((int)uid, 0xFFFFFF);
+  gprint("(", 0x777777);
+  gprint(user_name, 0x77FFAA);
+  gprint(") EUID=", 0x99EEFF);
+  gprint_dec((int)euid, 0xFFFFFF);
+  gprint(" GID=", 0x99EEFF);
+  gprint_dec((int)gid, 0xFFFFFF);
+  gprint("(", 0x777777);
+  gprint(group_name, 0x77FFAA);
+  gprint(") EGID=", 0x99EEFF);
+  gprint_dec((int)egid, 0xFFFFFF);
+  gprint(" PGID=", 0x99EEFF);
+  gprint_dec(pgid, 0xFFFFFF);
+  gprint("\n", 0x000000);
+  set_cmd_output("ID OK");
+}
+
+static void cmd_chmod_posix(const char *args) {
+  char path[64];
+  char mode_tok[16];
+  uint32_t mode = 0;
+  int rc;
+
+  args = next_token(args, path, sizeof(path));
+  next_token(args, mode_tok, sizeof(mode_tok));
+  if (path[0] == '\0' || mode_tok[0] == '\0' || !parse_u32_octal(mode_tok, &mode)) {
+    set_cmd_output("USAGE: chmod <path> <octal>");
+    return;
+  }
+
+  rc = posix_path_chmod(os_current_task, path, (int)(mode & 07777u));
+  set_cmd_output(rc == VFS_OK ? "CHMOD OK" : "CHMOD FAIL");
+}
+
+static void cmd_chown_posix(const char *args) {
+  char path[64];
+  char uid_tok[16];
+  char gid_tok[16];
+  int uid;
+  int gid;
+  int rc;
+
+  args = next_token(args, path, sizeof(path));
+  args = next_token(args, uid_tok, sizeof(uid_tok));
+  next_token(args, gid_tok, sizeof(gid_tok));
+  if (path[0] == '\0' || !is_dec_number(uid_tok) || !is_dec_number(gid_tok)) {
+    set_cmd_output("USAGE: chown <path> <uid> <gid>");
+    return;
+  }
+
+  uid = parse_u32_dec(uid_tok);
+  gid = parse_u32_dec(gid_tok);
+  rc = posix_path_chown(os_current_task, path, uid, gid);
+  set_cmd_output(rc == VFS_OK ? "CHOWN OK" : "CHOWN FAIL");
+}
+
+static void cmd_setuid(const char *args) {
+  char uid_tok[16];
+  int uid;
+  int rc;
+
+  next_token(args, uid_tok, sizeof(uid_tok));
+  if (!is_dec_number(uid_tok)) {
+    set_cmd_output("USAGE: setuid <uid>");
+    return;
+  }
+
+  uid = parse_u32_dec(uid_tok);
+  rc = posix_set_uid(os_current_task, (uint32_t)uid);
+  set_cmd_output(rc == VFS_OK ? "SETUID OK" : "SETUID FAIL");
+}
+
+static void cmd_setgid(const char *args) {
+  char gid_tok[16];
+  int gid;
+  int rc;
+
+  next_token(args, gid_tok, sizeof(gid_tok));
+  if (!is_dec_number(gid_tok)) {
+    set_cmd_output("USAGE: setgid <gid>");
+    return;
+  }
+
+  gid = parse_u32_dec(gid_tok);
+  rc = posix_set_gid(os_current_task, (uint32_t)gid);
+  set_cmd_output(rc == VFS_OK ? "SETGID OK" : "SETGID FAIL");
+}
+
+static void cmd_setpgid(const char *args) {
+  char task_tok[16];
+  char pgid_tok[16];
+  int tid;
+  int pgid;
+  int rc;
+
+  args = next_token(args, task_tok, sizeof(task_tok));
+  next_token(args, pgid_tok, sizeof(pgid_tok));
+  if (!is_dec_number(task_tok) || !is_dec_number(pgid_tok)) {
+    set_cmd_output("USAGE: setpgid <task> <pgid>");
+    return;
+  }
+
+  tid = parse_u32_dec(task_tok);
+  pgid = parse_u32_dec(pgid_tok);
+  rc = posix_task_set_pgid(tid, pgid);
+  set_cmd_output(rc == VFS_OK ? "SETPGID OK" : "SETPGID FAIL");
+}
+
+static void cmd_jobs(const char *args) {
+  (void)args;
+
+  gprint("PID ST PGID UID EUID\n", 0x99EEFF);
+  for (int t = 0; t < MAX_TASKS; t++) {
+    if (os_tasks[t].state == TASK_STATE_TERMINATED) {
+      continue;
+    }
+    gprint_dec(t, 0xFFFFFF);
+    gprint(" ", 0x000000);
+    gprint((char *)task_state_name(os_tasks[t].state), 0x77FFAA);
+    gprint(" ", 0x000000);
+    gprint_dec(posix_task_get_pgid(t), 0xFFFFFF);
+    gprint(" ", 0x000000);
+    gprint_dec((int)posix_get_uid(t), 0xFFFFFF);
+    gprint(" ", 0x000000);
+    gprint_dec((int)posix_get_euid(t), 0xFFFFFF);
+    gprint("\n", 0x000000);
+  }
+  set_cmd_output("JOBS OK");
+}
+
+static void cmd_fg(const char *args) {
+  char pid_tok[16];
+  int pid;
+  int pgid;
+  int rc;
+
+  next_token(args, pid_tok, sizeof(pid_tok));
+  if (!is_dec_number(pid_tok)) {
+    set_cmd_output("USAGE: fg <task>");
+    return;
+  }
+
+  pid = parse_u32_dec(pid_tok);
+  if (!task_is_valid(pid) || os_tasks[pid].state == TASK_STATE_TERMINATED) {
+    set_cmd_output("FG FAIL");
+    return;
+  }
+
+  pgid = posix_task_get_pgid(pid);
+  if (pgid < 0) {
+    set_cmd_output("FG FAIL");
+    return;
+  }
+
+  rc = posix_tty_tcsetpgrp(os_current_task, 0, pgid);
+  if (rc != VFS_OK) {
+    set_cmd_output("FG FAIL");
+    return;
+  }
+
+  (void)posix_task_signal_pgid(os_current_task, pgid, 18);
+  set_cmd_output("FG OK");
+}
+
+static void cmd_bg(const char *args) {
+  char pid_tok[16];
+  int pid;
+  int pgid;
+  int rc;
+
+  next_token(args, pid_tok, sizeof(pid_tok));
+  if (!is_dec_number(pid_tok)) {
+    set_cmd_output("USAGE: bg <task>");
+    return;
+  }
+
+  pid = parse_u32_dec(pid_tok);
+  if (!task_is_valid(pid) || os_tasks[pid].state == TASK_STATE_TERMINATED) {
+    set_cmd_output("BG FAIL");
+    return;
+  }
+
+  pgid = posix_task_get_pgid(pid);
+  if (pgid < 0) {
+    set_cmd_output("BG FAIL");
+    return;
+  }
+
+  rc = posix_task_signal_pgid(os_current_task, pgid, 18);
+  set_cmd_output(rc == VFS_OK ? "BG OK" : "BG FAIL");
+}
+
+static void cmd_tcsetpgrp(const char *args) {
+  char tty_tok[16];
+  char pgid_tok[16];
+  int tty_id;
+  int pgid;
+  int rc;
+
+  args = next_token(args, tty_tok, sizeof(tty_tok));
+  next_token(args, pgid_tok, sizeof(pgid_tok));
+  if (!is_dec_number(tty_tok) || !is_dec_number(pgid_tok)) {
+    set_cmd_output("USAGE: tcsetpgrp <tty> <pgid>");
+    return;
+  }
+
+  tty_id = parse_u32_dec(tty_tok);
+  pgid = parse_u32_dec(pgid_tok);
+  rc = posix_tty_tcsetpgrp(os_current_task, tty_id, pgid);
+  set_cmd_output(rc == VFS_OK ? "TCSETPGRP OK" : "TCSETPGRP FAIL");
+}
+
+static void cmd_tcgetpgrp(const char *args) {
+  char tty_tok[16];
+  int tty_id;
+  int pgid;
+
+  next_token(args, tty_tok, sizeof(tty_tok));
+  if (!is_dec_number(tty_tok)) {
+    set_cmd_output("USAGE: tcgetpgrp <tty>");
+    return;
+  }
+
+  tty_id = parse_u32_dec(tty_tok);
+  pgid = posix_tty_tcgetpgrp(tty_id);
+  if (pgid < 0) {
+    set_cmd_output("TCGETPGRP FAIL");
+    return;
+  }
+
+  gprint("TTY ", 0x99EEFF);
+  gprint_dec(tty_id, 0xFFFFFF);
+  gprint(" FG PGID=", 0x99EEFF);
+  gprint_dec(pgid, 0xFFFFFF);
+  gprint("\n", 0x000000);
+  set_cmd_output("TCGETPGRP OK");
 }
 
 static void cmd_delete(const char *args) {
@@ -3085,6 +3388,17 @@ static const CommandEntry command_table[] = {
     {"insmod", cmd_insmod},
     {"rmmod", cmd_rmmod},
     {"lsmod", cmd_lsmod},
+    {"id", cmd_id},
+    {"chmod", cmd_chmod_posix},
+    {"chown", cmd_chown_posix},
+    {"setuid", cmd_setuid},
+    {"setgid", cmd_setgid},
+    {"setpgid", cmd_setpgid},
+    {"jobs", cmd_jobs},
+    {"fg", cmd_fg},
+    {"bg", cmd_bg},
+    {"tcsetpgrp", cmd_tcsetpgrp},
+    {"tcgetpgrp", cmd_tcgetpgrp},
     {"mkdemo", cmd_mkdemo},
     {"synview", cmd_synview},
     {"synset", cmd_synset},

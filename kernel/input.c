@@ -1,4 +1,5 @@
 #include "input.h"
+#include "posix.h"
 
 typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
@@ -273,6 +274,18 @@ void keyboard_handler(void) {
 
   if (code == 0x3F) {
     sys_load_task(0, 0);
+    return;
+  }
+
+  /* Ctrl+C -> SIGINT to terminal foreground process group. */
+  if (key_ctrl && code == 0x2E) {
+    posix_tty_signal_foreground(0, 2);
+    return;
+  }
+
+  /* Ctrl+Z -> SIGTSTP to terminal foreground process group. */
+  if (key_ctrl && code == 0x2C) {
+    posix_tty_signal_foreground(0, 20);
     return;
   }
 
