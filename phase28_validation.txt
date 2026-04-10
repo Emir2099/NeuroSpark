@@ -1,0 +1,13 @@
+Phase 28 Validation Report
+Date: 2026-04-10 10:12:50 UTC
+Automated pass count: 13
+Automated fail count: 0
+Automated result: PASS
+
+Suggested shell sequence for manual validation:
+  profile on
+  profile samples 4
+  trace 1 show
+  kdbg show 1
+  kdbg stack 1
+  kdbg mem 0xC0000000 64

@@ -11,6 +11,10 @@ switch_task:
     ; Get the 'old' TCB pointer (first argument)
     mov eax, [esp + 20]     
     mov [eax], esp          ; Save current ESP (stack pointer) into TCB
+    mov ecx, [esp + 12]
+    mov [eax + 4], ecx      ; Save current EBP into TCB
+    mov ecx, [esp + 16]
+    mov [eax + 8], ecx      ; Save return EIP into TCB
 
     ; 2. Load new task's context
     mov eax, [esp + 24]     ; Get the 'new' TCB pointer (second argument)

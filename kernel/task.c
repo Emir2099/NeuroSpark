@@ -52,8 +52,28 @@ void task_trace_event(int task_id, uint32_t event, uint32_t arg) {
 }
 
 void task_trace_syscall(int task_id, uint32_t syscall_num, uint32_t result) {
+    task_trace_syscall_ex(task_id, syscall_num, result, 0, 0, 0);
+}
+
+void task_trace_syscall_ex(int task_id, uint32_t syscall_num, uint32_t result,
+                           uint32_t arg0, uint32_t arg1, uint32_t arg2) {
     uint32_t packed = ((syscall_num & 0xFFu) << 24) | (result & 0x00FFFFFFu);
-    task_trace_event(task_id, TASK_TRACE_EVT_SYSCALL, packed);
+
+    if (!task_is_valid(task_id)) {
+        return;
+    }
+    if (!os_tasks[task_id].trace_enabled) {
+        return;
+    }
+
+    os_tasks[task_id].trace_last_event = TASK_TRACE_EVT_SYSCALL;
+    os_tasks[task_id].trace_last_arg = packed;
+    os_tasks[task_id].trace_last_syscall = syscall_num;
+    os_tasks[task_id].trace_last_arg0 = arg0;
+    os_tasks[task_id].trace_last_arg1 = arg1;
+    os_tasks[task_id].trace_last_arg2 = arg2;
+    os_tasks[task_id].trace_last_result = result;
+    os_tasks[task_id].trace_event_count++;
 }
 
 void create_task(int index, void (*func_ptr)(), uint32_t page_dir) {
@@ -98,6 +118,11 @@ void create_task(int index, void (*func_ptr)(), uint32_t page_dir) {
     os_tasks[index].trace_enabled = 0;
     os_tasks[index].trace_last_event = 0;
     os_tasks[index].trace_last_arg = 0;
+    os_tasks[index].trace_last_syscall = 0;
+    os_tasks[index].trace_last_arg0 = 0;
+    os_tasks[index].trace_last_arg1 = 0;
+    os_tasks[index].trace_last_arg2 = 0;
+    os_tasks[index].trace_last_result = 0;
     os_tasks[index].trace_event_count = 0;
     os_tasks[index].fault_code = 0;
     os_tasks[index].fault_addr = 0;

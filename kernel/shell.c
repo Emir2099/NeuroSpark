@@ -408,6 +408,74 @@ static const char *fault_vector_name(uint32_t packed_fault) {
   return "EXC";
 }
 
+static void print_profile_sample_line(const ProfileStackSample *sample) {
+  if (sample == 0) {
+    return;
+  }
+
+  gprint("task=", 0x99EEFF);
+  gprint_dec((int)sample->task_id, 0xFFFFFF);
+  gprint(" tick=", 0x99EEFF);
+  gprint_dec((int)sample->tick, 0xFFFFFF);
+  gprint(" stack=", 0x99EEFF);
+  for (uint32_t i = 0; i < sample->depth; i++) {
+    gprint("0x", 0x666666);
+    gprint_hex(sample->frames[i], 8, 0xFFFFFF);
+    if (i + 1u < sample->depth) {
+      gprint(";", 0x666666);
+    }
+  }
+  gprint("\n", 0x000000);
+}
+
+static void dump_memory_region(uint32_t addr, uint32_t len) {
+  uint32_t end = addr + len;
+
+  for (uint32_t base = addr; base < end; base += 16u) {
+    gprint_hex(base, 8, 0x77C8FF);
+    gprint(": ", 0x000000);
+    for (uint32_t i = 0; i < 16u && (base + i) < end; i++) {
+      uint8_t value = *((uint8_t *)(base + i));
+      gprint_hex(value, 2, 0xFFFFFF);
+      gprint(" ", 0x666666);
+    }
+    gprint("\n", 0x000000);
+  }
+}
+
+static void print_task_debug_info(int pid) {
+  gprint("KDBG PID ", 0x99EEFF);
+  gprint_dec(pid, 0xFFFFFF);
+  gprint(" ST:", 0x99EEFF);
+  gprint((char *)task_state_name(os_tasks[pid].state), 0x77FFAA);
+  gprint(" PR:", 0x99EEFF);
+  gprint_dec((int)os_tasks[pid].priority, 0xFFFFFF);
+  gprint(" RT:", 0x99EEFF);
+  gprint_dec((int)os_tasks[pid].runtime_ticks, 0xFFFFFF);
+  gprint(" CSW:", 0x99EEFF);
+  gprint_dec((int)os_tasks[pid].context_switches, 0xFFFFFF);
+  gprint(" TRACE:", 0x99EEFF);
+  gprint(os_tasks[pid].trace_enabled ? "ON" : "OFF",
+         os_tasks[pid].trace_enabled ? 0x44FF88 : 0xFFAA66);
+  gprint(" EVT:", 0x99EEFF);
+  gprint((char *)trace_event_name(os_tasks[pid].trace_last_event), 0x77C8FF);
+    gprint(" ARG:", 0x99EEFF);
+    gprint_hex(os_tasks[pid].trace_last_arg, 8, 0xFFFFFF);
+  gprint(" SYSCALL:", 0x99EEFF);
+  gprint_dec((int)os_tasks[pid].trace_last_syscall, 0xFFFFFF);
+  gprint(" ARG0:", 0x99EEFF);
+  gprint_dec((int)os_tasks[pid].trace_last_arg0, 0xFFFFFF);
+  gprint(" ARG1:", 0x99EEFF);
+  gprint_dec((int)os_tasks[pid].trace_last_arg1, 0xFFFFFF);
+  gprint(" ARG2:", 0x99EEFF);
+  gprint_dec((int)os_tasks[pid].trace_last_arg2, 0xFFFFFF);
+  gprint(" RET:", 0x99EEFF);
+  gprint_dec((int)os_tasks[pid].trace_last_result, 0xFFFFFF);
+  gprint(" CNT:", 0x99EEFF);
+  gprint_dec((int)os_tasks[pid].trace_event_count, 0xFFFFFF);
+  gprint("\n", 0x000000);
+}
+
 static int require_admin_context(void) {
   if (os_current_task != 0) {
     set_cmd_output("ERR: PRIVILEGED (TASK0)");
@@ -582,6 +650,8 @@ static void cmd_help(const char *args) {
   gprint("          jobs  fg <task>  bg <task>  tcsetpgrp <tty> <pgid>  tcgetpgrp <tty>\n", 0x77C8FF);
   gprint("phase27:  sched show|reset  nice <pid> <0..7>  memstat\n", 0x77C8FF);
   gprint("          net coalesce <poll> <irqpoll>\n", 0x77C8FF);
+  gprint("phase28:  kdbg show|stack|mem|trace  trace <pid> on|off|show\n", 0x77C8FF);
+  gprint("          profile samples [n]  profile export <path>\n", 0x77C8FF);
   gprint("system:   tz show | tz set <+HH[:MM]|-HH[:MM]>\n", 0x77C8FF);
 }
 
@@ -892,18 +962,7 @@ static void cmd_trace(const char *args) {
     }
 
     if (t_mode[0] == '\0' || str_eq(t_mode, "show")) {
-      gprint("TRACE PID ", 0x99EEFF);
-      gprint_dec(pid, 0xFFFFFF);
-      gprint(" ", 0x000000);
-      gprint(os_tasks[pid].trace_enabled ? "ON" : "OFF",
-             os_tasks[pid].trace_enabled ? 0x44FF88 : 0xFFAA66);
-      gprint(" EVT:", 0x99EEFF);
-      gprint((char *)trace_event_name(os_tasks[pid].trace_last_event), 0x77C8FF);
-      gprint(" ARG:", 0x99EEFF);
-      gprint_dec((int)os_tasks[pid].trace_last_arg, 0xFFFFFF);
-      gprint(" CNT:", 0x99EEFF);
-      gprint_dec((int)os_tasks[pid].trace_event_count, 0xFFFFFF);
-      gprint("\n", 0x000000);
+      print_task_debug_info(pid);
       return;
     }
 
@@ -927,6 +986,124 @@ static void cmd_trace(const char *args) {
   }
 
   set_cmd_output("USAGE: trace <pid> on|off|show");
+}
+
+static void cmd_kdbg(const char *args) {
+  char sub[16];
+  char a[16];
+  char b[16];
+  char c[16];
+
+  args = next_token(args, sub, sizeof(sub));
+  args = next_token(args, a, sizeof(a));
+  args = next_token(args, b, sizeof(b));
+  next_token(args, c, sizeof(c));
+
+  if (sub[0] == '\0' || str_eq(sub, "show")) {
+    if (!is_dec_number(a)) {
+      set_cmd_output("USAGE: kdbg show <pid>");
+      return;
+    }
+    {
+      int pid = parse_u32_dec(a);
+      if (pid < 0 || pid >= os_task_count) {
+        set_cmd_output("KDBG FAIL");
+        return;
+      }
+      print_task_debug_info(pid);
+    }
+    return;
+  }
+
+  if (str_eq(sub, "stack")) {
+    if (!is_dec_number(a)) {
+      set_cmd_output("USAGE: kdbg stack <pid>");
+      return;
+    }
+
+    {
+      int pid = parse_u32_dec(a);
+      if (pid < 0 || pid >= os_task_count) {
+        set_cmd_output("KDBG FAIL");
+        return;
+      }
+
+      gprint("KDBG STACK PID ", 0x99EEFF);
+      gprint_dec(pid, 0xFFFFFF);
+      gprint(" EIP:", 0x99EEFF);
+      gprint_hex(os_tasks[pid].eip, 8, 0xFFFFFF);
+      gprint(" EBP:", 0x99EEFF);
+      gprint_hex(os_tasks[pid].ebp, 8, 0xFFFFFF);
+      gprint("\n", 0x000000);
+      {
+        uint32_t *frame = (uint32_t *)os_tasks[pid].ebp;
+        int depth = 0;
+
+        while (frame != 0 && depth < 6) {
+          uint32_t next = frame[0];
+          uint32_t ret = frame[1];
+
+          gprint("#", 0x666666);
+          gprint_dec(depth, 0xFFFFFF);
+          gprint(" RET=0x", 0x99EEFF);
+          gprint_hex(ret, 8, 0xFFFFFF);
+          gprint(" EBP=0x", 0x99EEFF);
+          gprint_hex((uint32_t)frame, 8, 0xFFFFFF);
+          gprint("\n", 0x000000);
+
+          if (next == 0u || next <= (uint32_t)frame || (next - (uint32_t)frame) > 0x4000u) {
+            break;
+          }
+          frame = (uint32_t *)next;
+          depth++;
+        }
+      }
+    }
+    return;
+  }
+
+  if (str_eq(sub, "mem")) {
+    uint32_t addr;
+    uint32_t len;
+
+    if (!is_dec_number(a) && !(a[0] == '0' && a[1] == 'x')) {
+      set_cmd_output("USAGE: kdbg mem <hexaddr> <len>");
+      return;
+    }
+    addr = parse_u32_hex(a);
+    len = is_dec_number(b) ? (uint32_t)parse_u32_dec(b) : parse_u32_hex(b);
+    if (len == 0u) {
+      len = 64u;
+    }
+    dump_memory_region(addr, len);
+    return;
+  }
+
+  if (str_eq(sub, "trace")) {
+    if (!is_dec_number(a)) {
+      set_cmd_output("USAGE: kdbg trace <pid> on|off");
+      return;
+    }
+    {
+      int pid = parse_u32_dec(a);
+      if (pid < 0 || pid >= os_task_count) {
+        set_cmd_output("KDBG FAIL");
+        return;
+      }
+      if (str_eq(b, "on")) {
+        os_tasks[pid].trace_enabled = 1;
+        set_cmd_output("KDBG TRACE ON");
+      } else if (str_eq(b, "off")) {
+        os_tasks[pid].trace_enabled = 0;
+        set_cmd_output("KDBG TRACE OFF");
+      } else {
+        print_task_debug_info(pid);
+      }
+    }
+    return;
+  }
+
+  set_cmd_output("USAGE: kdbg show|stack|mem|trace");
 }
 
 static void cmd_sched(const char *args) {
@@ -1182,7 +1359,9 @@ static void cmd_profile(const char *args) {
   char path[48];
   ProfileSnapshot snap;
   ProfileCommandStat cmd_stats[6];
+  ProfileStackSample samples[8];
   int cmd_stat_count = 0;
+  int sample_count = 0;
 
   args = next_token(args, sub, sizeof(sub));
   args = next_token(args, opt, sizeof(opt));
@@ -1191,6 +1370,7 @@ static void cmd_profile(const char *args) {
   if (sub[0] == '\0' || str_eq(sub, "show")) {
     profile_snapshot(&snap);
     cmd_stat_count = profile_get_command_stats(cmd_stats, 6);
+    sample_count = profile_get_stack_samples(samples, 8);
     gprint("PROFILE ", 0x99EEFF);
     gprint(snap.enabled ? "ON" : "OFF", snap.enabled ? 0x44FF88 : 0xFFAA66);
     gprint(" HUD:", 0x99EEFF);
@@ -1263,6 +1443,37 @@ static void cmd_profile(const char *args) {
         gprint("\n", 0x000000);
       }
     }
+
+    gprint("SAMPLES: ", 0x99EEFF);
+    gprint_dec(sample_count, 0xFFFFFF);
+    gprint("\n", 0x000000);
+    for (int i = 0; i < sample_count; i++) {
+      print_profile_sample_line(&samples[i]);
+    }
+    return;
+  }
+
+  if (str_eq(sub, "samples") || str_eq(sub, "stacks")) {
+    int max_entries = 8;
+
+    if (is_dec_number(opt)) {
+      max_entries = parse_u32_dec(opt);
+    }
+    if (max_entries < 1) {
+      max_entries = 1;
+    }
+    if (max_entries > 8) {
+      max_entries = 8;
+    }
+
+    sample_count = profile_get_stack_samples(samples, max_entries);
+    gprint("PROFILE SAMPLES\n", 0x99EEFF);
+    for (int i = 0; i < sample_count; i++) {
+      print_profile_sample_line(&samples[i]);
+    }
+    if (sample_count == 0) {
+      gprint("NO SAMPLES\n", 0xFFAA66);
+    }
     return;
   }
 
@@ -1309,7 +1520,7 @@ static void cmd_profile(const char *args) {
     return;
   }
 
-  set_cmd_output("USAGE: profile on|off|show|reset|export <path>|hud compact|detail");
+  set_cmd_output("USAGE: profile on|off|show|reset|export <path>|hud compact|detail|samples [n]");
 }
 
 static void cmd_manifest(const char *args) {
@@ -3530,6 +3741,7 @@ static const CommandEntry command_table[] = {
     {"kill", cmd_kill},
     {"nice", cmd_nice},
     {"trace", cmd_trace},
+    {"kdbg", cmd_kdbg},
     {"ipc", cmd_ipc},
     {"remote", cmd_remote},
     {"viz", cmd_viz},

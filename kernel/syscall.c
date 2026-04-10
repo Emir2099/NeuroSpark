@@ -108,6 +108,8 @@ enum {
 #define SYS_IO_SETUP 80
 #define SYS_IO_SUBMIT 81
 #define SYS_IO_GETEVENTS 82
+#define SYS_TRACE 83
+#define SYS_PTRACE 84
 
 #define SIGKILL 9
 #define SIGINT 2
@@ -174,6 +176,13 @@ enum {
 #define NS_AIO_MAX_REQ 64
 #define NS_AIO_OP_READ 0u
 #define NS_AIO_OP_WRITE 1u
+
+#define NS_PTRACE_GET_INFO 0u
+#define NS_PTRACE_GET_STACK 1u
+#define NS_PTRACE_SET_TRACE 2u
+#define NS_PTRACE_SET_PRIORITY 3u
+
+#define NS_PTRACE_STACK_DEPTH 6u
 
 #define NS_BOOT_EPOCH_SECONDS 1767225600u /* 2026-01-01T00:00:00Z */
 #define NS_TICKS_PER_SECOND 100u
@@ -362,6 +371,43 @@ typedef struct {
   uint32_t nbytes;
   uint32_t user_data;
 } NsIoCb;
+
+typedef struct {
+  uint32_t task_id;
+  uint32_t state;
+  uint32_t priority;
+  uint32_t workload_class;
+  uint32_t runtime_ticks;
+  uint32_t context_switches;
+  uint32_t trace_enabled;
+  uint32_t trace_event_count;
+  uint32_t trace_last_event;
+  uint32_t trace_last_arg;
+  uint32_t trace_last_syscall;
+  uint32_t trace_last_result;
+  uint32_t trace_last_arg0;
+  uint32_t trace_last_arg1;
+  uint32_t trace_last_arg2;
+  uint32_t esp;
+  uint32_t ebp;
+  uint32_t eip;
+  uint32_t fault_code;
+  uint32_t fault_addr;
+  uint32_t fault_eip;
+  uint32_t wake_tick;
+  uint32_t wait_reason;
+  uint32_t sched_wait_ticks;
+  uint32_t sched_wake_boost;
+  uint32_t sched_last_run_tick;
+} NsPtraceInfo;
+
+typedef struct {
+  uint32_t task_id;
+  uint32_t eip;
+  uint32_t ebp;
+  uint32_t depth;
+  uint32_t frames[NS_PTRACE_STACK_DEPTH];
+} NsPtraceStack;
 
 typedef struct {
   uint32_t user_data;
@@ -635,6 +681,80 @@ static int aio_submit_one(NsAioCtx *ctx, const NsIoCb *cb) {
 
   ctx->req_count++;
   return 1;
+}
+
+static int ptrace_task_allowed(uint32_t cpl, int task_id) {
+  if (task_id < 0 || task_id >= MAX_TASKS) {
+    return 0;
+  }
+  if (cpl != 3u) {
+    return 1;
+  }
+  return task_id == os_current_task;
+}
+
+static void ptrace_fill_info(int task_id, NsPtraceInfo *info) {
+  TCB *task;
+
+  if (info == 0 || task_id < 0 || task_id >= MAX_TASKS) {
+    return;
+  }
+
+  task = &os_tasks[task_id];
+  info->task_id = (uint32_t)task_id;
+  info->state = task->state;
+  info->priority = task->priority;
+  info->workload_class = task->workload_class;
+  info->runtime_ticks = task->runtime_ticks;
+  info->context_switches = task->context_switches;
+  info->trace_enabled = task->trace_enabled;
+  info->trace_event_count = task->trace_event_count;
+  info->trace_last_event = task->trace_last_event;
+  info->trace_last_arg = task->trace_last_arg;
+  info->trace_last_syscall = task->trace_last_syscall;
+  info->trace_last_result = task->trace_last_result;
+  info->trace_last_arg0 = task->trace_last_arg0;
+  info->trace_last_arg1 = task->trace_last_arg1;
+  info->trace_last_arg2 = task->trace_last_arg2;
+  info->esp = task->esp;
+  info->ebp = task->ebp;
+  info->eip = task->eip;
+  info->fault_code = task->fault_code;
+  info->fault_addr = task->fault_addr;
+  info->fault_eip = task->fault_eip;
+  info->wake_tick = task->wake_tick;
+  info->wait_reason = task->wait_reason;
+  info->sched_wait_ticks = task->sched_wait_ticks;
+  info->sched_wake_boost = task->sched_wake_boost;
+  info->sched_last_run_tick = task->sched_last_run_tick;
+}
+
+static void ptrace_fill_stack(int task_id, NsPtraceStack *stack) {
+  uint32_t *frame;
+
+  if (stack == 0 || task_id < 0 || task_id >= MAX_TASKS) {
+    return;
+  }
+
+  stack->task_id = (uint32_t)task_id;
+  stack->eip = os_tasks[task_id].eip;
+  stack->ebp = os_tasks[task_id].ebp;
+  stack->depth = 0;
+  for (uint32_t i = 0; i < NS_PTRACE_STACK_DEPTH; i++) {
+    stack->frames[i] = 0;
+  }
+
+  frame = (uint32_t *)os_tasks[task_id].ebp;
+  while (frame != 0 && stack->depth < NS_PTRACE_STACK_DEPTH) {
+    uint32_t next = frame[0];
+    uint32_t ret = frame[1];
+
+    stack->frames[stack->depth++] = ret;
+    if (next == 0u || next <= (uint32_t)frame || (next - (uint32_t)frame) > 0x4000u) {
+      break;
+    }
+    frame = (uint32_t *)next;
+  }
 }
 
 static int aio_process_events(NsAioCtx *ctx, NsIoEvent *events, uint32_t maxevents) {
@@ -1181,7 +1301,7 @@ static int syscall_validate_cpl(uint32_t cpl, int kernel_only) {
 
 static void syscall_complete(uint32_t *regs, uint32_t syscall_num, uint32_t result) {
   regs[7] = result;
-  task_trace_syscall(os_current_task, syscall_num, result);
+  task_trace_syscall_ex(os_current_task, syscall_num, result, regs[4], regs[5], regs[6]);
 }
 
 static void syscall_complete_value(uint32_t *regs, uint32_t syscall_num,
@@ -2799,6 +2919,82 @@ void syscall_handler(uint32_t *regs) {
     int rc = posix_tty_tcgetpgrp(tty_id);
     syscall_complete(regs, syscall_num,
                      rc >= 0 ? (uint32_t)rc : NS_ERR_INVALID_ARG);
+    break;
+  }
+
+  case SYS_TRACE: {
+    int task_id = (int)regs[4];
+    int mode = (int)regs[5];
+
+    if (!ptrace_task_allowed(cpl, task_id)) {
+      syscall_complete(regs, syscall_num, NS_ERR_PERMISSION);
+      break;
+    }
+
+    if (mode > 0) {
+      os_tasks[task_id].trace_enabled = 1;
+    } else if (mode < 0) {
+      os_tasks[task_id].trace_enabled = 0;
+    }
+
+    syscall_complete(regs, syscall_num, os_tasks[task_id].trace_enabled);
+    break;
+  }
+
+  case SYS_PTRACE: {
+    int task_id = (int)regs[4];
+    uint32_t request = regs[5];
+    uint32_t arg = regs[6];
+
+    if (!ptrace_task_allowed(cpl, task_id)) {
+      syscall_complete(regs, syscall_num, NS_ERR_PERMISSION);
+      break;
+    }
+
+    if (request == NS_PTRACE_GET_INFO) {
+      NsPtraceInfo *info = (NsPtraceInfo *)arg;
+
+      if (cpl == 3u && !validate_user_ptr(info, sizeof(NsPtraceInfo))) {
+        syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+        break;
+      }
+
+      ptrace_fill_info(task_id, info);
+      syscall_complete(regs, syscall_num, NS_OK);
+      break;
+    }
+
+    if (request == NS_PTRACE_GET_STACK) {
+      NsPtraceStack *stack = (NsPtraceStack *)arg;
+
+      if (cpl == 3u && !validate_user_ptr(stack, sizeof(NsPtraceStack))) {
+        syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+        break;
+      }
+
+      ptrace_fill_stack(task_id, stack);
+      syscall_complete(regs, syscall_num, NS_OK);
+      break;
+    }
+
+    if (request == NS_PTRACE_SET_TRACE) {
+      os_tasks[task_id].trace_enabled = arg ? 1u : 0u;
+      syscall_complete(regs, syscall_num, os_tasks[task_id].trace_enabled);
+      break;
+    }
+
+    if (request == NS_PTRACE_SET_PRIORITY) {
+      if (arg > 7u) {
+        syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+        break;
+      }
+      os_tasks[task_id].priority = arg;
+      task_trace_event(task_id, TASK_TRACE_EVT_PRIORITY, arg);
+      syscall_complete(regs, syscall_num, NS_OK);
+      break;
+    }
+
+    syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
     break;
   }
 

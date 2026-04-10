@@ -54,6 +54,11 @@ typedef struct {
   uint32_t trace_enabled;
   uint32_t trace_last_event;
   uint32_t trace_last_arg;
+  uint32_t trace_last_syscall;
+  uint32_t trace_last_arg0;
+  uint32_t trace_last_arg1;
+  uint32_t trace_last_arg2;
+  uint32_t trace_last_result;
   uint32_t trace_event_count;
   uint32_t fault_code;
   uint32_t fault_addr;
@@ -86,5 +91,7 @@ int task_is_valid(int task_id);
 int task_alloc_slot(void);
 void task_trace_event(int task_id, uint32_t event, uint32_t arg);
 void task_trace_syscall(int task_id, uint32_t syscall_num, uint32_t result);
+void task_trace_syscall_ex(int task_id, uint32_t syscall_num, uint32_t result,
+                           uint32_t arg0, uint32_t arg1, uint32_t arg2);
 
 #endif

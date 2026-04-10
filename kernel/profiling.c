@@ -1,15 +1,8 @@
 #include "profiling.h"
 #include "vfs.h"
 
-typedef struct {
-  uint32_t magic;
-  uint32_t version;
-  uint32_t tick;
-  ProfileSnapshot snapshot;
-} ProfileExportBlob;
-
 #define PROFILE_EXPORT_MAGIC 0x50524639u /* PRF9 */
-#define PROFILE_EXPORT_VERSION 2u
+#define PROFILE_EXPORT_VERSION 3u
 
 typedef struct {
   uint32_t samples[PROFILE_ROLLING_WINDOW];
@@ -25,12 +18,24 @@ typedef struct {
   RollingMetric rolling;
 } NamedCommandMetric;
 
+typedef struct {
+  uint32_t tick;
+  uint32_t task_id;
+  uint32_t eip;
+  uint32_t ebp;
+  uint32_t depth;
+  uint32_t frames[PROFILE_SAMPLE_FRAME_MAX];
+} ProfileStackSampleLocal;
+
 static volatile int profile_enabled = 0;
 static volatile int profile_hud_mode = PROFILE_HUD_COMPACT;
 static ProfileMetric profile_metrics[PROFILE_SLOT_COUNT];
 static uint32_t profile_cmd_hist[PROFILE_CMD_HIST_BUCKETS];
 static RollingMetric profile_rolling[PROFILE_SLOT_COUNT];
 static NamedCommandMetric named_cmds[PROFILE_NAMED_CMD_MAX];
+static ProfileStackSampleLocal profile_samples[PROFILE_SAMPLE_MAX];
+static uint32_t profile_sample_head = 0;
+static uint32_t profile_sample_count = 0;
 
 extern uint32_t tick;
 
@@ -127,6 +132,72 @@ static void copy_name(char *dst, const char *src) {
   dst[i] = '\0';
 }
 
+static void append_text(char *dst, uint32_t cap, uint32_t *cursor, const char *text) {
+  uint32_t i = 0;
+
+  if (dst == 0 || cursor == 0 || text == 0 || cap == 0u) {
+    return;
+  }
+
+  while (text[i] != '\0' && *cursor + 1u < cap) {
+    dst[*cursor] = text[i];
+    (*cursor)++;
+    i++;
+  }
+  dst[*cursor] = '\0';
+}
+
+static void append_dec(char *dst, uint32_t cap, uint32_t *cursor, uint32_t value) {
+  char tmp[16];
+  uint32_t len = 0;
+
+  if (value == 0u) {
+    append_text(dst, cap, cursor, "0");
+    return;
+  }
+
+  while (value > 0u && len < sizeof(tmp)) {
+    tmp[len++] = (char)('0' + (value % 10u));
+    value /= 10u;
+  }
+
+  while (len > 0u) {
+    char c[2];
+    c[0] = tmp[--len];
+    c[1] = '\0';
+    append_text(dst, cap, cursor, c);
+  }
+}
+
+static void append_hex(char *dst, uint32_t cap, uint32_t *cursor, uint32_t value) {
+  int started = 0;
+
+  for (int shift = 28; shift >= 0; shift -= 4) {
+    uint32_t nibble = (value >> shift) & 0xFu;
+    char c;
+
+    if (!started && nibble == 0u && shift > 0) {
+      continue;
+    }
+    started = 1;
+    if (nibble < 10u) {
+      c = (char)('0' + nibble);
+    } else {
+      c = (char)('A' + (nibble - 10u));
+    }
+    {
+      char out[2];
+      out[0] = c;
+      out[1] = '\0';
+      append_text(dst, cap, cursor, out);
+    }
+  }
+
+  if (!started) {
+    append_text(dst, cap, cursor, "0");
+  }
+}
+
 static void metric_accumulate(ProfileMetric *m, uint32_t delta_cycles) {
   if (m == 0) {
     return;
@@ -160,6 +231,42 @@ static int metric_avg_cmp(const ProfileMetric *a, const ProfileMetric *b) {
   return 0;
 }
 
+static int frame_chain_valid(uint32_t current, uint32_t next) {
+  if (next == 0u || next <= current) {
+    return 0;
+  }
+  if ((next - current) > 0x4000u) {
+    return 0;
+  }
+  return 1;
+}
+
+static uint32_t capture_stack_frames(uint32_t ebp, uint32_t *frames, uint32_t max_frames) {
+  uint32_t depth = 0;
+  uint32_t *frame = (uint32_t *)ebp;
+
+  if (frames == 0 || max_frames == 0u) {
+    return 0;
+  }
+
+  for (uint32_t i = 0; i < max_frames; i++) {
+    frames[i] = 0;
+  }
+
+  while (frame != 0 && depth < max_frames) {
+    uint32_t next = frame[0];
+    uint32_t ret = frame[1];
+
+    frames[depth++] = ret;
+    if (!frame_chain_valid((uint32_t)frame, next)) {
+      break;
+    }
+    frame = (uint32_t *)next;
+  }
+
+  return depth;
+}
+
 void profile_init(void) {
   profile_enabled = 0;
   profile_hud_mode = PROFILE_HUD_COMPACT;
@@ -184,6 +291,18 @@ void profile_reset(void) {
     metric_reset(&named_cmds[i].metric);
     rolling_reset(&named_cmds[i].rolling);
   }
+  for (int i = 0; i < PROFILE_SAMPLE_MAX; i++) {
+    profile_samples[i].tick = 0;
+    profile_samples[i].task_id = 0;
+    profile_samples[i].eip = 0;
+    profile_samples[i].ebp = 0;
+    profile_samples[i].depth = 0;
+    for (int j = 0; j < PROFILE_SAMPLE_FRAME_MAX; j++) {
+      profile_samples[i].frames[j] = 0;
+    }
+  }
+  profile_sample_head = 0;
+  profile_sample_count = 0;
 }
 
 uint32_t profile_begin(void) {
@@ -285,6 +404,55 @@ void profile_record_named_command(const char *name, uint32_t delta_cycles) {
   rolling_push(&named_cmds[best_index].rolling, delta_cycles);
 }
 
+void profile_sample_current_task(int task_id, uint32_t eip, uint32_t ebp) {
+  ProfileStackSampleLocal *sample;
+
+  if (!profile_enabled || task_id < 0) {
+    return;
+  }
+
+  sample = &profile_samples[profile_sample_head];
+  sample->tick = tick;
+  sample->task_id = (uint32_t)task_id;
+  sample->eip = eip;
+  sample->ebp = ebp;
+  sample->depth = capture_stack_frames(ebp, sample->frames, PROFILE_SAMPLE_FRAME_MAX);
+
+  profile_sample_head++;
+  if (profile_sample_head >= PROFILE_SAMPLE_MAX) {
+    profile_sample_head = 0;
+  }
+  if (profile_sample_count < PROFILE_SAMPLE_MAX) {
+    profile_sample_count++;
+  }
+}
+
+int profile_get_stack_samples(ProfileStackSample *out, int max_entries) {
+  int count = 0;
+
+  if (out == 0 || max_entries <= 0 || profile_sample_count == 0) {
+    return 0;
+  }
+
+  for (uint32_t i = 0; i < profile_sample_count && count < max_entries; i++) {
+    uint32_t idx = (profile_sample_head + PROFILE_SAMPLE_MAX - profile_sample_count + i) %
+                   PROFILE_SAMPLE_MAX;
+    ProfileStackSampleLocal *src = &profile_samples[idx];
+
+    out[count].tick = src->tick;
+    out[count].task_id = src->task_id;
+    out[count].eip = src->eip;
+    out[count].ebp = src->ebp;
+    out[count].depth = src->depth;
+    for (int j = 0; j < PROFILE_SAMPLE_FRAME_MAX; j++) {
+      out[count].frames[j] = src->frames[j];
+    }
+    count++;
+  }
+
+  return count;
+}
+
 uint32_t profile_metric_rolling_avg(uint32_t slot) {
   if (slot >= PROFILE_SLOT_COUNT) {
     return 0;
@@ -347,18 +515,91 @@ void profile_snapshot(ProfileSnapshot *out) {
 }
 
 int profile_export(const char *path) {
-  ProfileExportBlob blob;
-  int wrote;
+  ProfileSnapshot snap;
+  ProfileCommandStat cmd_stats[PROFILE_NAMED_CMD_MAX];
+  ProfileStackSample samples[PROFILE_SAMPLE_MAX];
+  char buffer[8192];
+  uint32_t cursor = 0;
+  int cmd_count = 0;
+  int sample_count = 0;
 
   if (path == 0 || path[0] == '\0') {
     return 0;
   }
 
-  blob.magic = PROFILE_EXPORT_MAGIC;
-  blob.version = PROFILE_EXPORT_VERSION;
-  blob.tick = tick;
-  profile_snapshot(&blob.snapshot);
+  profile_snapshot(&snap);
+  cmd_count = profile_get_command_stats(cmd_stats, PROFILE_NAMED_CMD_MAX);
+  sample_count = profile_get_stack_samples(samples, PROFILE_SAMPLE_MAX);
 
-  wrote = vfs_write_file(path, &blob, sizeof(blob));
-  return wrote == (int)sizeof(blob);
+  buffer[0] = '\0';
+  append_text(buffer, sizeof(buffer), &cursor, "PRF3\n");
+  append_text(buffer, sizeof(buffer), &cursor, "tick=");
+  append_dec(buffer, sizeof(buffer), &cursor, tick);
+  append_text(buffer, sizeof(buffer), &cursor, " enabled=");
+  append_dec(buffer, sizeof(buffer), &cursor, snap.enabled);
+  append_text(buffer, sizeof(buffer), &cursor, " samples=");
+  append_dec(buffer, sizeof(buffer), &cursor, (uint32_t)sample_count);
+  append_text(buffer, sizeof(buffer), &cursor, "\n");
+
+  for (int i = 0; i < PROFILE_SLOT_COUNT; i++) {
+    append_text(buffer, sizeof(buffer), &cursor, "slot[");
+    append_dec(buffer, sizeof(buffer), &cursor, (uint32_t)i);
+    append_text(buffer, sizeof(buffer), &cursor, "] count=");
+    append_dec(buffer, sizeof(buffer), &cursor, snap.slots[i].count);
+    append_text(buffer, sizeof(buffer), &cursor, " total=");
+    append_dec(buffer, sizeof(buffer), &cursor, snap.slots[i].total_cycles);
+    append_text(buffer, sizeof(buffer), &cursor, " min=");
+    append_dec(buffer, sizeof(buffer), &cursor, snap.slots[i].min_cycles);
+    append_text(buffer, sizeof(buffer), &cursor, " max=");
+    append_dec(buffer, sizeof(buffer), &cursor, snap.slots[i].max_cycles);
+    append_text(buffer, sizeof(buffer), &cursor, "\n");
+  }
+
+  append_text(buffer, sizeof(buffer), &cursor, "hist ");
+  for (int i = 0; i < PROFILE_CMD_HIST_BUCKETS; i++) {
+    append_dec(buffer, sizeof(buffer), &cursor, snap.cmd_hist[i]);
+    if (i != PROFILE_CMD_HIST_BUCKETS - 1) {
+      append_text(buffer, sizeof(buffer), &cursor, "/");
+    }
+  }
+  append_text(buffer, sizeof(buffer), &cursor, "\n");
+
+  append_text(buffer, sizeof(buffer), &cursor, "commands ");
+  append_dec(buffer, sizeof(buffer), &cursor, (uint32_t)cmd_count);
+  append_text(buffer, sizeof(buffer), &cursor, "\n");
+  for (int i = 0; i < cmd_count; i++) {
+    append_text(buffer, sizeof(buffer), &cursor, cmd_stats[i].name);
+    append_text(buffer, sizeof(buffer), &cursor, " ");
+    append_dec(buffer, sizeof(buffer), &cursor,
+               cmd_stats[i].metric.count > 0
+                   ? (cmd_stats[i].metric.total_cycles / cmd_stats[i].metric.count)
+                   : 0u);
+    append_text(buffer, sizeof(buffer), &cursor, "/");
+    append_dec(buffer, sizeof(buffer), &cursor, cmd_stats[i].rolling_avg_cycles);
+    append_text(buffer, sizeof(buffer), &cursor, "\n");
+  }
+
+  append_text(buffer, sizeof(buffer), &cursor, "samples\n");
+  for (int i = 0; i < sample_count; i++) {
+    append_text(buffer, sizeof(buffer), &cursor, "task=");
+    append_dec(buffer, sizeof(buffer), &cursor, samples[i].task_id);
+    append_text(buffer, sizeof(buffer), &cursor, " tick=");
+    append_dec(buffer, sizeof(buffer), &cursor, samples[i].tick);
+    append_text(buffer, sizeof(buffer), &cursor, " eip=0x");
+    append_hex(buffer, sizeof(buffer), &cursor, samples[i].eip);
+    append_text(buffer, sizeof(buffer), &cursor, " ebp=0x");
+    append_hex(buffer, sizeof(buffer), &cursor, samples[i].ebp);
+    append_text(buffer, sizeof(buffer), &cursor, " stack=");
+    for (uint32_t j = 0; j < samples[i].depth; j++) {
+      append_text(buffer, sizeof(buffer), &cursor, "0x");
+      append_hex(buffer, sizeof(buffer), &cursor, samples[i].frames[j]);
+      if (j + 1u < samples[i].depth) {
+        append_text(buffer, sizeof(buffer), &cursor, ";");
+      }
+    }
+    append_text(buffer, sizeof(buffer), &cursor, "\n");
+  }
+
+  buffer[cursor] = '\0';
+  return vfs_write_file(path, buffer, cursor + 1u) == (int)(cursor + 1u);
 }

@@ -612,6 +612,12 @@ uint32_t tick = 0;
 uint32_t render_frame = 0;
 void timer_handler(void) {
   tick++;
+
+  if (profile_is_enabled() && (tick & 3u) == 0u && os_current_task >= 0 &&
+      os_current_task < os_task_count) {
+    profile_sample_current_task(os_current_task, os_tasks[os_current_task].eip,
+                                os_tasks[os_current_task].ebp);
+  }
   
   /* Decrement command output timeout if active */
   if (cmd_output_timeout > 0) {
