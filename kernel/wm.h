@@ -82,5 +82,6 @@ void wm_get_taskbar_icon_center(int slot, int *out_x, int *out_y);
 void wm_launch_icon_slot(int slot);
 void wm_open_model_manager(void);
 void wm_open_spike_monitor(void);
+void wm_open_snapshot_browser(void);
 
 #endif

@@ -1787,6 +1787,378 @@ static void draw_content_settings(int x, int y, int w, int h) {
     gprint("Use: tz show | tz set +/-HH:MM", 0x8FB8CC);
 }
 
+typedef struct {
+    uint32_t last_tick;
+    int scroll_offset;
+    int live_trace[200];
+    int base_trace[200];
+    int snapshots_count;
+    char snap_tags[8][16];
+    int selected_snapshot;
+    int diff_view_idx;
+    int active_btn_pulse;
+    int initialized;
+    int diff_sliders[4];
+    int param_scroll;
+    char status_msg[64];
+} WmSnapshotBrowserState;
+
+static WmSnapshotBrowserState g_snap_browser = {0};
+
+static void snapshot_browser_update(void) {
+    int dt = (int)(tick - g_snap_browser.last_tick);
+    if (dt <= 0) return;
+
+    if (!g_snap_browser.initialized) {
+        g_snap_browser.selected_snapshot = -1;
+        int _i; for(_i=0;_i<4;_i++) g_snap_browser.diff_sliders[_i] = (_i*20)%100;
+        g_snap_browser.param_scroll = 0;
+        wm_strcpy(g_snap_browser.status_msg, "System Ready.", 63);
+        g_snap_browser.initialized = 1;
+    }
+
+    g_snap_browser.snapshots_count = storage_snapshot_used_count();
+    
+    int i;
+    for (i = 0; i < 8 && i < g_snap_browser.snapshots_count; i++) {
+        storage_get_snapshot_tag(i, g_snap_browser.snap_tags[i], 15);
+    }
+
+    while (dt-- > 0) {
+        int idx = g_snap_browser.scroll_offset % 200;
+        
+        int live_volt = 0;
+        for (i = 0; i < 5; i++) {
+            live_volt += os_memory_map[0].neurons[i].voltage;
+        }
+        live_volt /= 5;
+        
+        int base_volt = 0;
+        for (i = 0; i < 5; i++) {
+            base_volt += task_list[0].saved_voltages[i];
+        }
+        base_volt /= 5;
+
+        g_snap_browser.live_trace[idx] = wm_clamp_i32(live_volt, 0, 2000);
+        g_snap_browser.base_trace[idx] = wm_clamp_i32(base_volt, 0, 2000);
+
+        g_snap_browser.scroll_offset = (g_snap_browser.scroll_offset + 1) % 200;
+        g_snap_browser.last_tick++;
+    }
+}
+
+static void handle_snapshot_browser_drag(WmWindow *win, int mx, int my) {
+    int px = win->x + 6;
+    int py = win->y + 6;
+    int pw = win->w - 12;
+    int left_w = 420;
+    int right_w = pw - left_w - 6;
+
+    int p2_x = px + left_w + 6;
+    int p2_y = py + 22;
+    int g_w = right_w - 220;
+    int rp_x = p2_x + 6 + g_w + 6;
+    int rp_y = p2_y + 24;
+    int rp_w = right_w - g_w - 18;
+    int i;
+
+    /* 1. Diff View options */
+    for (i = 0; i < 4; i++) {
+        int opt_y = rp_y + 24 + i*13;
+        if (mx >= rp_x && mx <= rp_x + 60 && my >= opt_y - 4 && my <= opt_y + 12) {
+            int track_x = rp_x + 6;
+            int track_w = 28;
+            int val = ((mx - track_x) * 100) / track_w;
+            if (val < 0) val = 0;
+            if (val > 100) val = 100;
+            g_snap_browser.diff_sliders[i] = val;
+            return;
+        }
+    }
+
+    /* 2. Metadata/Params Scrollbar */
+    int cp_y = rp_y + 86;
+    if (mx >= rp_x + rp_w - 15 && mx <= rp_x + rp_w && my >= cp_y + 10 && my <= cp_y + 86) {
+        int t_y = cp_y + 14;
+        int t_h = 30;
+        int val = ((my - t_y - 15) * 100) / t_h;
+        if (val < 0) val = 0;
+        if (val > 100) val = 100;
+        g_snap_browser.param_scroll = val;
+        return;
+    }
+}
+
+static void handle_snapshot_browser_click(WmWindow *win, int mx, int my) {
+    int px = win->x + 6;
+    int py = win->y + 6;
+    int pw = win->w - 12;
+    int ph = win->h - 12;
+    int left_w = 420;
+    int right_w = pw - left_w - 6;
+
+    int p1_x = px;
+    int p1_y = py + 22;
+    
+    int p2_x = px + left_w + 6;
+    int p2_y = p1_y;
+    int p2_h = ph - 28;
+
+    /* Snapshots List Items */
+    int lst_y = p1_y + 74;
+    int i;
+    for (i = 0; i < g_snap_browser.snapshots_count; i++) {
+        int row_y = lst_y - 2;
+        if (mx >= p1_x + 22 && mx <= p1_x + 22 + left_w - 90 &&
+            my >= row_y && my <= row_y + 12) {
+            g_snap_browser.selected_snapshot = i;
+            return;
+        }
+        lst_y += 14;
+    }
+
+    /* Diff View options */
+    int g_w = right_w - 220;
+    int rp_x = p2_x + 6 + g_w + 6;
+    int rp_y = p2_y + 24;
+    for (i = 0; i < 4; i++) {
+        int opt_y = rp_y + 24 + i*13;
+        if (mx >= rp_x && mx <= rp_x + right_w - g_w - 18 &&
+            my >= opt_y && my <= opt_y + 12) {
+            g_snap_browser.diff_view_idx = i;
+            return;
+        }
+    }
+
+    /* Bottom Action Buttons */
+    int by = p2_y + p2_h - 44;
+    int bw = (right_w - 30) / 3;
+
+    if (mx >= p2_x + 10 && mx <= p2_x + 10 + bw && my >= by && my <= by + 32) {
+        g_snap_browser.active_btn_pulse = 1;
+        wm_strcpy(g_snap_browser.status_msg, "DIFF SELECTION Triggered!", 63);
+        return;
+    }
+    if (mx >= p2_x + 10 + bw + 5 && mx <= p2_x + 10 + bw + 5 + bw && my >= by && my <= by + 32) {
+        g_snap_browser.active_btn_pulse = 2;
+        wm_strcpy(g_snap_browser.status_msg, "TAG MENU Displayed!", 63);
+        return;
+    }
+    if (mx >= p2_x + 10 + bw*2 + 10 && mx <= p2_x + 10 + bw*2 + 10 + bw && my >= by && my <= by + 32) {
+        g_snap_browser.active_btn_pulse = 3;
+        wm_strcpy(g_snap_browser.status_msg, "DATASET EXPORTED successfully!", 63);
+        return;
+    }
+}
+
+static void draw_content_snapshot_browser(int x, int y, int w, int h) {
+    int px = x + 6;
+    int py = y + 6;
+    int pw = w - 12;
+    int ph = h - 12;
+    int left_w = 420;
+    int right_w = pw - left_w - 6;
+
+    int p1_x = px;
+    int p1_y = py + 22;
+    int p1_h = ph - 28;
+    
+    int p2_x = px + left_w + 6;
+    int p2_y = p1_y;
+    int p2_h = p1_h;
+
+    draw_filled_rect(px, py, pw, ph, 0x081122);
+    draw_rect(px, py, pw, ph, 0x2D7C98);
+    draw_hline(py + 18, px + 1, px + pw - 1, 0x2AA9C0);
+    
+    cursor_x = px + 8; cursor_y = py + 4;
+    gprint("NEUROSPARK OS v0.7", 0x89DAF4);
+    cursor_x = px + pw - 146; cursor_y = py + 4;
+    gprint("SNAPSHOT BROWSER", 0x86EAFF);
+
+    draw_filled_rect(p1_x, p1_y, left_w, p1_h, 0x05162B);
+    draw_rect(p1_x, p1_y, left_w, p1_h, 0x3AC2D9);
+    cursor_x = p1_x + (left_w / 2) - 86; cursor_y = p1_y + 4;
+    gprint("SNAPSHOTS & REPLAYS - VFS", 0x9DEBFF);
+    draw_hline(p1_y + 20, p1_x + 1, p1_x + left_w - 1, 0x113350);
+    
+    cursor_x = p1_x + 8; cursor_y = p1_y + 24; gprint("Name", 0x4D8E9E);
+    draw_vline(p1_x + left_w - 80, p1_y + 20, p1_y + p1_h - 1, 0x113350);
+    cursor_x = p1_x + left_w - 76; cursor_y = p1_y + 24; gprint("Metadata", 0x4D8E9E);
+    draw_hline(p1_y + 40, p1_x + 1, p1_x + left_w - 1, 0x113350);
+
+    snapshot_browser_update();
+
+    int lst_y = p1_y + 46;
+    int i;
+    cursor_x=p1_x+8; cursor_y=lst_y; gprint("> [~] SYSTEM_RAM_MOUNT", 0xDEFFFF);
+    cursor_x=p1_x+left_w-76; cursor_y=lst_y; gprint("(SYS_DEF)", 0x8FB8CC); lst_y += 14;
+
+    cursor_x=p1_x+8; cursor_y=lst_y; gprint("v [D] SNAPSHOT_VFS", 0xDEFFFF);
+    cursor_x=p1_x+left_w-76; cursor_y=lst_y; gprint("(MNT)", 0x8FB8CC); lst_y += 14;
+
+    if (g_snap_browser.snapshots_count == 0) {
+        cursor_x=p1_x+24; cursor_y=lst_y; gprint("... [No active snapshots]", 0x557788);
+    } else {
+        for(i = 0; i < g_snap_browser.snapshots_count; i++) {
+            if (i == g_snap_browser.selected_snapshot) {
+                draw_filled_rect(p1_x + 22, lst_y - 2, left_w - 90, 12, 0x1A445C);
+            }
+            cursor_x=p1_x+24; cursor_y=lst_y; 
+            gprint("[S] Slot ", (i == g_snap_browser.selected_snapshot) ? 0xFFFFFF : 0x8FB8CC); 
+            gprint_dec(i, (i == g_snap_browser.selected_snapshot) ? 0xFFFFFF : 0x8FB8CC);
+            gprint(" -> ", 0x8FB8CC); gprint(g_snap_browser.snap_tags[i], (i == g_snap_browser.selected_snapshot) ? 0xFFE082 : 0xA7E0EB);
+            cursor_x=p1_x+left_w-76; cursor_y=lst_y; gprint("#saved...", 0x7CA6BD); lst_y += 14;
+        }
+    }
+
+    draw_filled_rect(p1_x + left_w - 6, p1_y + 42, 6, (g_snap_browser.snapshots_count > 0 ? 30*g_snap_browser.snapshots_count : 20), 0x2EE0A4);
+
+    draw_filled_rect(p2_x, p2_y, right_w, p2_h, 0x05162B);
+    draw_rect(p2_x, p2_y, right_w, p2_h, 0x3AC2D9);
+    cursor_x = p2_x + (right_w / 2) - 100; cursor_y = p2_y + 4;
+    gprint("COMPARISON SURFACE - AXIS", 0x9DEBFF);
+    draw_hline(p2_y + 20, p2_x + 1, p2_x + right_w - 1, 0x113350);
+
+    int g_x = p2_x + 6;
+    int g_y = p2_y + 26;
+    int g_w = right_w - 220;
+    int g_h = p2_h - 75;
+    
+    cursor_x = g_x; cursor_y = g_y - 4; gprint("User Summary", 0xDEFFFF);
+    draw_filled_rect(g_x + 46, g_y + 16, g_w - 46, g_h - 16, 0x02152A);
+    draw_rect(g_x + 46, g_y + 16, g_w - 46, g_h - 16, 0x2B6A86);
+
+    cursor_x = g_x + 50; cursor_y = g_y + 20; gprint("Potentials", 0x5ACB96);
+    draw_line_segment(g_x + g_w - 120, g_y + 24, g_x + g_w - 100, g_y + 24, 0xFFE082);
+    cursor_x = g_x + g_w - 94; cursor_y = g_y + 20; gprint("Compared State", 0xFFE082);
+    
+    for(i=0; i<10; i++) put_pixel(g_x + g_w - 120 + i*2, g_y + 36, 0x9DEBFF);
+    cursor_x = g_x + g_w - 94; cursor_y = g_y + 32; gprint("Baseline State", 0x9DEBFF);
+
+    const char *y_lbl[] = {"+40mV", "+20mV", "  0mV", "-20mV", "-40mV", "-60mV", "-80mV"};
+    for (i = 0; i < 7; i++) {
+        int ly = g_y + 36 + i * ((g_h - 36) / 6);
+        cursor_x = g_x; cursor_y = ly - 4; gprint((char *)y_lbl[i], i==2 ? 0xFFFFFF : 0xDEFFFF);
+        draw_hline(ly, g_x + 47, g_x + g_w - 2, 0x14384F);
+    }
+    for (i = 1; i < 10; i++) {
+        int lx = g_x + 46 + i * ((g_w - 46) / 10);
+        draw_vline(lx, g_y + 17, g_y + g_h - 1, 0x14384F);
+    }
+    
+    int px_base = g_x + 47;
+    int py1_base = g_y + 36 + ((g_h - 36) / 6);
+    int py2_base = g_y + 36 + 3 * ((g_h - 36) / 6);
+    int py3_base = g_y + 36 + 4 * ((g_h - 36) / 6);
+    int py4_base = g_y + 36 + 5 * ((g_h - 36) / 6);
+    int prev1_x = px_base, prev1_y = py1_base;
+    int prev2_x = px_base, prev2_y = py1_base + 3;
+    int prev3_x = px_base, prev3_y = py2_base;
+    int prev4_x = px_base, prev4_y = py3_base;
+    int prev5_x = px_base, prev5_y = py4_base;
+
+    for (i = 1; i < (g_w - 48); i++) {
+        int idx = (g_snap_browser.scroll_offset + (i * 200) / (g_w - 48)) % 200;
+        int live_y = py1_base - (g_snap_browser.live_trace[idx] / 15);
+        int base_y = py1_base - (g_snap_browser.base_trace[idx] / 15);
+
+        int env2 = (i > 140 && i < 180) ? ((180 - i)*(i - 140)/8) : 0;
+        int noise1 = (i*13 % 17) - 8;
+        int noise2 = (i*7 % 11) - 5;
+        
+        int n_y3 = py2_base + (noise1 * env2 / 24) + (noise1 / 2);
+        int n_y4 = py3_base + (noise2 * env2 / 22) + (noise2 / 2);
+        int n_y5 = py4_base + ((noise1+noise2) * env2 / 30);
+        
+        /* The main "Potentials" line follows actual memory mapping now */
+        draw_line_segment(prev1_x, prev1_y, px_base + i, live_y, 0xFFE082);
+        
+        draw_line_segment(prev3_x, prev3_y, px_base + i, n_y3, 0xFFE082);
+        draw_line_segment(prev4_x, prev4_y, px_base + i, n_y4, 0xFFE082);
+        draw_line_segment(prev5_x, prev5_y, px_base + i, n_y5, 0xFFE082);
+        
+        /* Baseline State is dashed overlay following the saved snapshot trace */
+        if (i % 3 != 0) {
+            put_pixel(px_base + i, base_y, 0x9DEBFF);
+        }
+        
+        prev1_x = px_base + i; prev1_y = live_y;
+        prev2_x = px_base + i; prev2_y = base_y;
+        prev3_x = px_base + i; prev3_y = n_y3;
+        prev4_x = px_base + i; prev4_y = n_y4;
+        prev5_x = px_base + i; prev5_y = n_y5;
+    }
+
+    int rp_x = g_x + g_w + 6;
+    int rp_y = p2_y + 24;
+    int rp_w = right_w - g_w - 18;
+
+    cursor_x = rp_x; cursor_y = rp_y - 2; gprint("Diff View", 0xDEFFFF);
+    draw_rect(rp_x, rp_y + 12, rp_w, 64, 0x2B6A86);
+    for (i = 0; i < 4; i++) {
+        int ly = rp_y + 24 + i*13;
+        draw_hline(ly, rp_x + 6, rp_x + 40, 0x3AC2D9);
+        int sx = rp_x + 6 + (g_snap_browser.diff_sliders[i] * 28) / 100;
+        if(sx < rp_x + 6) sx = rp_x + 6;
+        if(sx > rp_x + 34) sx = rp_x + 34;
+        draw_filled_rect(sx, ly - 3, 6, 6, (i == g_snap_browser.diff_view_idx) ? 0xFFFFFF : 0x5AEBD1);
+    }
+    cursor_x = rp_x + 48; cursor_y = rp_y + 18; gprint("Diffs View", (g_snap_browser.diff_view_idx == 0) ? 0xFFFFFF : 0x8FB8CC);
+    cursor_x = rp_x + 48; cursor_y = rp_y + 31; gprint("L:tine line", (g_snap_browser.diff_view_idx == 1) ? 0xFFFFFF : 0x8FB8CC);
+    cursor_x = rp_x + 48; cursor_y = rp_y + 44; gprint("Best View", (g_snap_browser.diff_view_idx == 2) ? 0xFFFFFF : 0x8FB8CC);
+    cursor_x = rp_x + 48; cursor_y = rp_y + 57; gprint("Mix View", (g_snap_browser.diff_view_idx == 3) ? 0xFFFFFF : 0x8FB8CC);
+
+    int cp_y = rp_y + 86;
+    cursor_x = rp_x; cursor_y = cp_y - 2; gprint("Creation Parameters", 0xDEFFFF);
+    draw_rect(rp_x, cp_y + 12, rp_w, 74, 0x2B6A86);
+    cursor_x = rp_x+4; cursor_y = cp_y+16; gprint("Parameters:", 0x8FB8CC);
+    cursor_x = rp_x+4; cursor_y = cp_y+28; gprint("clamp_alpha_20s", 0x8FB8CC);
+    cursor_x = rp_x+4; cursor_y = cp_y+40; gprint("stdp_learn_ra=0.05", 0x8FB8CC);
+    cursor_x = rp_x+4; cursor_y = cp_y+52; gprint("stdp_learn_ra=0.05", 0x8FB8CC);
+    cursor_x = rp_x+4; cursor_y = cp_y+64; gprint("stdp_learn_ra=0.05", 0x8FB8CC);
+    int sy = cp_y + 14 + (g_snap_browser.param_scroll * 30) / 100;
+    if(sy < cp_y + 14) sy = cp_y + 14;
+    if(sy > cp_y + 44) sy = cp_y + 44;
+    draw_filled_rect(rp_x + rp_w - 6, sy, 4, 30, 0x5AEBD1);
+
+    int md_y = cp_y + 96;
+    cursor_x = rp_x; cursor_y = md_y - 2; gprint("Metadata", 0xDEFFFF);
+    draw_rect(rp_x, md_y + 12, rp_w, 64, 0x2B6A86);
+    cursor_x = rp_x+4; cursor_y = md_y+16; gprint("Name  alpha_...", 0x8FB8CC);
+    cursor_x = rp_x+4; cursor_y = md_y+28; gprint("Tags  #stdp", 0x8FB8CC);
+    cursor_x = rp_x+4; cursor_y = md_y+40; gprint("T-Id  #phase_alpha", 0x8FB8CC);
+    cursor_x = rp_x+4; cursor_y = md_y+52; gprint("Time  1:18:02", 0x8FB8CC);
+    cursor_x = rp_x+4; cursor_y = md_y+64; gprint("Param_rate 300", 0x8FB8CC);
+
+    int bw = (right_w - 30) / 3;
+    int by = p2_y + p2_h - 44;
+    
+    int btn1_c = (g_snap_browser.active_btn_pulse == 1) ? 0xFFFFFF : 0xD19145;
+    draw_rect(p2_x + 10, by, bw, 32, btn1_c);
+    draw_rect(p2_x + 11, by+1, bw-2, 30, btn1_c);
+    cursor_x = p2_x + 10 + (bw/2) - 52; cursor_y = by + 12; gprint("DIFF SELECTION", (g_snap_browser.active_btn_pulse == 1) ? 0xFFFFFF : 0xFFD89E);
+    for(i=0; i<30; i++) put_pixel(p2_x + 10 + ((i*37)%bw), by + ((i*17)%32), btn1_c);
+
+    int btn2_c = (g_snap_browser.active_btn_pulse == 2) ? 0xFFFFFF : 0xD19145;
+    draw_rect(p2_x + 10 + bw + 5, by, bw, 32, btn2_c);
+    draw_rect(p2_x + 11 + bw + 5, by+1, bw-2, 30, btn2_c);
+    cursor_x = p2_x + 10 + bw + 5 + (bw/2) - 48; cursor_y = by + 12; gprint("TAG SELECTION", (g_snap_browser.active_btn_pulse == 2) ? 0xFFFFFF : 0xFFD89E);
+    for(i=0; i<15; i++) put_pixel(p2_x + 10 + bw + 5 + ((i*29)%bw), by + ((i*7)%32), btn2_c);
+
+    int btn3_c = (g_snap_browser.active_btn_pulse == 3) ? 0xFFFFFF : 0xD19145;
+    draw_rect(p2_x + 10 + bw*2 + 10, by, bw, 32, btn3_c);
+    draw_rect(p2_x + 11 + bw*2 + 10, by+1, bw-2, 30, btn3_c);
+    cursor_x = p2_x + 10 + bw*2 + 10 + (bw/2) - 52; cursor_y = by + 12; gprint("EXPORT DATASET", (g_snap_browser.active_btn_pulse == 3) ? 0xFFFFFF : 0xFFD89E);
+    for(i=0; i<15; i++) put_pixel(p2_x + 10 + bw*2 + 10 + ((i*31)%bw), by + ((i*11)%32), btn3_c);
+
+    cursor_x = p2_x + 10; cursor_y = by - 12;
+    gprint("OS MESSAGE: ", 0x4AA0C7);
+    gprint(g_snap_browser.status_msg, 0xDEFFFF);
+
+    if (g_snap_browser.active_btn_pulse > 0) g_snap_browser.active_btn_pulse = 0;
+}
+
 /* ------------------------------------------------------------ */
 /*  Initialisation                                               */
 /* ------------------------------------------------------------ */
@@ -1814,6 +2186,7 @@ void wm_init(void) {
     wm_add_window(450, 110, 280, 210, "Profiler", draw_content_profiler, 0, 4);
     wm_add_window(480, 150, 250, 150, "Settings", draw_content_settings, 0, 5);
     wm_add_window(30, 34, 760, 450, "Spike Monitor App", draw_content_spike_monitor, 0, -1);
+    wm_add_window(20, 26, 1000, 420, "Snapshot Browser App", draw_content_snapshot_browser, 0, -1);
     wm_add_window(20, 26, 760, 500, "Model Manager App", draw_content_model_manager, 0, -1);
     model_ui_sync_from_kernel();
 }
@@ -1989,6 +2362,22 @@ void wm_open_spike_monitor(void) {
             wm_windows[j].y = 34;
             wm_windows[j].w = 760;
             wm_windows[j].h = 450;
+            wm_windows[j].visible = 1;
+            wm_windows[j].state = WM_STATE_NORMAL;
+            bring_to_front(j);
+            return;
+        }
+    }
+}
+
+void wm_open_snapshot_browser(void) {
+    int j;
+    for (j = 0; j < wm_window_count; j++) {
+        if (wm_str_eq(wm_windows[j].title, "Snapshot Browser App")) {
+            wm_windows[j].x = 20;
+            wm_windows[j].y = 26;
+            wm_windows[j].w = 1000;
+            wm_windows[j].h = 420;
             wm_windows[j].visible = 1;
             wm_windows[j].state = WM_STATE_NORMAL;
             bring_to_front(j);
@@ -2247,6 +2636,10 @@ void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons) {
                 pt_in_rect(mx, my, fw->x, fw->y, fw->w, fw->h)) {
                 (void)handle_model_manager_drag(fw, mx, my);
             }
+            if (fw->visible && wm_str_eq(fw->title, "Snapshot Browser App") &&
+                pt_in_rect(mx, my, fw->x, fw->y, fw->w, fw->h)) {
+                handle_snapshot_browser_drag(fw, mx, my);
+            }
         }
         return;
     }
@@ -2370,6 +2763,11 @@ void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons) {
 
         if (wm_str_eq(w->title, "Model Manager App")) {
             (void)handle_model_manager_click(w, mx, my);
+            return;
+        }
+
+        if (wm_str_eq(w->title, "Snapshot Browser App")) {
+            handle_snapshot_browser_click(w, mx, my);
             return;
         }
 

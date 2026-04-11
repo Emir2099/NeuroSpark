@@ -10,6 +10,7 @@ extern void wm_get_taskbar_icon_center(int slot, int *out_x, int *out_y);
 extern void wm_launch_icon_slot(int slot);
 extern void wm_open_model_manager(void);
 extern void wm_open_spike_monitor(void);
+extern void wm_open_snapshot_browser(void);
 #define LAUNCHER_ANIMATION_SPEED 8      /* Frames to fully open/close */
 #define LAUNCHER_RIPPLE_RADIUS 300      /* Max ripple spread from OS button */
 #define APP_TILE_W 78
@@ -533,6 +534,11 @@ void launcher_launch_app(int app_idx) {
     }
     if (app->name[0] == 'S' && app->name[1] == 'p') { /* Spike Monitor */
         wm_open_spike_monitor();
+        launcher_set_app_status(app_idx, APP_STATUS_RUNNING);
+        return;
+    }
+    if (app->name[0] == 'S' && app->name[1] == 'n') { /* Snapshot Browser */
+        wm_open_snapshot_browser();
         launcher_set_app_status(app_idx, APP_STATUS_RUNNING);
         return;
     }
