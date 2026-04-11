@@ -1393,6 +1393,357 @@ static void draw_content_profiler(int x, int y, int w, int h) {
     gprint("Group spike load", 0x8FB8CC);
 }
 
+typedef struct {
+    int initialized;
+    uint32_t last_tick;
+    int col;
+    uint8_t raster[48][160];
+    uint8_t heat[24][120];
+    int trend_col;
+    int trend_a[120];
+    int trend_b[120];
+    int avg_hz;
+    int max_hz;
+    int active_neurons;
+    int sync_score;
+    int sync_alert;
+} WmSpikeMonitorState;
+
+static WmSpikeMonitorState g_spike_mon = {0};
+
+static void spike_monitor_init_if_needed(void) {
+    int y, x;
+    if (g_spike_mon.initialized) return;
+    g_spike_mon.initialized = 1;
+    g_spike_mon.last_tick = tick;
+    g_spike_mon.col = 0;
+    for (y = 0; y < 48; y++) {
+        for (x = 0; x < 160; x++) {
+            g_spike_mon.raster[y][x] = 0;
+        }
+    }
+    for (y = 0; y < 24; y++) {
+        for (x = 0; x < 120; x++) {
+            g_spike_mon.heat[y][x] = 0;
+        }
+    }
+    for (x = 0; x < 120; x++) {
+        g_spike_mon.trend_a[x] = 0;
+        g_spike_mon.trend_b[x] = 0;
+    }
+}
+
+static void spike_monitor_update(void) {
+    int dt;
+    spike_monitor_init_if_needed();
+    dt = (int)(tick - g_spike_mon.last_tick);
+    if (dt <= 0) return;
+
+    while (dt-- > 0) {
+        int y;
+        int xcol = g_spike_mon.col;
+        int max_sps = 0;
+        int active = 0;
+        int n_idx, p_idx;
+
+        int sps0 = wm_clamp_i32(task_list[0].spikes_per_second, 0, 600);
+        int sps1 = wm_clamp_i32(task_list[1].spikes_per_second, 0, 600);
+        int sps_mix = (sps0 + sps1) / 2;
+
+        if (sps0 > max_sps) max_sps = sps0;
+        if (sps1 > max_sps) max_sps = sps1;
+
+        g_spike_mon.avg_hz = wm_clamp_i32(sps_mix, 0, 420);
+        g_spike_mon.max_hz = wm_clamp_i32(max_sps, 0, 540);
+
+        for (p_idx = 0; p_idx < 2; p_idx++) {
+            for (n_idx = 0; n_idx < 5; n_idx++) {
+                if (os_memory_map[p_idx].neurons[n_idx].voltage > 350) active++;
+            }
+        }
+        g_spike_mon.active_neurons = active;
+
+        for (y = 0; y < 48; y++) {
+            int src = (y * 10) / 48; /* Map 48 vertical lines to the 10 real neurons */
+            int p2_idx = src >= 5 ? 1 : 0;
+            int n2_idx = src % 5;
+            int v = os_memory_map[p2_idx].neurons[n2_idx].voltage;
+            int thresh = os_memory_map[p2_idx].neurons[n2_idx].dynamic_threshold;
+            int rf = os_memory_map[p2_idx].neurons[n2_idx].refractory_timer;
+            
+            /* ONLY real spikes from the kernel structures */
+            int fire = (v >= thresh || rf > 6) ? 1 : 0; 
+            
+            g_spike_mon.raster[y][xcol] = (uint8_t)fire;
+        }
+
+        g_spike_mon.trend_a[g_spike_mon.trend_col] = g_spike_mon.avg_hz;
+        g_spike_mon.trend_b[g_spike_mon.trend_col] = wm_clamp_i32(g_spike_mon.max_hz - 40, 0, 540);
+
+        g_spike_mon.sync_score = wm_clamp_i32((g_spike_mon.active_neurons * 24) + (g_spike_mon.max_hz - g_spike_mon.avg_hz) / 2, 0, 240);
+        g_spike_mon.sync_alert = (g_spike_mon.sync_score >= 120) ? 1 : 0;
+
+        g_spike_mon.col = (g_spike_mon.col + 1) % 160;
+        g_spike_mon.trend_col = (g_spike_mon.trend_col + 1) % 120;
+        g_spike_mon.last_tick++;
+    }
+}
+
+static uint32_t spike_phase_color(int v) {
+    int x = wm_clamp_i32(v, 0, 255);
+    if (x < 45) {
+        int t = x;
+        return (uint32_t)((3 + (t * 9) / 45) << 16) |
+               (uint32_t)((22 + (t * 28) / 45) << 8) |
+               (uint32_t)(44 + (t * 40) / 45);
+    }
+    if (x < 95) {
+        int t = x - 45;
+        return (uint32_t)((12 + (t * 16) / 50) << 16) |
+               (uint32_t)((50 + (t * 64) / 50) << 8) |
+               (uint32_t)(84 + (t * 64) / 50);
+    }
+    if (x < 145) {
+        int t = x - 95;
+        return (uint32_t)((28 + (t * 28) / 50) << 16) |
+               (uint32_t)((114 + (t * 82) / 50) << 8) |
+               (uint32_t)(146 + (t * 44) / 50);
+    }
+    if (x < 195) {
+        int t = x - 145;
+        return (uint32_t)((56 + (t * 42) / 50) << 16) |
+               (uint32_t)((196 + (t * 44) / 50) << 8) |
+               (uint32_t)(190 + (t * 24) / 50);
+    }
+    {
+        int t = x - 195;
+        return (uint32_t)((98 + (t * 54) / 60) << 16) |
+               (uint32_t)((240 + (t * 15) / 60) << 8) |
+               (uint32_t)(214 - (t * 24) / 60);
+    }
+}
+
+static void draw_spike_glow_dot(int x, int y) {
+    put_pixel(x, y, 0x98FF7D);
+    put_pixel(x + 1, y, 0x7CFF72);
+    put_pixel(x - 1, y, 0x3BD25B);
+    put_pixel(x, y - 1, 0x3BD25B);
+    put_pixel(x, y + 1, 0x3BD25B);
+    put_pixel(x + 1, y + 1, 0x2DA04A);
+}
+
+static void draw_spike_soft_blob(int cx, int cy, uint32_t core, uint32_t ring) {
+    int dx, dy;
+    for (dy = -4; dy <= 4; dy++) {
+        for (dx = -4; dx <= 4; dx++) {
+            int d = dx * dx + dy * dy;
+            if (d <= 4) put_pixel(cx + dx, cy + dy, core);
+            else if (d <= 12) put_pixel(cx + dx, cy + dy, ring);
+        }
+    }
+}
+
+static void draw_content_spike_monitor(int x, int y, int w, int h) {
+    int px = x + 6;
+    int py = y + 6;
+    int pw = w - 12;
+    int ph = h - 12;
+    int right_w = 220;
+    int left_w = pw - right_w - 12;
+    int t;
+
+    int raster_x = px + 34;
+    int raster_y = py + 38;
+    int raster_w = left_w - 44;
+    int raster_h = 160;
+
+    int heat_x = raster_x;
+    int heat_y = py + 238;
+    int heat_w = raster_w;
+    int heat_h = 126;
+
+    int panel_x = px + left_w + 6;
+    int panel_y = py + 22;
+    int panel_w = right_w;
+    int panel_h = ph - 28;
+
+    spike_monitor_update();
+
+    draw_filled_rect(px, py, pw, ph, 0x081122);
+    draw_rect(px, py, pw, ph, 0x2D7C98);
+    draw_hline(py + 18, px + 1, px + pw - 1, 0x2AA9C0);
+    cursor_x = px + 8;
+    cursor_y = py + 4;
+    gprint("NEUROSPARK OS v0.7", 0x89DAF4);
+    cursor_x = px + pw - 150;
+    cursor_y = py + 4;
+    gprint("SPIKE MONITOR APP", 0x86EAFF);
+
+    draw_filled_rect(px + 4, py + 22, left_w, ph - 28, 0x05162B);
+    draw_rect(px + 4, py + 22, left_w, ph - 28, 0x3AC2D9);
+
+    cursor_x = raster_x + (raster_w / 2) - 68;
+    cursor_y = raster_y - 14;
+    gprint("Rolling Raster Plot", 0x9DEBFF);
+    draw_filled_rect(raster_x, raster_y, raster_w, raster_h, 0x000A33);
+    draw_rect(raster_x, raster_y, raster_w, raster_h, 0x2B6A86);
+    for (t = 1; t < 8; t++) {
+        draw_hline(raster_y + (t * raster_h) / 8, raster_x + 1, raster_x + raster_w - 1, 0x113350);
+    }
+    for (t = 0; t < 160; t++) {
+        int xx = raster_x + 2 + (t * (raster_w - 4)) / 159;
+        int ry;
+        for (ry = 0; ry < 48; ry++) {
+            int src_col = (g_spike_mon.col + t + (ry * 3)) % 160;
+            if (g_spike_mon.raster[ry][src_col]) {
+                int yy = raster_y + 2 + (ry * (raster_h - 4)) / 47;
+                uint32_t core = (os_memory_map[(ry >= 24) ? 1 : 0].current_phase == 1) ? 0x9DFF7E : 0x88FF66;
+                uint32_t ring = (os_memory_map[(ry >= 24) ? 1 : 0].current_phase == 1) ? 0x2EE0A4 : 0x2CB86E;
+                draw_spike_soft_blob(xx, yy, core, ring);
+            }
+        }
+    }
+
+    {
+        const char *yv[5] = {"2000", "1500", "1000", "500", "0"};
+        int yi;
+        for (yi = 0; yi < 5; yi++) {
+            cursor_x = raster_x - 30;
+            cursor_y = raster_y + 1 + (yi * (raster_h - 12)) / 4;
+            gprint((char *)yv[yi], 0x9ED6E8);
+        }
+        cursor_x = raster_x - 32;
+        cursor_y = raster_y + (raster_h / 2);
+        gprint("Neuron ID", 0x9ED6E8);
+    }
+
+    cursor_x = raster_x + raster_w - 34;
+    cursor_y = raster_y + raster_h + 4;
+    gprint("X", 0x80D7EF);
+
+    cursor_x = heat_x + (heat_w / 2) - 110;
+    cursor_y = heat_y - 14;
+    gprint("Activity Density - PHASE HEATMAP", 0x69D9EE);
+    draw_filled_rect(heat_x, heat_y, heat_w, heat_h, 0x02152A);
+    draw_rect(heat_x, heat_y, heat_w, heat_h, 0x2B6A86);
+    {
+        int iw = heat_w - 2;
+        int ih = heat_h - 2;
+        int xx;
+        int yy;
+        for (yy = 0; yy < ih; yy++) {
+            for (xx = 0; xx < iw; xx++) {
+                int p;
+                int v = 10;
+
+                for (p = 0; p < 2; p++) {
+                    int n;
+                    WmNeuralPixel *pxp = &os_memory_map[p];
+                    int phase_boost = pxp->current_phase ? 25 : 0;
+                    int recent_boost = wm_clamp_i32(pxp->pixel_recent_spikes * 3, 0, 50);
+
+                    for (n = 0; n < 5; n++) {
+                        /* Arrange the 10 neurons evenly across the entire heatmap area */
+                        int cx = (iw / 10) + (n * (iw / 5));
+                        int cy = (ih / 4) + (p * (ih / 2));
+                        
+                        int dx = xx - cx;
+                        int dy = yy - cy;
+                        int dist2 = (dx * dx) + (dy * dy) * 2; /* Stretch horizontally a bit */
+                        
+                        int voltage = pxp->neurons[n].voltage;
+                        int thresh = pxp->neurons[n].dynamic_threshold;
+                        
+                        /* Calculate intensity based on how close to threshold it is */
+                        int base_e = (voltage * 255) / (thresh > 1 ? thresh : 100);
+                        int energy = wm_clamp_i32(base_e + phase_boost + recent_boost, 0, 500);
+                        
+                        /* Smooth inverse-square falloff for a continuous glowing topological map */
+                        int contrib = (energy * 1500) / (1500 + dist2);
+                        v += contrib;
+                    }
+                }
+
+                /* Boost overall intensity and map into the cyan/green/yellow spectrum */
+                v = wm_clamp_i32(v, 0, 255);
+                put_pixel(heat_x + 1 + xx, heat_y + 1 + yy, spike_phase_color(v));
+            }
+        }
+    }
+
+    draw_filled_rect(panel_x, panel_y, panel_w, panel_h, 0x092033);
+    draw_rect(panel_x, panel_y, panel_w, panel_h, 0x3AC2D9);
+
+    draw_model_health_gauge(panel_x + 10, panel_y + 16, panel_w - 70,
+                            "Avg Firing Rate", wm_clamp_i32((g_spike_mon.avg_hz * 100) / 420, 0, 100), 0x5AEBD1);
+    cursor_x = panel_x + panel_w - 88;
+    cursor_y = panel_y + 18;
+    gprint_dec(g_spike_mon.avg_hz, 0xCFFFFF);
+    gprint(" Hz", 0x9ED6E8);
+
+    draw_model_health_gauge(panel_x + 10, panel_y + 52, panel_w - 70,
+                            "Max Spike Load", wm_clamp_i32((g_spike_mon.max_hz * 100) / 540, 0, 100), 0x80E85A);
+
+        draw_filled_rect(panel_x + 10, panel_y + 88, panel_w - 20, 26,
+                g_spike_mon.sync_alert ? 0x3A2A17 : 0x17342A);
+        draw_rect(panel_x + 10, panel_y + 88, panel_w - 20, 26,
+            g_spike_mon.sync_alert ? 0xD19145 : 0x5ACB96);
+    cursor_x = panel_x + 20;
+    cursor_y = panel_y + 96;
+        gprint(g_spike_mon.sync_alert ? "**HIGH SYNCHRONY WARNING**" : "Synchrony: nominal",
+            g_spike_mon.sync_alert ? 0xFFD89E : 0xB9FFD9);
+
+    draw_model_health_gauge(panel_x + 10, panel_y + 126, panel_w - 70,
+                            "Active Neurons", wm_clamp_i32((g_spike_mon.active_neurons * 100) / 10, 0, 100), 0x5ACDFF);
+    cursor_x = panel_x + panel_w - 84;
+    cursor_y = panel_y + 128;
+    gprint_dec(g_spike_mon.active_neurons, 0xCFFFFF);
+    gprint("/10", 0x9ED6E8);
+
+    draw_filled_rect(panel_x + 10, panel_y + 164, panel_w - 20, 104, 0x06182A);
+    draw_rect(panel_x + 10, panel_y + 164, panel_w - 20, 104, 0x2F799A);
+    cursor_x = panel_x + 16;
+    cursor_y = panel_y + 170;
+    gprint("Trending", 0xAEEBFF);
+    cursor_x = panel_x + panel_w - 88;
+    cursor_y = panel_y + 170;
+    gprint("Past 120", 0x8FB8CC);
+
+    {
+        int sx = panel_x + 12;
+        int sy = panel_y + 186;
+        int sw = panel_w - 24;
+        int sh = 74;
+        int i;
+        int px0 = sx + 1;
+        int py0 = sy + sh - 2;
+        draw_rect(sx, sy, sw, sh, 0x255E79);
+        for (i = 1; i < 4; i++) {
+            draw_hline(sy + (i * sh) / 4, sx + 1, sx + sw - 1, 0x14384F);
+        }
+        for (i = 0; i < 120; i++) {
+            int idx = (g_spike_mon.trend_col + i) % 120;
+            int v = wm_clamp_i32(g_spike_mon.trend_a[idx], 0, 540);
+            int xx = sx + 1 + (i * (sw - 3)) / 119;
+            int yy = sy + sh - 2 - (v * (sh - 6)) / 540;
+            draw_line_segment(px0, py0, xx, yy, 0x7DFF85);
+            px0 = xx;
+            py0 = yy;
+        }
+        px0 = sx + 1;
+        py0 = sy + sh - 2;
+        for (i = 0; i < 120; i++) {
+            int idx = (g_spike_mon.trend_col + i) % 120;
+            int v = wm_clamp_i32(g_spike_mon.trend_b[idx], 0, 540);
+            int xx = sx + 1 + (i * (sw - 3)) / 119;
+            int yy = sy + sh - 2 - (v * (sh - 6)) / 540;
+            draw_line_segment(px0, py0, xx, yy, 0xA7D9FF);
+            px0 = xx;
+            py0 = yy;
+        }
+    }
+}
+
 static void draw_content_settings(int x, int y, int w, int h) {
     int tz = wm_get_timezone_offset_minutes();
     int abs_tz = tz < 0 ? -tz : tz;
@@ -1462,6 +1813,7 @@ void wm_init(void) {
     wm_add_window(156, 92, 360, 180, "Console", draw_content_console, 1, 3);
     wm_add_window(450, 110, 280, 210, "Profiler", draw_content_profiler, 0, 4);
     wm_add_window(480, 150, 250, 150, "Settings", draw_content_settings, 0, 5);
+    wm_add_window(30, 34, 760, 450, "Spike Monitor App", draw_content_spike_monitor, 0, -1);
     wm_add_window(20, 26, 760, 500, "Model Manager App", draw_content_model_manager, 0, -1);
     model_ui_sync_from_kernel();
 }
@@ -1621,6 +1973,22 @@ void wm_open_model_manager(void) {
             wm_windows[j].y = 26;
             wm_windows[j].w = 760;
             wm_windows[j].h = 500;
+            wm_windows[j].visible = 1;
+            wm_windows[j].state = WM_STATE_NORMAL;
+            bring_to_front(j);
+            return;
+        }
+    }
+}
+
+void wm_open_spike_monitor(void) {
+    int j;
+    for (j = 0; j < wm_window_count; j++) {
+        if (wm_str_eq(wm_windows[j].title, "Spike Monitor App")) {
+            wm_windows[j].x = 30;
+            wm_windows[j].y = 34;
+            wm_windows[j].w = 760;
+            wm_windows[j].h = 450;
             wm_windows[j].visible = 1;
             wm_windows[j].state = WM_STATE_NORMAL;
             bring_to_front(j);
