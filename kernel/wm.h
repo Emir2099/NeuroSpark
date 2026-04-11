@@ -80,5 +80,6 @@ int  wm_set_timezone_offset_minutes(int minutes);
 int  wm_get_timezone_offset_minutes(void);
 void wm_get_taskbar_icon_center(int slot, int *out_x, int *out_y);
 void wm_launch_icon_slot(int slot);
+void wm_open_model_manager(void);
 
 #endif

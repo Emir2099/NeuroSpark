@@ -9,6 +9,7 @@
  * ================================================================ */
 #include "wm.h"
 #include "launcher.h"
+#include "model_manager.h"
 
 /* External graphics primitives (graphics.c) */
 extern void put_pixel(int x, int y, uint32_t color);
@@ -344,6 +345,810 @@ static void draw_glass_rect(int x, int y, int w, int h, uint32_t tint) {
     draw_vline(x + w - 1, y + 1, y + h - 1, 0x08131A);
 }
 
+typedef struct {
+    int selected_task;
+    int lr_fast[2];
+    int lr_slow[2];
+    int refractory_ticks[2];
+    int tau[2];
+    int toggles[2][4];
+    int base_lr_fast[2];
+    int base_lr_slow[2];
+    int base_refractory_ticks[2];
+    int base_tau[2];
+    int base_toggles[2][4];
+    int dirty_mask;
+    uint32_t last_apply_tick;
+    uint32_t last_sync_tick;
+    uint32_t last_graph_tick;
+    int graph_head;
+    int graph_hist[64];
+    int initialized;
+} WmModelManagerUiState;
+
+static WmModelManagerUiState g_model_ui = {
+    0,
+    {4, 4}, {8, 8}, {10, 10}, {2, 2},
+    {{1, 1, 1, 1}, {1, 1, 1, 1}},
+    {4, 4}, {8, 8}, {10, 10}, {2, 2},
+    {{1, 1, 1, 1}, {1, 1, 1, 1}},
+    0,
+    0, 0, 0,
+    0,
+    {0},
+    0
+};
+
+static int wm_clamp_i32(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static int wm_str_eq(const char *a, const char *b) {
+    int i = 0;
+    if (!a || !b) return 0;
+    while (a[i] && b[i]) {
+        if (a[i] != b[i]) return 0;
+        i++;
+    }
+    return a[i] == '\0' && b[i] == '\0';
+}
+
+static void gprint_clipped(const char *text, int max_chars, uint32_t color) {
+    int i = 0;
+    if (!text || max_chars <= 0) return;
+    while (text[i] && i < max_chars) {
+        char ch[2];
+        ch[0] = text[i];
+        ch[1] = '\0';
+        gprint(ch, color);
+        i++;
+    }
+}
+
+static int model_ui_selected_task(void) {
+    return wm_clamp_i32(g_model_ui.selected_task, 0, 1);
+}
+
+static int model_ui_task_dirty(int t) {
+    return (g_model_ui.dirty_mask & (1 << t)) != 0;
+}
+
+static void model_ui_mark_dirty(int t) {
+    g_model_ui.dirty_mask |= (1 << t);
+}
+
+static void model_ui_clear_dirty(int t) {
+    g_model_ui.dirty_mask &= ~(1 << t);
+}
+
+static int model_ui_lr_ref(int t) {
+    int tf = wm_clamp_i32(t, 0, 1);
+    return (g_model_ui.lr_fast[tf] * 8) + (g_model_ui.lr_slow[tf] * 3);
+}
+
+static void model_ui_capture_task_baseline(int t) {
+    int tf = wm_clamp_i32(t, 0, 1);
+    int i;
+    g_model_ui.base_lr_fast[tf] = g_model_ui.lr_fast[tf];
+    g_model_ui.base_lr_slow[tf] = g_model_ui.lr_slow[tf];
+    g_model_ui.base_refractory_ticks[tf] = g_model_ui.refractory_ticks[tf];
+    g_model_ui.base_tau[tf] = g_model_ui.tau[tf];
+    for (i = 0; i < 4; i++) {
+        g_model_ui.base_toggles[tf][i] = g_model_ui.toggles[tf][i];
+    }
+}
+
+static void model_ui_restore_task_baseline(int t) {
+    int tf = wm_clamp_i32(t, 0, 1);
+    int i;
+    g_model_ui.lr_fast[tf] = g_model_ui.base_lr_fast[tf];
+    g_model_ui.lr_slow[tf] = g_model_ui.base_lr_slow[tf];
+    g_model_ui.refractory_ticks[tf] = g_model_ui.base_refractory_ticks[tf];
+    g_model_ui.tau[tf] = g_model_ui.base_tau[tf];
+    for (i = 0; i < 4; i++) {
+        g_model_ui.toggles[tf][i] = g_model_ui.base_toggles[tf][i];
+    }
+    model_ui_clear_dirty(tf);
+}
+
+static void model_ui_update_graph_history(void) {
+    if (!g_model_ui.initialized) return;
+    if (g_model_ui.last_graph_tick == tick) return;
+
+    while (g_model_ui.last_graph_tick < tick) {
+        int i;
+        int peak = 0;
+        g_model_ui.last_graph_tick++;
+        for (i = 0; i < 16; i++) {
+            int p = wm_clamp_i32(potentials[i], 0, 1000);
+            if (p > peak) peak = p;
+        }
+        g_model_ui.graph_hist[g_model_ui.graph_head] = peak;
+        g_model_ui.graph_head = (g_model_ui.graph_head + 1) & 63;
+    }
+}
+
+static void model_ui_sync_task_from_kernel(int t) {
+    int tf = wm_clamp_i32(t, 0, 1);
+    ModelManifestData mf;
+
+    g_model_ui.toggles[tf][0] = model_get_stdp() ? 1 : 0;
+
+    if (model_manifest_capture(&mf)) {
+        int lr = wm_clamp_i32(mf.learning_rate[tf][0], 1, 80);
+        g_model_ui.lr_fast[tf] = wm_clamp_i32((lr + 3) / 4, 1, 10);
+        g_model_ui.lr_slow[tf] = wm_clamp_i32((lr + 7) / 8, 1, 10);
+        g_model_ui.refractory_ticks[tf] = wm_clamp_i32(mf.refractory_ticks[tf][0], 1, 40);
+        g_model_ui.tau[tf] = wm_clamp_i32(mf.tau[tf][0], 1, 8);
+    } else {
+        g_model_ui.refractory_ticks[tf] = wm_clamp_i32(model_get_refractory_ticks(tf, 0), 1, 40);
+        g_model_ui.tau[tf] = 2;
+    }
+
+    model_ui_clear_dirty(tf);
+    model_ui_capture_task_baseline(tf);
+    g_model_ui.last_sync_tick = tick;
+}
+
+static void model_ui_sync_from_kernel(void) {
+    int i;
+    g_model_ui.selected_task = model_ui_selected_task();
+    g_model_ui.last_graph_tick = tick;
+    g_model_ui.graph_head = 0;
+    for (i = 0; i < 64; i++) {
+        g_model_ui.graph_hist[i] = 0;
+    }
+    for (i = 0; i < 2; i++) {
+        model_ui_sync_task_from_kernel(i);
+        g_model_ui.toggles[i][1] = 1;
+        g_model_ui.toggles[i][2] = 1;
+        g_model_ui.toggles[i][3] = 1;
+        model_ui_capture_task_baseline(i);
+    }
+    g_model_ui.initialized = 1;
+}
+
+static void model_ui_apply_to_kernel(void) {
+    int t = model_ui_selected_task();
+    int lr = wm_clamp_i32(model_ui_lr_ref(t), 1, 80);
+
+    model_set_stdp(g_model_ui.toggles[t][0] ? 1 : 0);
+    if (g_model_ui.toggles[t][1]) {
+        (void)model_set_param(t, -1, "lr", lr);
+    }
+    if (g_model_ui.toggles[t][2]) {
+        (void)model_set_param(t, -1, "refractory", wm_clamp_i32(g_model_ui.refractory_ticks[t], 1, 40));
+    }
+    if (g_model_ui.toggles[t][3]) {
+        (void)model_set_param(t, -1, "tau", wm_clamp_i32(g_model_ui.tau[t], 1, 8));
+    }
+
+    model_ui_capture_task_baseline(t);
+    model_ui_clear_dirty(t);
+    g_model_ui.last_apply_tick = tick;
+    g_model_ui.last_sync_tick = tick;
+}
+
+static const char *model_display_name(const char *name) {
+    if (wm_str_eq(name, "adapt")) return "Adaptive LIF";
+    if (wm_str_eq(name, "lif")) return "LIF";
+    if (wm_str_eq(name, "stdp")) return "STDP";
+    return name;
+}
+
+static const char *workload_display_name(int t) {
+    if (t >= 0 && t < 2 && task_list[t].task_name && task_list[t].task_name[0]) {
+        if (wm_str_eq(task_list[t].task_name, "IO")) {
+            return "ardent_simulator";
+        }
+        if (wm_str_eq(task_list[t].task_name, "COMP")) {
+            return "logger";
+        }
+        return task_list[t].task_name;
+    }
+    return (t == 0) ? "ardent_simulator" : "logger";
+}
+
+static void draw_model_slider(int x, int y, int w, const char *label,
+                              int value, int min_v, int max_v,
+                              uint32_t fill_color) {
+    int track_x = x;
+    int track_y = y + 13;
+    int track_h = 8;
+    int span = (max_v - min_v) > 0 ? (max_v - min_v) : 1;
+    int fill_w = ((value - min_v) * (w - 2)) / span;
+    int knob_x = track_x + 1 + fill_w;
+
+    if (fill_w < 0) fill_w = 0;
+    if (fill_w > w - 2) fill_w = w - 2;
+    if (knob_x < track_x + 2) knob_x = track_x + 2;
+    if (knob_x > track_x + w - 4) knob_x = track_x + w - 4;
+
+    cursor_x = x;
+    cursor_y = y;
+    gprint((char *)label, 0xB6E2F2);
+
+    draw_filled_rect(track_x, track_y, w, track_h, 0x0A2436);
+    draw_rect(track_x, track_y, w, track_h, 0x2F7A97);
+    put_pixel(track_x - 1, track_y + (track_h / 2), 0x52EFFF);
+    put_pixel(track_x - 2, track_y + (track_h / 2), 0x52EFFF);
+    put_pixel(track_x + w + 1, track_y + (track_h / 2), 0x52EFFF);
+    draw_filled_rect(track_x + 1, track_y + 1, fill_w, track_h - 2, fill_color);
+    draw_filled_rect(knob_x - 2, track_y - 1, 5, track_h + 2, 0x8EF6FF);
+
+}
+
+static void draw_model_value_chip(int x, int y, int value, int show_lr_format, int show_ms) {
+    draw_filled_rect(x, y, 44, 14, 0x123C4F);
+    draw_rect(x, y, 44, 14, 0x4BE8F1);
+    draw_rect(x + 1, y + 1, 42, 12, 0x1B6D86);
+
+    cursor_x = x + 4;
+    cursor_y = y + 1;
+    if (show_lr_format) {
+        gprint("0.", 0x9AF4F9);
+        if (value < 10) gprint("0", 0x9AF4F9);
+        gprint_dec(value, 0x9AF4F9);
+    } else {
+        gprint_dec(value, 0x9AF4F9);
+        if (show_ms) {
+            gprint("ms", 0x9AF4F9);
+        }
+    }
+}
+
+static void draw_model_toggle(int x, int y, int on) {
+    uint32_t bg = on ? 0x22D1C7 : 0x1A2D3A;
+    uint32_t knob = 0xB5FCFF;
+    draw_filled_rect(x, y, 44, 14, bg);
+    draw_rect(x, y, 44, 14, 0x69F1F5);
+    draw_rect(x + 1, y + 1, 42, 12, on ? 0x2CE7DD : 0x2C4A59);
+    draw_filled_rect(x + 2, y + 2, 40, 10, on ? 0x28CFC5 : 0x223A48);
+    if (on) {
+        draw_filled_rect(x + 29, y + 2, 12, 10, knob);
+        draw_rect(x + 29, y + 2, 12, 10, 0x4AB5C5);
+    } else {
+        draw_filled_rect(x + 3, y + 2, 12, 10, knob);
+        draw_rect(x + 3, y + 2, 12, 10, 0x4AB5C5);
+    }
+}
+
+static void draw_model_health_gauge(int x, int y, int w, const char *label,
+                                    int value, uint32_t color) {
+    int v = wm_clamp_i32(value, 0, 100);
+    int fill_w = (v * (w - 2)) / 100;
+
+    cursor_x = x;
+    cursor_y = y;
+    gprint((char *)label, 0xC6E6F5);
+
+    draw_filled_rect(x, y + 12, w, 10, 0x0D2232);
+    draw_rect(x, y + 12, w, 10, 0x2A617B);
+    draw_filled_rect(x + 1, y + 13, fill_w, 8, color);
+    if (wm_str_eq(label, "Jitter Latency")) {
+        int seg;
+        static const uint32_t jitter_cols[14] = {
+            0x5BEFF5, 0x58EEE9, 0x54EDD8, 0x5CECA5,
+            0x79E57D, 0xA9DF63, 0xDAD961, 0xE7CC58,
+            0xC9C55C, 0x8EC965, 0x52C679, 0x2FAE88,
+            0x2B8B8E, 0x246A81
+        };
+        for (seg = 0; seg < 14; seg++) {
+            int sx0 = x + 1 + (seg * (w - 2)) / 14;
+            int sx1 = x + 1 + ((seg + 1) * (w - 2)) / 14;
+            draw_filled_rect(sx0, y + 13, sx1 - sx0 - 1, 8, jitter_cols[seg]);
+        }
+        {
+            int marker_x = x + (w * 10) / 14;
+            draw_vline(marker_x, y + 11, y + 22, 0x3DE9F7);
+        }
+    } else {
+        int seg;
+        for (seg = 1; seg < 12; seg++) {
+            int sx = x + (seg * (w - 2)) / 12;
+            draw_vline(sx, y + 13, y + 20, 0x163E55);
+        }
+    }
+    draw_filled_rect(x + w + 4, y + 10, 40, 14, 0x153A4D);
+    draw_rect(x + w + 4, y + 10, 40, 14, 0x4BDDEB);
+    draw_rect(x + w + 5, y + 11, 38, 12, 0x206683);
+    cursor_x = x + w + 10;
+    cursor_y = y + 12;
+    gprint_dec(v, 0xEAFBFF);
+    gprint("%", 0xEAFBFF);
+}
+
+static void draw_content_model_manager(int x, int y, int w, int h) {
+    int px = x + 6;
+    int py = y + 6;
+    int pw = w - 12;
+    int ph = h - 12;
+
+    int left_w = 214;
+    int right_w = 190;
+    int mid_x;
+    int mid_w;
+    int jitter;
+    int integrity;
+    int cluster;
+    int t;
+    int task_idx;
+    int slider_w;
+    int graph_x;
+    int graph_y;
+    int graph_w;
+    int graph_h;
+    int toggle_x;
+    int value_x;
+    int control_x;
+    int row1_y;
+    int row2_y;
+    int row3_y;
+    int row4_y;
+
+    if (!g_model_ui.initialized) {
+        model_ui_sync_from_kernel();
+    }
+    model_ui_update_graph_history();
+    task_idx = model_ui_selected_task();
+
+    if (left_w + right_w + 36 > pw) {
+        left_w = pw / 3;
+        right_w = pw / 3;
+    }
+    mid_x = px + left_w + 14;
+    mid_w = pw - left_w - right_w - 30;
+    graph_x = mid_x + mid_w - 140;
+    graph_y = py + 214;
+    graph_w = 126;
+    graph_h = 72;
+    row1_y = py + 64;
+    row2_y = row1_y + 48;
+    row3_y = row2_y + 48;
+    row4_y = graph_y + 8;
+    slider_w = (graph_x - 16) - (mid_x + 10);
+    if (slider_w < 120) slider_w = 120;
+    control_x = mid_x + 10;
+    value_x = control_x;
+    toggle_x = control_x + 50;
+
+    for (t = 0; t < 56; t++) {
+        int sx = px + ((t * 37 + (int)tick) % (pw - 8)) + 4;
+        int sy = py + ((t * 19 + (int)(tick >> 1)) % (ph - 8)) + 4;
+        put_pixel(sx, sy, 0x10304A);
+    }
+
+    draw_filled_rect(px, py, pw, ph, 0x071224);
+    draw_rect(px, py, pw, ph, 0x2F6D89);
+    draw_hline(py + 18, px + 1, px + pw - 1, 0x2BA8C3);
+
+    cursor_x = px + 8;
+    cursor_y = py + 4;
+    gprint("MODEL MANAGER", 0x86EAFF);
+
+    draw_filled_rect(px + 6, py + 22, left_w, ph - 28, 0x061C30);
+    draw_rect(px + 6, py + 22, left_w, ph - 28, 0x3AC2D9);
+    draw_hline(py + 50, px + 7, px + left_w + 5, 0x1E6A86);
+    cursor_x = px + 12;
+    cursor_y = py + 28;
+    gprint("ACTIVE WORKLOADS - PID", 0xBFEEFF);
+    cursor_x = px + 12;
+    cursor_y = py + 42;
+    gprint("Strict user processes", 0x86BDD2);
+
+    for (t = 0; t < 2; t++) {
+        int row_y = py + 58 + t * 26;
+        uint32_t row_bg = (t == task_idx) ? 0x0C3C57 : 0x0A1D2D;
+        uint32_t row_fg = (t == task_idx) ? 0xCFFFFF : 0xB2D8E8;
+        draw_filled_rect(px + 10, row_y, left_w - 8, 20, row_bg);
+        draw_rect(px + 10, row_y, left_w - 8, 20, 0x2A6D88);
+        cursor_x = px + 14;
+        cursor_y = row_y + 4;
+        gprint_dec(t + 1, row_fg);
+        gprint(". ", row_fg);
+        gprint_clipped((char *)workload_display_name(t), 13, row_fg);
+        gprint(" (R3)", 0x8FBDD2);
+    }
+
+    draw_hline(py + ph - 50, px + 7, px + left_w + 5, 0x1E6A86);
+    cursor_x = px + 12;
+    cursor_y = py + ph - 38;
+    gprint("Active model name:", 0x9CC8DC);
+    cursor_x = px + 12;
+    cursor_y = py + ph - 22;
+    gprint((char *)model_display_name(model_name(task_idx)), 0xD1F7FF);
+    gprint(" baseline", 0x9CC8DC);
+
+    draw_filled_rect(mid_x, py + 22, mid_w, ph - 28, 0x071A2A);
+    draw_rect(mid_x, py + 22, mid_w, ph - 28, 0x46D3E7);
+    draw_hline(py + 50, mid_x + 1, mid_x + mid_w - 1, 0x1E6A86);
+    cursor_x = mid_x + 8;
+    cursor_y = py + 28;
+    gprint("STDP PARAMETER TUNING", 0xC5F5FF);
+    gprint(" - Model: ", 0x84B7CB);
+    gprint((char *)model_display_name(model_name(task_idx)), 0x9CF3FF);
+    cursor_x = mid_x + 8;
+    cursor_y = py + 42;
+    gprint("Phase 10 STDP parameter definition", 0x84B7CB);
+
+    draw_model_slider(mid_x + 10, row1_y, slider_w,
+                      "STDP learning rates (0.01 - 0.10)",
+                      g_model_ui.lr_fast[task_idx], 1, 10, 0x39D8E8);
+    draw_model_value_chip(value_x, row1_y + 24, g_model_ui.lr_fast[task_idx], 1, 0);
+    draw_model_toggle(toggle_x, row1_y + 24, g_model_ui.toggles[task_idx][0]);
+
+    draw_model_slider(mid_x + 10, row2_y, slider_w,
+                      "STDP learning rates (0.05 - 0.10)",
+                      g_model_ui.lr_slow[task_idx], 1, 10, 0x3AB8F2);
+    draw_model_value_chip(value_x, row2_y + 24, g_model_ui.lr_slow[task_idx], 1, 0);
+    draw_model_toggle(toggle_x, row2_y + 24, g_model_ui.toggles[task_idx][1]);
+
+    draw_model_slider(mid_x + 10, row3_y, slider_w,
+                      "Refractory periods (1ms)",
+                      g_model_ui.refractory_ticks[task_idx], 1, 40, 0x49EEC4);
+    draw_model_value_chip(value_x, row3_y + 24, g_model_ui.refractory_ticks[task_idx], 0, 1);
+    draw_model_toggle(toggle_x, row3_y + 24, g_model_ui.toggles[task_idx][2]);
+
+    draw_model_slider(mid_x + 10, row4_y, slider_w,
+                      "Time constants (1m)",
+                      g_model_ui.tau[task_idx], 1, 8, 0x62E5C1);
+    draw_model_value_chip(value_x, row4_y + 24, g_model_ui.tau[task_idx], 0, 0);
+    draw_model_toggle(toggle_x, row4_y + 24, g_model_ui.toggles[task_idx][3]);
+
+    draw_filled_rect(graph_x, graph_y, graph_w, graph_h, 0x0A2235);
+    draw_rect(graph_x, graph_y, graph_w, graph_h, 0x3AC2D9);
+    cursor_x = graph_x + 12;
+    cursor_y = graph_y + 4;
+    gprint("Potentials", 0xBEEFFD);
+    {
+        int gx = graph_x + 4;
+        int gy = graph_y + 16;
+        int gw = graph_w - 8;
+        int gh = 52;
+        int i;
+        int px0 = gx + 2;
+        int py0 = gy + gh - 3;
+        int pmax = 0;
+        int start = (g_model_ui.graph_head + 64 - 32) & 63;
+        draw_rect(gx, gy, gw, gh, 0x2E6F8A);
+        for (i = 1; i < 4; i++) {
+            draw_hline(gy + (i * gh) / 4, gx + 1, gx + gw - 1, 0x1A465F);
+        }
+        for (i = 0; i < 32; i++) {
+            int p = wm_clamp_i32(g_model_ui.graph_hist[(start + i) & 63], 0, 1000);
+            if (p > pmax) pmax = p;
+        }
+        pmax = wm_clamp_i32(pmax, 120, 1000);
+        for (i = 0; i < 32; i++) {
+            int p = wm_clamp_i32(g_model_ui.graph_hist[(start + i) & 63], 0, pmax);
+            int xx = gx + 2 + (i * (gw - 5)) / 31;
+            int yy = gy + gh - 3 - (p * (gh - 8)) / pmax;
+            draw_line_segment(px0, py0, xx, yy, 0x89E7FF);
+            px0 = xx;
+            py0 = yy;
+        }
+    }
+
+    draw_filled_rect(mid_x + 12, py + ph - 108, mid_w - 24, 58, 0x0A2234);
+    draw_rect(mid_x + 12, py + ph - 108, mid_w - 24, 58, 0x3A7992);
+    cursor_x = mid_x + 18;
+    cursor_y = py + ph - 102;
+    gprint("STDP: ", 0xA8D8E8);
+        gprint(g_model_ui.toggles[task_idx][0] ? "ON" : "OFF",
+            g_model_ui.toggles[task_idx][0] ? 0x7BFFBA : 0xFFCC88);
+    cursor_x = mid_x + 18;
+    cursor_y = py + ph - 88;
+    gprint("Task model: ", 0xA8D8E8);
+    gprint((char *)model_display_name(model_name(task_idx)), 0xD3F8FF);
+    cursor_x = mid_x + 18;
+    cursor_y = py + ph - 74;
+    gprint("LR(ref): ", 0xA8D8E8);
+    gprint_dec(model_ui_lr_ref(task_idx), 0xD3F8FF);
+
+    if (model_ui_task_dirty(task_idx)) {
+        cursor_x = mid_x + 120;
+        cursor_y = py + ph - 102;
+        gprint("pending changes", 0xFFCC66);
+    }
+
+    draw_filled_rect(px + pw - right_w - 6, py + 22, right_w, ph - 28, 0x081F31);
+    draw_rect(px + pw - right_w - 6, py + 22, right_w, ph - 28, 0x3AC2D9);
+    draw_hline(py + 50, px + pw - right_w - 5, px + pw - 7, 0x1E6A86);
+    cursor_x = px + pw - right_w + 2;
+    cursor_y = py + 28;
+    gprint("MODEL HEALTH & STATUS", 0xCCF5FF);
+
+    {
+        int pmin = 10000;
+        int pmax = 0;
+        int psum = 0;
+        for (t = 0; t < 16; t++) {
+            int p = wm_clamp_i32(potentials[t], 0, 1000);
+            if (p < pmin) pmin = p;
+            if (p > pmax) pmax = p;
+            psum += p;
+        }
+        jitter = wm_clamp_i32(((pmax - pmin) * 100) / 1000, 12, 95);
+        integrity = wm_clamp_i32(95 - (jitter / 4), 72, 96);
+        cluster = wm_clamp_i32((psum * 100) / (16 * 1000), 28, 90);
+    }
+
+    draw_model_health_gauge(px + pw - right_w + 2, py + 50, right_w - 54,
+                            "Jitter Latency", jitter, 0xF2BE4A);
+    draw_model_health_gauge(px + pw - right_w + 2, py + 84, right_w - 54,
+                            "Experiment Integrity", integrity, 0x45E8D7);
+    draw_model_health_gauge(px + pw - right_w + 2, py + 118, right_w - 54,
+                            "Cluster Health", cluster, 0x6EEA78);
+
+    draw_filled_rect(px + pw - right_w + 2, py + 152, right_w - 18, right_w - 40, 0x0A2031);
+    draw_rect(px + pw - right_w + 2, py + 152, right_w - 18, right_w - 40, 0x2A607B);
+    {
+        int gx = px + pw - right_w + 18;
+        int gy = py + 166;
+        int gw = right_w - 50;
+        int gh = right_w - 72;
+        int i;
+        draw_filled_rect(gx, gy, gw, gh, 0x102439);
+        draw_rect(gx, gy, gw, gh, 0x386D88);
+        for (i = 1; i < 8; i++) {
+            draw_hline(gy + (i * gh) / 8, gx + 1, gx + gw - 1, 0x1C445C);
+            draw_vline(gx + (i * gw) / 8, gy + 1, gy + gh - 1, 0x1C445C);
+        }
+        {
+            int cols = 14;
+            int rows = 14;
+            int usable_w = gw - 10;
+            int usable_h = gh - 10;
+            int cx0 = gx + 5;
+            int cy0 = gy + 5;
+            int cy;
+            int cx;
+            int center_r = 4 + (cluster / 18);
+            for (cy = 0; cy < rows; cy++) {
+                for (cx = 0; cx < cols; cx++) {
+                    int dx = cx - (cols / 2);
+                    int dy = cy - (rows / 2);
+                    int d2 = dx * dx + dy * dy;
+                    int intensity = (cluster + 25) - (d2 * 3) + (center_r * 2);
+                    uint32_t c = 0x1A4358;
+                    int x0 = cx0 + (cx * usable_w) / cols;
+                    int x1 = cx0 + ((cx + 1) * usable_w) / cols;
+                    int y0 = cy0 + (cy * usable_h) / rows;
+                    int y1 = cy0 + ((cy + 1) * usable_h) / rows;
+                    int cw = x1 - x0 - 1;
+                    int ch = y1 - y0 - 1;
+                    if (intensity > 72) c = 0xE2CE67;
+                    else if (intensity > 56) c = 0x95D86F;
+                    else if (intensity > 42) c = 0x56C68E;
+                    else if (intensity > 30) c = 0x3398A9;
+                    else if (intensity > 20) c = 0x286E8D;
+                    if (cw < 1) cw = 1;
+                    if (ch < 1) ch = 1;
+                    draw_filled_rect(x0, y0, cw, ch, c);
+                }
+            }
+            for (cx = 0; cx <= cols; cx++) {
+                int gxv = cx0 + (cx * usable_w) / cols;
+                draw_vline(gxv, cy0, cy0 + usable_h - 1, 0x1C445C);
+            }
+            for (cy = 0; cy <= rows; cy++) {
+                int gyh = cy0 + (cy * usable_h) / rows;
+                draw_hline(gyh, cx0, cx0 + usable_w - 1, 0x1C445C);
+            }
+        }
+    }
+
+    draw_filled_rect(px + pw - 172, py + ph - 66, 154, 24, 0x6A3F10);
+    draw_rect(px + pw - 172, py + ph - 66, 154, 24, 0xF6A947);
+    draw_rect(px + pw - 173, py + ph - 67, 156, 26, 0x7A4A12);
+    cursor_x = px + pw - 154;
+    cursor_y = py + ph - 60;
+    gprint("APPLY TUNING", 0xFFE4B8);
+
+    draw_filled_rect(px + pw - 172, py + ph - 36, 154, 22, 0x3A1C20);
+    draw_rect(px + pw - 172, py + ph - 36, 154, 22, 0xC0707D);
+    cursor_x = px + pw - 143;
+    cursor_y = py + ph - 31;
+    gprint("REVERT", 0xFFD2D8);
+
+    if ((tick - g_model_ui.last_apply_tick) < 80u && g_model_ui.last_apply_tick != 0u) {
+        cursor_x = px + pw - 168;
+        cursor_y = py + ph - 86;
+        gprint("APPLIED", 0x77FFAA);
+    }
+}
+
+static int handle_model_manager_click(WmWindow *w, int mx, int my) {
+    int cx = w->x + WM_BORDER;
+    int cy = w->y + WM_TITLEBAR_H;
+    int cw = w->w - WM_BORDER * 2;
+    int ch = w->h - WM_TITLEBAR_H - WM_BORDER;
+
+    int px = cx + 6;
+    int py = cy + 6;
+    int pw = cw - 12;
+    int left_w = 214;
+    int right_w = 190;
+    int ph = ch - 12;
+    int mid_x;
+    int mid_w;
+    int slider_w;
+    int graph_x;
+    int graph_y;
+    int toggle_x;
+    int value_x;
+    int control_x;
+    int task_idx;
+    int row1_y;
+    int row2_y;
+    int row3_y;
+    int row4_y;
+
+    int rel;
+
+    if (left_w + right_w + 36 > pw) {
+        left_w = pw / 3;
+        right_w = pw / 3;
+    }
+    mid_x = px + left_w + 14;
+    mid_w = pw - left_w - right_w - 30;
+    graph_x = mid_x + mid_w - 140;
+    graph_y = py + 214;
+    row1_y = py + 64;
+    row2_y = row1_y + 48;
+    row3_y = row2_y + 48;
+    row4_y = graph_y + 8;
+    slider_w = (graph_x - 16) - (mid_x + 10);
+    if (slider_w < 120) slider_w = 120;
+    control_x = mid_x + 10;
+    value_x = control_x;
+    toggle_x = control_x + 50;
+    (void)value_x;
+    task_idx = model_ui_selected_task();
+
+    if (pt_in_rect(mx, my, px + 10, py + 58, left_w - 8, 20)) {
+        g_model_ui.selected_task = 0;
+        if (!model_ui_task_dirty(0)) {
+            model_ui_sync_task_from_kernel(0);
+        }
+        return 1;
+    }
+    if (pt_in_rect(mx, my, px + 10, py + 84, left_w - 8, 20)) {
+        g_model_ui.selected_task = 1;
+        if (!model_ui_task_dirty(1)) {
+            model_ui_sync_task_from_kernel(1);
+        }
+        return 1;
+    }
+
+    if (pt_in_rect(mx, my, mid_x + 10, row1_y + 13, slider_w, 8)) {
+        rel = ((mx - (mid_x + 10)) * 9) / (slider_w > 0 ? slider_w : 1);
+        g_model_ui.lr_fast[task_idx] = wm_clamp_i32(rel + 1, 1, 10);
+        model_ui_mark_dirty(task_idx);
+        return 1;
+    }
+    if (pt_in_rect(mx, my, mid_x + 10, row2_y + 13, slider_w, 8)) {
+        rel = ((mx - (mid_x + 10)) * 9) / (slider_w > 0 ? slider_w : 1);
+        g_model_ui.lr_slow[task_idx] = wm_clamp_i32(rel + 1, 1, 10);
+        model_ui_mark_dirty(task_idx);
+        return 1;
+    }
+    if (pt_in_rect(mx, my, mid_x + 10, row3_y + 13, slider_w, 8)) {
+        rel = ((mx - (mid_x + 10)) * 39) / (slider_w > 0 ? slider_w : 1);
+        g_model_ui.refractory_ticks[task_idx] = wm_clamp_i32(rel + 1, 1, 40);
+        model_ui_mark_dirty(task_idx);
+        return 1;
+    }
+    if (pt_in_rect(mx, my, mid_x + 10, row4_y + 13, slider_w, 8)) {
+        rel = ((mx - (mid_x + 10)) * 7) / (slider_w > 0 ? slider_w : 1);
+        g_model_ui.tau[task_idx] = wm_clamp_i32(rel + 1, 1, 8);
+        model_ui_mark_dirty(task_idx);
+        return 1;
+    }
+
+    if (pt_in_rect(mx, my, toggle_x, row1_y + 24, 44, 14)) {
+        g_model_ui.toggles[task_idx][0] ^= 1;
+        model_ui_mark_dirty(task_idx);
+        return 1;
+    }
+    if (pt_in_rect(mx, my, toggle_x, row2_y + 24, 44, 14)) {
+        g_model_ui.toggles[task_idx][1] ^= 1;
+        model_ui_mark_dirty(task_idx);
+        return 1;
+    }
+    if (pt_in_rect(mx, my, toggle_x, row3_y + 24, 44, 14)) {
+        g_model_ui.toggles[task_idx][2] ^= 1;
+        model_ui_mark_dirty(task_idx);
+        return 1;
+    }
+    if (pt_in_rect(mx, my, toggle_x, row4_y + 24, 44, 14)) {
+        g_model_ui.toggles[task_idx][3] ^= 1;
+        model_ui_mark_dirty(task_idx);
+        return 1;
+    }
+
+    if (pt_in_rect(mx, my, px + pw - 172, py + ph - 66, 154, 24)) {
+        model_ui_apply_to_kernel();
+        return 1;
+    }
+    if (pt_in_rect(mx, my, px + pw - 172, py + ph - 36, 154, 22)) {
+        model_ui_restore_task_baseline(task_idx);
+        return 1;
+    }
+
+    return 0;
+}
+
+static int handle_model_manager_drag(WmWindow *w, int mx, int my) {
+    int cx = w->x + WM_BORDER;
+    int cy = w->y + WM_TITLEBAR_H;
+    int cw = w->w - WM_BORDER * 2;
+    int ch = w->h - WM_TITLEBAR_H - WM_BORDER;
+
+    int px = cx + 6;
+    int py = cy + 6;
+    int pw = cw - 12;
+    int left_w = 214;
+    int right_w = 190;
+    int mid_x;
+    int mid_w;
+    int slider_w;
+    int graph_x;
+    int graph_y;
+    int task_idx;
+    int row1_y;
+    int row2_y;
+    int row3_y;
+    int row4_y;
+    int rel;
+
+    (void)ch;
+
+    if (left_w + right_w + 36 > pw) {
+        left_w = pw / 3;
+        right_w = pw / 3;
+    }
+    mid_x = px + left_w + 14;
+    mid_w = pw - left_w - right_w - 30;
+    graph_x = mid_x + mid_w - 140;
+    graph_y = py + 214;
+    row1_y = py + 64;
+    row2_y = row1_y + 48;
+    row3_y = row2_y + 48;
+    row4_y = graph_y + 8;
+    slider_w = (graph_x - 16) - (mid_x + 10);
+    if (slider_w < 120) slider_w = 120;
+    task_idx = model_ui_selected_task();
+
+    if (pt_in_rect(mx, my, mid_x + 10, row1_y + 13, slider_w, 8)) {
+        rel = ((mx - (mid_x + 10)) * 9) / (slider_w > 0 ? slider_w : 1);
+        g_model_ui.lr_fast[task_idx] = wm_clamp_i32(rel + 1, 1, 10);
+        model_ui_mark_dirty(task_idx);
+        return 1;
+    }
+    if (pt_in_rect(mx, my, mid_x + 10, row2_y + 13, slider_w, 8)) {
+        rel = ((mx - (mid_x + 10)) * 9) / (slider_w > 0 ? slider_w : 1);
+        g_model_ui.lr_slow[task_idx] = wm_clamp_i32(rel + 1, 1, 10);
+        model_ui_mark_dirty(task_idx);
+        return 1;
+    }
+    if (pt_in_rect(mx, my, mid_x + 10, row3_y + 13, slider_w, 8)) {
+        rel = ((mx - (mid_x + 10)) * 39) / (slider_w > 0 ? slider_w : 1);
+        g_model_ui.refractory_ticks[task_idx] = wm_clamp_i32(rel + 1, 1, 40);
+        model_ui_mark_dirty(task_idx);
+        return 1;
+    }
+    if (pt_in_rect(mx, my, mid_x + 10, row4_y + 13, slider_w, 8)) {
+        rel = ((mx - (mid_x + 10)) * 7) / (slider_w > 0 ? slider_w : 1);
+        g_model_ui.tau[task_idx] = wm_clamp_i32(rel + 1, 1, 8);
+        model_ui_mark_dirty(task_idx);
+        return 1;
+    }
+    return 0;
+}
+
 static void draw_content_launcher(int x, int y, int w, int h) {
     draw_filled_rect(x + 8, y + 8, w - 16, h - 16, 0x102232);
     draw_rect(x + 8, y + 8, w - 16, h - 16, 0x3A627B);
@@ -657,6 +1462,8 @@ void wm_init(void) {
     wm_add_window(156, 92, 360, 180, "Console", draw_content_console, 1, 3);
     wm_add_window(450, 110, 280, 210, "Profiler", draw_content_profiler, 0, 4);
     wm_add_window(480, 150, 250, 150, "Settings", draw_content_settings, 0, 5);
+    wm_add_window(20, 26, 760, 500, "Model Manager App", draw_content_model_manager, 0, -1);
+    model_ui_sync_from_kernel();
 }
 
 int wm_add_window(int x, int y, int w, int h, const char *title,
@@ -798,6 +1605,22 @@ void wm_launch_icon_slot(int slot) {
     int j;
     for (j = 0; j < wm_window_count; j++) {
         if (wm_windows[j].icon_slot == slot) {
+            wm_windows[j].visible = 1;
+            wm_windows[j].state = WM_STATE_NORMAL;
+            bring_to_front(j);
+            return;
+        }
+    }
+}
+
+void wm_open_model_manager(void) {
+    int j;
+    for (j = 0; j < wm_window_count; j++) {
+        if (wm_str_eq(wm_windows[j].title, "Model Manager App")) {
+            wm_windows[j].x = 20;
+            wm_windows[j].y = 26;
+            wm_windows[j].w = 760;
+            wm_windows[j].h = 500;
             wm_windows[j].visible = 1;
             wm_windows[j].state = WM_STATE_NORMAL;
             bring_to_front(j);
@@ -1049,7 +1872,16 @@ void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons) {
         }
     }
 
-    if (!clicked) return;
+    if (!clicked) {
+        if (held && wm_focused >= 0 && wm_focused < wm_window_count) {
+            WmWindow *fw = &wm_windows[wm_focused];
+            if (fw->visible && wm_str_eq(fw->title, "Model Manager App") &&
+                pt_in_rect(mx, my, fw->x, fw->y, fw->w, fw->h)) {
+                (void)handle_model_manager_drag(fw, mx, my);
+            }
+        }
+        return;
+    }
 
     if (power_menu_open) {
         int pmx = 646;
@@ -1168,6 +2000,11 @@ void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons) {
             return;
         }
 
+        if (wm_str_eq(w->title, "Model Manager App")) {
+            (void)handle_model_manager_click(w, mx, my);
+            return;
+        }
+
         /* Clicked in content area - just focus */
         return;
     }
@@ -1233,10 +2070,22 @@ void wm_render(void) {
 
         /* Content area: inside title bar and border */
         if (w->draw_fn) {
-            int cx = w->x + WM_BORDER;
-            int cy = w->y + WM_TITLEBAR_H;
-            int cw = w->w - WM_BORDER * 2;
-            int ch = w->h - WM_TITLEBAR_H - WM_BORDER;
+            int cx;
+            int cy;
+            int cw;
+            int ch;
+
+            if (wm_str_eq(w->title, "Model Manager App")) {
+                cx = w->x + 2;
+                cy = w->y + 22;
+                cw = w->w - 4;
+                ch = w->h - 24;
+            } else {
+                cx = w->x + WM_BORDER;
+                cy = w->y + WM_TITLEBAR_H;
+                cw = w->w - WM_BORDER * 2;
+                ch = w->h - WM_TITLEBAR_H - WM_BORDER;
+            }
             w->draw_fn(cx, cy, cw, ch);
         }
     }
