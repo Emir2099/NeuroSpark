@@ -485,8 +485,8 @@ static int require_admin_context(void) {
 }
 
 #define REPLAY_MAX_CMDS 64
-static char replay_cmds[REPLAY_MAX_CMDS][32];
-static int replay_count = 0;
+char replay_cmds[REPLAY_MAX_CMDS][32];
+int replay_count = 0;
 static int replay_recording = 0;
 static int replay_running = 0;
 
@@ -1601,6 +1601,10 @@ static void cmd_dataset(const char *args) {
   set_cmd_output("USAGE: dataset export|import <path>");
 }
 
+int shell_is_recording_replay(void) {
+  return replay_recording;
+}
+
 static void cmd_replay(const char *args) {
   char sub[12];
   args = next_token(args, sub, sizeof(sub));
@@ -1636,8 +1640,11 @@ static void cmd_replay(const char *args) {
     } else if (str_eq(mode, "off")) {
       replay_recording = 0;
       set_cmd_output("REPLAY REC OFF");
+    } else if (str_eq(mode, "toggle")) {
+      replay_recording = !replay_recording;
+      set_cmd_output(replay_recording ? "REPLAY REC ON" : "REPLAY REC OFF");
     } else {
-      set_cmd_output("USAGE: replay rec on|off");
+      set_cmd_output("USAGE: replay rec on|off|toggle");
     }
     return;
   }

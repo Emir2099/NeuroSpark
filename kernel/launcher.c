@@ -542,6 +542,11 @@ void launcher_launch_app(int app_idx) {
         launcher_set_app_status(app_idx, APP_STATUS_RUNNING);
         return;
     }
+    if (app->name[0] == 'R' && app->name[1] == 'e') { /* Replay Control */
+        wm_open_replay_control();
+        launcher_set_app_status(app_idx, APP_STATUS_RUNNING);
+        return;
+    }
 
     if (app->launch_fn) {
         app->launch_fn();

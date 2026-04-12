@@ -34,7 +34,7 @@ typedef unsigned int uint32_t;
 typedef unsigned char uint8_t;
 #endif
 
-#define WM_MAX_WINDOWS    8
+#define WM_MAX_WINDOWS    12
 #define WM_STATE_NORMAL   0
 #define WM_STATE_MINIMIZED 1
 #define WM_STATE_MAXIMIZED 2
@@ -83,5 +83,6 @@ void wm_launch_icon_slot(int slot);
 void wm_open_model_manager(void);
 void wm_open_spike_monitor(void);
 void wm_open_snapshot_browser(void);
+void wm_open_replay_control(void);
 
 #endif

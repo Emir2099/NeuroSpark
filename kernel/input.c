@@ -18,6 +18,7 @@ extern void sys_save_task(int task_id, int slot);
 extern int sys_load_task(int task_id, int slot);
 extern void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons);
 extern int wm_focused_needs_keyboard(void);
+extern int wm_is_replay_focused(void);
 
 typedef struct {
   int voltage;
@@ -225,6 +226,13 @@ void keyboard_handler(void) {
         code == 0x3F) {
       /* Keep global function-key controls live even when no text target is focused. */
     } else {
+      if (wm_is_replay_focused()) {
+        if (c == 'r' || c == 'R') {
+          process_command("replay rec toggle");
+        } else if (c == 'p' || c == 'P') {
+          process_command("replay run");
+        }
+      }
       return;
     }
   }

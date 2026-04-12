@@ -8,6 +8,8 @@
  *   • Z-order management and focus tracking
  * ================================================================ */
 #include "wm.h"
+extern void process_command(char *);
+
 #include "launcher.h"
 #include "model_manager.h"
 
@@ -1523,14 +1525,6 @@ static uint32_t spike_phase_color(int v) {
     }
 }
 
-static void draw_spike_glow_dot(int x, int y) {
-    put_pixel(x, y, 0x98FF7D);
-    put_pixel(x + 1, y, 0x7CFF72);
-    put_pixel(x - 1, y, 0x3BD25B);
-    put_pixel(x, y - 1, 0x3BD25B);
-    put_pixel(x, y + 1, 0x3BD25B);
-    put_pixel(x + 1, y + 1, 0x2DA04A);
-}
 
 static void draw_spike_soft_blob(int cx, int cy, uint32_t core, uint32_t ring) {
     int dx, dy;
@@ -2162,6 +2156,7 @@ static void draw_content_snapshot_browser(int x, int y, int w, int h) {
 /* ------------------------------------------------------------ */
 /*  Initialisation                                               */
 /* ------------------------------------------------------------ */
+static void draw_content_replay_control(int x, int y, int w, int h);
 void wm_init(void) {
     int i;
     for (i = 0; i < WM_MAX_WINDOWS; i++) {
@@ -2188,6 +2183,7 @@ void wm_init(void) {
     wm_add_window(30, 34, 760, 450, "Spike Monitor App", draw_content_spike_monitor, 0, -1);
     wm_add_window(20, 26, 1000, 420, "Snapshot Browser App", draw_content_snapshot_browser, 0, -1);
     wm_add_window(20, 26, 760, 500, "Model Manager App", draw_content_model_manager, 0, -1);
+    wm_add_window(150, 150, 800, 360, "Replay Control App", draw_content_replay_control, 0, -1);
     model_ui_sync_from_kernel();
 }
 
@@ -2597,6 +2593,7 @@ static void draw_window_chrome(WmWindow *win) {
 /* ------------------------------------------------------------ */
 /*  Mouse handling                                               */
 /* ------------------------------------------------------------ */
+void handle_replay_control_click(int win_idx, int mx, int my);
 void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons) {
     int clicked   = (buttons & 1) && !(prev_buttons & 1);
     int held      = (buttons & 1);
@@ -2771,6 +2768,11 @@ void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons) {
             return;
         }
 
+        if (wm_str_eq(w->title, "Replay Control App")) {
+            handle_replay_control_click(idx, mx, my);
+            return;
+        }
+
         /* Clicked in content area - just focus */
         return;
     }
@@ -2888,3 +2890,284 @@ void wm_get_runtime_metrics(uint32_t *frames_total, uint32_t *fps_x10) {
         *fps_x10 = wm_fps_x10;
     }
 }
+
+typedef struct {
+    int playing;
+    int current_frame;
+    int last_cmd_executed;
+} WmReplayState;
+WmReplayState replay_state = {0, 0, -1};
+
+extern int shell_is_recording_replay(void);
+extern char replay_cmds[64][32];
+extern int replay_count;
+
+static void draw_hex_button(int x, int y, int w, int h, const char *txt1, const char *txt2, uint32_t border_col, uint32_t fill_col) {
+    int bevel = 8;
+    draw_filled_rect(x + bevel, y, w - bevel*2, h, fill_col);
+    draw_filled_rect(x, y + bevel, w, h - bevel*2, fill_col);
+
+    draw_line_segment(x + bevel, y, x + w - bevel, y, border_col);
+    draw_line_segment(x + bevel, y + h, x + w - bevel, y + h, border_col);
+    draw_line_segment(x, y + bevel, x, y + h - bevel, border_col);
+    draw_line_segment(x + w, y + bevel, x + w, y + h - bevel, border_col);
+
+    draw_line_segment(x, y + bevel, x + bevel, y, border_col);
+    draw_line_segment(x + w - bevel, y, x + w, y + bevel, border_col);
+    draw_line_segment(x, y + h - bevel, x + bevel, y + h, border_col);
+    draw_line_segment(x + w - bevel, y + h, x + w, y + h - bevel, border_col);
+    
+    if (txt1) {
+        int sl = 0; while (txt1[sl]) ++sl;
+        cursor_x = x + (w - sl * 8) / 2;
+        cursor_y = y + h/2 - 12;
+        gprint((char *)txt1, 0x4EEBFE);
+    }
+    if (txt2) {
+        int sl = 0; while (txt2[sl]) ++sl;
+        cursor_x = x + (w - sl * 8) / 2;
+        cursor_y = y + h/2 + 2;
+        gprint((char *)txt2, 0xCCCCCC);
+    }
+}
+
+static void draw_hex_button_orange(int x, int y, int w, int h, const char *txt1, const char *txt2, uint32_t border_col, uint32_t fill_col, int dot) {
+    int bevel = 8;
+    draw_filled_rect(x + bevel, y, w - bevel*2, h, fill_col);
+    draw_filled_rect(x, y + bevel, w, h - bevel*2, fill_col);
+
+    draw_line_segment(x + bevel, y, x + w - bevel, y, border_col);
+    draw_line_segment(x + bevel, y + h, x + w - bevel, y + h, border_col);
+    draw_line_segment(x, y + bevel, x, y + h - bevel, border_col);
+    draw_line_segment(x + w, y + bevel, x + w, y + h - bevel, border_col);
+
+    draw_line_segment(x, y + bevel, x + bevel, y, border_col);
+    draw_line_segment(x + w - bevel, y, x + w, y + bevel, border_col);
+    draw_line_segment(x, y + h - bevel, x + bevel, y + h, border_col);
+    draw_line_segment(x + w - bevel, y + h, x + w, y + h - bevel, border_col);
+    
+    if (dot) {
+        draw_filled_rect(x + w - 24, y + 6, 6, 6, shell_is_recording_replay() ? 0xFF0000 : 0xFF9F3B);
+        cursor_x = x + w - 16; cursor_y = y + 5; gprint((char *)"REC", shell_is_recording_replay() ? 0xFF0000 : 0xFF9F3B);
+    }
+
+    if (txt1) {
+        int sl = 0; while (txt1[sl]) ++sl;
+        cursor_x = x + (w - sl * 8) / 2;
+        cursor_y = y + h/2 - 12;
+        gprint((char *)txt1, 0xFF9F3B);
+    }
+    if (txt2) {
+        int sl = 0; while (txt2[sl]) ++sl;
+        cursor_x = x + (w - sl * 8) / 2;
+        cursor_y = y + h/2 + 2;
+        gprint((char *)txt2, 0xFFFFFF);
+    }
+}
+
+static void draw_content_replay_control(int x, int y, int w, int h) {
+    int cx = x;
+    int cy = y;
+    int cw = w;
+    int ch = h;
+    
+    draw_filled_rect(cx, cy, cw, ch, 0x05131C);
+    
+    int tb_y = cy + 10;
+    draw_filled_rect(cx + 10, tb_y, cw - 200, 60, 0x0D2232);
+    draw_rect(cx + 10, tb_y, cw - 200, 60, 0x2A617B);
+
+    int btn_w = (cw - 220) / 6 - 5;
+    int bx = cx + 18;
+    int by = tb_y + 8;
+    int border_c = 0x4CEBFD;
+    int bg_c     = 0x0A2D40;
+    
+    draw_hex_button(bx, by, btn_w, 44, "|[<<]", "(Start)", border_c, bg_c); bx += btn_w + 6;
+    draw_hex_button(bx, by, btn_w, 44, "[<<]", "(Rewind)", border_c, bg_c); bx += btn_w + 6;
+    draw_hex_button(bx, by, btn_w, 44, "[ || ]", "(Pause)", border_c, bg_c); bx += btn_w + 6;
+    draw_hex_button(bx, by, btn_w, 44, "|[>]", "(Play)", border_c, bg_c); bx += btn_w + 6;
+    draw_hex_button(bx, by, btn_w, 44, "[>>]", "(Fast-Forward)", border_c, bg_c); bx += btn_w + 6;
+    draw_hex_button(bx, by, btn_w, 44, "[>>]|", "(End)", border_c, bg_c); 
+    
+    int rx = cx + cw - 180;
+    int is_rec = shell_is_recording_replay();
+    draw_hex_button_orange(rx + 8, by, 144, 44, "RECORD", "User Summary", is_rec ? 0xFF0000 : 0xFF9F3B, 0x1F1410, 1);
+    
+    int t_y = cy + 80;
+    draw_filled_rect(cx + 10, t_y, cw - 20, 80, 0x0D2232);
+    draw_rect(cx + 10, t_y, cw - 20, 80, 0x2A617B);
+    cursor_x = cx + 16; cursor_y = t_y + 6; gprint((char *)"Replay Scrubber Timeline", 0xFFFFFF);
+    
+    int line_y = t_y + 50;
+    draw_line_segment(cx + 20, line_y, cx + cw - 30, line_y, 0x367F60);
+    for(int i=cx+20; i < cx+cw-30; i+= 15) {
+       draw_vline(i, line_y - 4, line_y + 4, 0x367F60);
+    }
+    
+    if (replay_state.playing) {
+        replay_state.current_frame += 2;
+        if (replay_state.current_frame > (cw - 60)) {
+            replay_state.playing = 0;
+            replay_state.current_frame = 0;
+            replay_state.last_cmd_executed = -1;
+        }
+    }
+    
+    int phx = cx + 20 + replay_state.current_frame;
+    if (phx > cx + cw - 30) phx = cx + cw - 30;
+    
+    int pins = replay_count;
+    if (pins > 0) {
+        int spacing = (cw - 60) / pins;
+        for (int p = 0; p < pins; p++) {
+            int px = cx + 20 + (p + 1) * spacing;
+            draw_filled_rect(px - 3, line_y - 3, 6, 6, 0x4EEBFE);
+            draw_vline(px, t_y + 20, t_y + 50, 0x4EEBFE);
+            
+            if (replay_state.playing && phx >= px && p > replay_state.last_cmd_executed) {
+                replay_state.last_cmd_executed = p;
+                char cmd_copy[32];
+                extern void copy_cmd_text(char *, const char *, int);
+                int k = 0;
+                while (replay_cmds[p][k] && k < 31) {
+                    cmd_copy[k] = replay_cmds[p][k];
+                    k++;
+                }
+                cmd_copy[k] = 0;
+                process_command(cmd_copy);
+            }
+        }
+    }
+    draw_filled_rect(phx - 2, t_y + 30, 4, 30, 0x5DEAD4);
+    
+    cursor_x = cx + cw/2 - 64; cursor_y = t_y + 60;
+    gprint((char *)"T:18:07:05.123", 0x5DEAD4);
+
+    int h_y = cy + 170;
+    draw_filled_rect(cx + 10, h_y, cw - 340, 110, 0x0D2232);
+    draw_rect(cx + 10, h_y, cw - 340, 110, 0x2A617B);
+    cursor_x = cx + 16; cursor_y = h_y + 6; gprint((char *)"ACTION HISTORY - Sequential Commands", 0xFFFFFF);
+    
+    for (int k = 0; k < replay_count && k < 4; k++) {
+        cursor_x = cx + 16; cursor_y = h_y + 26 + k*16;
+        gprint((char *)"> Ardent REPL ", 0xDDDDDD);
+        char num[4];
+        num[0] = '1' + k; num[1] = '.'; num[2] = ' '; num[3] = 0;
+        gprint(num, 0xCCCCCC);
+        gprint(replay_cmds[k], 0xFFDD99);
+        gprint((char *)" (T+...ms)", 0x888888);
+    }
+    
+    draw_filled_rect(cx + cw - 320, h_y, 310, 110, 0x0D2232);
+    draw_rect(cx + cw - 320, h_y, 310, 110, 0x2A617B);
+    
+    draw_hex_button_orange(cx + cw - 310, h_y + 30, 140, 60, "CLEAR QUEUE", "", 0xFF9F3B, 0x1D0E09, 0);
+    draw_hex_button_orange(cx + cw - 160, h_y + 30, 140, 60, "EXPORT SESSION", "Manifest", 0xFF9F3B, 0x1D0E09, 0);
+}
+
+
+int wm_is_replay_focused(void) {
+    if (wm_focused >= 0 && wm_focused < wm_window_count) {
+        if (wm_str_eq(wm_windows[wm_focused].title, "Replay Control App")) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void wm_open_replay_control(void) {
+    int j;
+    for (j = 0; j < wm_window_count; j++) {
+        if (wm_str_eq(wm_windows[j].title, "Replay Control App")) {
+            wm_windows[j].x = 150;
+            wm_windows[j].y = 150;
+            wm_windows[j].w = 800;
+            wm_windows[j].h = 360;
+            wm_windows[j].visible = 1;
+            wm_windows[j].state = WM_STATE_NORMAL;
+            bring_to_front(j);
+            return;
+        }
+    }
+}extern int wm_is_replay_focused(void);
+extern int wm_str_eq(const char *s1, const char *s2);
+
+void handle_replay_control_click(int win_idx, int mx, int my) {
+    if (win_idx < 0 || win_idx >= 12) return;
+    int wx = wm_windows[win_idx].x;
+    int wy = wm_windows[win_idx].y;
+    int rx = mx - wx;
+    int ry = my - wy;
+    
+    int tb_y = 30 + 10;
+    int by = tb_y + 8;
+    int btn_w = (wm_windows[win_idx].w - 220) / 6 - 5;
+    
+    if (ry >= by && ry <= by + 44) {
+        int bx = 18;
+        if (rx >= bx && rx <= bx + btn_w) {
+            replay_state.current_frame = 0;
+            replay_state.last_cmd_executed = -1;
+            return;
+        }
+        bx += btn_w + 6;
+        if (rx >= bx && rx <= bx + btn_w) {
+            replay_state.current_frame -= 60;       
+            if (replay_state.current_frame < 0) {
+               replay_state.current_frame = 0;
+               replay_state.last_cmd_executed = -1;
+            }
+            return;
+        }
+        bx += btn_w + 6;
+        if (rx >= bx && rx <= bx + btn_w) {
+            replay_state.playing = 0;
+            return;
+        }
+        bx += btn_w + 6;
+        if (rx >= bx && rx <= bx + btn_w) {
+            int cx2 = wm_windows[win_idx].w - WM_BORDER * 2;
+            if (replay_state.current_frame >= (cx2 - 60)) {
+                replay_state.current_frame = 0;
+                replay_state.last_cmd_executed = -1;
+            }
+            replay_state.playing = 1;
+            return;
+        }
+        bx += btn_w + 6;
+        if (rx >= bx && rx <= bx + btn_w) {
+            replay_state.current_frame += 60;       
+            return;
+        }
+        bx += btn_w + 6;
+        if (rx >= bx && rx <= bx + btn_w) {
+            replay_state.current_frame = 99999;
+            return;
+        }
+        
+        int rbx = wm_windows[win_idx].w - 180 + 8;
+        if (rx >= rbx && rx <= rbx + 144) {
+            process_command("replay rec toggle");
+            return;
+        }
+    }
+    
+    int h_y = 30 + 170;
+    int cq_x = wm_windows[win_idx].w - 310;
+    int ey_x = wm_windows[win_idx].w - 160;
+    
+    if (ry >= h_y + 30 && ry <= h_y + 90) {
+        if (rx >= cq_x && rx <= cq_x + 140) {
+            process_command("replay clear");
+            return;
+        }
+        if (rx >= ey_x && rx <= ey_x + 140) {
+            process_command("dataset export");
+            return;
+        }
+    }
+}
+
+
+

@@ -2154,9 +2154,9 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
   // Read VBE handoff values from low memory populated by bootloader:
   // 0x500: framebuffer address, 0x504: pitch(bytes per scanline),
   // 0x508: bits per pixel.
-  vbe_framebuffer = *((uint32_t *)0x500);
-  vbe_pitch = *((uint32_t *)0x504);
-  vbe_bpp = *((uint32_t *)0x508);
+  vbe_framebuffer = *((volatile uint32_t *)0x500);
+  vbe_pitch = *((volatile uint32_t *)0x504);
+  vbe_bpp = *((volatile uint32_t *)0x508);
   graphics_enabled =
       (vbe_framebuffer != 0) && (vbe_bpp == 24 || vbe_bpp == 32);
 
