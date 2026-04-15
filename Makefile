@@ -68,7 +68,7 @@ clean:
 
 # Run in QEMU
 run: NeuroSpark.bin
-	qemu-system-i386 -vga std -rtc base=localtime,clock=host -drive file=$<,format=raw,index=0,media=disk
+	qemu-system-i386 -vga std -rtc base=localtime,clock=host -net nic,model=rtl8139 -net user -drive file=$<,format=raw,index=0,media=disk
 
 validate-phase15-17:
 	bash tools/validate_phase15_17.sh

@@ -219,6 +219,10 @@ int pmm_get_free_pages() {
   return free_count;
 }
 
+int pmm_get_total_pages() {
+  return (BITMAP_SIZE * 8);
+}
+
 void pmm_get_stats(void *out_stats) {
   PmmStats *stats = (PmmStats *)out_stats;
   uint32_t first_user_page = 0x100000 / PAGE_SIZE;

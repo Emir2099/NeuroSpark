@@ -1605,6 +1605,13 @@ int shell_is_recording_replay(void) {
   return replay_recording;
 }
 
+static void cmd_telemetry(const char *args) {
+    extern void wm_open_telemetry_cockpit(void);
+    wm_open_telemetry_cockpit();
+    extern void set_cmd_output(const char *);
+    set_cmd_output("TELEMETRY LAUNCHED");
+}
+
 static void cmd_replay(const char *args) {
   char sub[12];
   args = next_token(args, sub, sizeof(sub));
@@ -3754,6 +3761,7 @@ static const CommandEntry command_table[] = {
     {"viz", cmd_viz},
     {"manifest", cmd_manifest},
     {"dataset", cmd_dataset},
+    {"telemetry", cmd_telemetry},
     {"replay", cmd_replay},
     {"pcache", cmd_pcache},
     {"diag", cmd_diag},

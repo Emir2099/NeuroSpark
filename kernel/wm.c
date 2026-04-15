@@ -1,3 +1,4 @@
+#include "task.h"
 /* ================================================================
  * wm.c – NeuroSpark Desktop Window Manager
  *
@@ -8,6 +9,12 @@
  *   • Z-order management and focus tracking
  * ================================================================ */
 #include "wm.h"
+int storage_get_snapshot_tag(int slot, char *out, int out_len);
+
+int handle_replay_control_click(WmWindow *w, int mx, int my);
+void draw_spike_glow_dot(int x, int y);
+void draw_content_telemetry(int cx, int cy, int cw, int ch);
+
 extern void process_command(char *);
 
 #include "launcher.h"
@@ -2047,7 +2054,8 @@ static void draw_content_snapshot_browser(int x, int y, int w, int h) {
     int py3_base = g_y + 36 + 4 * ((g_h - 36) / 6);
     int py4_base = g_y + 36 + 5 * ((g_h - 36) / 6);
     int prev1_x = px_base, prev1_y = py1_base;
-    int prev2_x = px_base, prev2_y = py1_base + 3;
+    
+    int prev2_x = px_base, prev2_y = py1_base;
     int prev3_x = px_base, prev3_y = py2_base;
     int prev4_x = px_base, prev4_y = py3_base;
     int prev5_x = px_base, prev5_y = py4_base;
@@ -2593,7 +2601,7 @@ static void draw_window_chrome(WmWindow *win) {
 /* ------------------------------------------------------------ */
 /*  Mouse handling                                               */
 /* ------------------------------------------------------------ */
-void handle_replay_control_click(int win_idx, int mx, int my);
+void handle_replay_control_click_idx(int win_idx, int mx, int my);
 void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons) {
     int clicked   = (buttons & 1) && !(prev_buttons & 1);
     int held      = (buttons & 1);
@@ -2769,7 +2777,7 @@ void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons) {
         }
 
         if (wm_str_eq(w->title, "Replay Control App")) {
-            handle_replay_control_click(idx, mx, my);
+            handle_replay_control_click_idx(idx, mx, my);
             return;
         }
 
@@ -3093,7 +3101,7 @@ void wm_open_replay_control(void) {
 }extern int wm_is_replay_focused(void);
 extern int wm_str_eq(const char *s1, const char *s2);
 
-void handle_replay_control_click(int win_idx, int mx, int my) {
+void handle_replay_control_click_idx(int win_idx, int mx, int my) {
     if (win_idx < 0 || win_idx >= 12) return;
     int wx = wm_windows[win_idx].x;
     int wy = wm_windows[win_idx].y;
@@ -3171,3 +3179,350 @@ void handle_replay_control_click(int win_idx, int mx, int my) {
 
 
 
+
+
+static void telemetry_itoa(int value, char *str) {
+    if (value == 0) {
+        str[0] = '0';
+        str[1] = '\0';
+        return;
+    }
+    int is_negative = 0;
+    if (value < 0) {
+        is_negative = 1;
+        value = -value;
+    }
+    char temp[32];
+    int i = 0;
+    while (value > 0) {
+        temp[i++] = (value % 10) + '0';
+        value /= 10;
+    }
+    int j = 0;
+    if (is_negative) str[j++] = '-';
+    while (i > 0) {
+        str[j++] = temp[--i];
+    }
+    str[j] = '\0';
+}
+
+extern void itoa(int n, char *str);
+
+void draw_content_telemetry(int cx, int cy, int cw, int ch) {
+    draw_filled_rect(cx, cy, cw, ch, 0x05131C);
+    int pill_w = 200, pill_h = 24;
+    int pill_x = cx + (cw - pill_w)/2;
+    int pill_y = cy + 10;
+    draw_filled_rect(pill_x, pill_y, pill_w, pill_h, 0x0D2B1C);
+    draw_rect(pill_x, pill_y, pill_w, pill_h, 0x24C655);
+    draw_filled_rect(pill_x + 12, pill_y + 8, 8, 8, 0x24C655); 
+    extern int cursor_x, cursor_y;
+    cursor_x = pill_x + 30; cursor_y = pill_y + 8;
+    gprint("ALL SYSTEMS NOMINAL", 0x24C655);
+
+    int margin = 10;
+    int panel_w = cw / 2 - margin * 1.5;
+    int left_x = cx + margin;
+    int right_x = cx + cw / 2 + margin / 2;
+    
+    int row1_y = cy + 40;
+    int row1_h = 160;
+    int row2_y = row1_y + row1_h + 10;
+    int row2_h = 120;
+    int row3_y = row2_y + row2_h + 10;
+    int row3_h = 100;
+
+    extern uint32_t tick;
+    uint32_t secs = tick / 100;
+    uint32_t mins = secs / 60;
+    uint32_t hrs = mins / 60;
+
+    extern int pmm_get_free_pages(void);
+    extern int pmm_get_total_pages(void);
+    int total_mb = pmm_get_total_pages() * 4 / 1024;
+    if (total_mb == 0) total_mb = 32; // fallback
+    int free_mb = pmm_get_free_pages() * 4 / 1024;
+    int used_mb = total_mb - free_mb;
+    if (used_mb < 0) used_mb = 0;
+
+    typedef struct {
+        uint32_t total_frames; uint32_t total_bytes; uint32_t ipv4_frames; uint32_t arp_frames;
+        uint32_t neuro_frames; uint32_t unknown_frames; uint32_t dropped_frames; uint32_t irq_count;
+        uint32_t irq_rx_events; uint32_t tx_probe_ok; uint32_t tx_probe_fail; uint32_t poll_budget;
+        uint32_t irq_poll_budget; uint32_t coalesced_batches;
+    } UI_NetRxStats;
+    extern void net_get_rx_stats(UI_NetRxStats *out);
+    UI_NetRxStats nstats;
+    net_get_rx_stats(&nstats);
+
+    extern TCB os_tasks[MAX_TASKS];
+    extern int os_task_count;
+    /* extern WmNeuralPixel os_memory_map[2]; */
+
+    // ----- ROW 1 LEFT: OS KERNEL & SCHEDULER -----
+    draw_filled_rect(left_x, row1_y, panel_w, row1_h, 0x0D2232);
+    draw_rect(left_x, row1_y, panel_w, row1_h, 0x4CEBFD);
+    draw_filled_rect(left_x, row1_y, panel_w, 20, 0x123A4A);
+    cursor_x = left_x + 8; cursor_y = row1_y + 6; gprint("OS KERNEL & SCHEDULER", 0xFFFFFF);
+    
+    cursor_x = left_x + 8; cursor_y = row1_y + 26; gprint("Processes", 0x888888);
+    cursor_x = left_x + 120; cursor_y = row1_y + 26; gprint("Status", 0x888888);
+    cursor_x = left_x + 180; cursor_y = row1_y + 26; gprint("PID", 0x888888);
+    cursor_x = left_x + 228; cursor_y = row1_y + 26; gprint("Priority", 0x888888);
+    draw_hline(row1_y + 38, left_x + 8, left_x + panel_w - 8, 0x2A617B);
+    
+    int num_to_draw = os_task_count > 5 ? 5 : os_task_count;
+    for (int i=0; i<num_to_draw; i++) {
+        int ry = row1_y + 44 + i * 16;
+        
+        char name[32]; wm_strcpy(name, "task_", 31);
+        char tnum[4]; telemetry_itoa(i, tnum);
+        int nlen=0; while(name[nlen]) nlen++; 
+        for(int m=0; tnum[m] && nlen<31; m++) name[nlen++] = tnum[m]; name[nlen] = 0;
+        
+        char pid[8]; telemetry_itoa(os_tasks[i].task_id, pid);
+        char status[32];
+        if (os_tasks[i].state == 1) wm_strcpy(status, "RUNNING", 31);
+        else if (os_tasks[i].state == 0) wm_strcpy(status, "READY", 31);
+        else if (os_tasks[i].state == 2) wm_strcpy(status, "BLOCKED", 31);
+        else if (os_tasks[i].state == 3) wm_strcpy(status, "SLEEPING", 31);
+        else wm_strcpy(status, "DYING", 31);
+        
+        char prio[8]; telemetry_itoa(os_tasks[i].priority, prio);
+
+        cursor_x = left_x + 8; cursor_y = ry; gprint(name, 0xFFFFDD);
+        cursor_x = left_x + 120; cursor_y = ry; gprint(status, os_tasks[i].state == 1 ? 0x24C655 : 0xAAAAAA);
+        cursor_x = left_x + 180; cursor_y = ry; gprint(pid, 0xDDDDDD);
+        cursor_x = left_x + 228; cursor_y = ry; gprint(prio, 0xFFDD88);
+    }
+    draw_filled_rect(left_x + panel_w - 6, row1_y + 44, 4, 30, 0x4CEBFD);
+
+    // ----- ROW 1 RIGHT: TELEMETRY PANEL -----
+    draw_filled_rect(right_x, row1_y, panel_w, row1_h, 0x0D2232);
+    draw_rect(right_x, row1_y, panel_w, row1_h, 0x4CEBFD);
+    draw_filled_rect(right_x, row1_y, panel_w, 20, 0x123A4A);
+    cursor_x = right_x + 8; cursor_y = row1_y + 6; gprint("TELEMETRY PANEL", 0xFFFFFF);
+    
+    int sub_y = row1_y + 30, sub_h = row1_h - 40, sub_w = (panel_w - 40) / 3;
+    
+    int b1_x = right_x + 10;
+    draw_filled_rect(b1_x + 5, sub_y, sub_w - 5, sub_h, 0x1A2A3A); draw_rect(b1_x + 5, sub_y, sub_w - 5, sub_h, 0x364E68);
+    cursor_x = b1_x + ((sub_w-5)/2) - 20; cursor_y = sub_y + 8; gprint("Clock", 0xDDDDDD);
+    
+    char time_str[16], hm_s[8]; telemetry_itoa(hrs % 24, time_str);
+    int tlen=0; while(time_str[tlen]) tlen++;
+    time_str[tlen++] = ':'; if ((mins%60) < 10) time_str[tlen++] = '0';
+    telemetry_itoa(mins%60, hm_s); for(int m=0; hm_s[m]; m++) time_str[tlen++] = hm_s[m]; time_str[tlen] = 0;
+    cursor_x = b1_x + ((sub_w-5)/2) - 20; cursor_y = sub_y + 40; gprint(time_str, 0xFFFFFF);
+    
+    int b2_x = b1_x + sub_w + 10;
+    draw_filled_rect(b2_x + 5, sub_y, sub_w - 5, sub_h, 0x1A2A3A); draw_rect(b2_x + 5, sub_y, sub_w - 5, sub_h, 0x364E68);
+    cursor_x = b2_x + ((sub_w-5)/2) - 24; cursor_y = sub_y + 8; gprint("Memory", 0xDDDDDD);
+    
+    char mem_str[32], mb_str[8]; telemetry_itoa(used_mb, mem_str);
+    int mlen=0; while(mem_str[mlen]) mlen++;
+    mem_str[mlen++] = 'M'; mem_str[mlen++] = 'B'; mem_str[mlen++] = ' '; mem_str[mlen++] = '/'; mem_str[mlen++] = ' ';
+    telemetry_itoa(total_mb, mb_str); for(int m=0; mb_str[m]; m++) mem_str[mlen++] = mb_str[m];
+    mem_str[mlen++] = 'M'; mem_str[mlen++] = 'B'; mem_str[mlen] = 0;
+    cursor_x = b2_x + 12; cursor_y = sub_y + 24; gprint(mem_str, 0xAAAAAA);
+    int chart_y_base = sub_y + sub_h - 10;
+    static int mem_hist[64] = {0};
+    static int cpu_hist[8] = {0};
+    static uint32_t last_hist_tick = 0;
+    
+    // CPU load calculation based on running tasks ratio + base load
+    int running_tasks = 0;
+    for (int i=0; i<os_task_count; i++) if (os_tasks[i].state == 1) running_tasks++;
+    int cpu_load = 5; // Base OS load
+    if (os_task_count > 0) cpu_load += (running_tasks * 85) / os_task_count;
+    if (cpu_load > 100) cpu_load = 100;
+
+    // Update history every ~1 second (assuming 100 ticks = 1s)
+    if (tick - last_hist_tick > 100 || last_hist_tick == 0) {
+        for (int i=0; i<63; i++) mem_hist[i] = mem_hist[i+1];
+        mem_hist[63] = used_mb;
+        
+        for (int i=0; i<7; i++) cpu_hist[i] = cpu_hist[i+1];
+        cpu_hist[7] = cpu_load;
+        
+        last_hist_tick = tick;
+    }
+
+    // Draw Memory sparkline chart
+    int max_mem_hist_w = (sub_w - 20) / 2;
+    for(int i=0; i<max_mem_hist_w && i<64; i+=1) {
+        // v mapped to pixel height (max ~25px)
+        int v = (mem_hist[63 - max_mem_hist_w + i + 1] * 25) / total_mb;
+        if(v>25) { v=25; } if(v<0) { v=0; }
+        int next_v = (mem_hist[63 - max_mem_hist_w + i + 2] * 25) / total_mb;
+        if(next_v>25) { next_v=25; } if(next_v<0) { next_v=0; }
+
+        draw_line_segment(b2_x + 10 + (i*2), chart_y_base - v, b2_x + 12 + (i*2), chart_y_base - next_v, 0x4CEBFD);
+    }
+
+    int b3_x = b2_x + sub_w + 10;
+    draw_filled_rect(b3_x + 5, sub_y, sub_w - 5, sub_h, 0x1A2A3A); draw_rect(b3_x + 5, sub_y, sub_w - 5, sub_h, 0x364E68);
+    cursor_x = b3_x + ((sub_w-5)/2) - 12; cursor_y = sub_y + 8; gprint("CPU", 0xDDDDDD);
+    char cpu_str[16]; telemetry_itoa(cpu_load, cpu_str); 
+    int clen=0; while(cpu_str[clen]) clen++; cpu_str[clen++]='%'; cpu_str[clen]=0;
+    cursor_x = b3_x + ((sub_w-5)/2) - 10; cursor_y = sub_y + 24; gprint(cpu_str, 0xAAAAAA);
+    int bar_w = ((sub_w-20)/8) - 2;
+    
+    // Draw CPU history bars
+    for(int i=0; i<8; i++) {
+        int h = (cpu_hist[i] * 40) / 100;
+        if(h<2) h=2; else if (h>40) h=40;
+        uint32_t bar_c = (h > 30) ? 0xFF8800 : 0x24C655;
+        draw_filled_rect(b3_x + 10 + i*(bar_w+2), sub_y + sub_h - h - 5, bar_w, h, bar_c);
+    }
+
+    // ----- ROW 2 LEFT: SYSTEM RESOURCES -----
+    draw_filled_rect(left_x, row2_y, panel_w, 20, 0x123A4A);
+    cursor_x = left_x + 8; cursor_y = row2_y + 6; gprint("SYSTEM RESOURCES", 0xFFFFFF);
+    
+    int sb_y = row2_y + 30, sb_h = row2_h - 40;
+    draw_filled_rect(left_x + 10, sb_y, sub_w - 5, sb_h, 0x1A2A3A); draw_rect(left_x + 10, sb_y, sub_w - 5, sb_h, 0x364E68);
+    cursor_x = left_x + 10 + ((sub_w-5)/2) - 20; cursor_y = sb_y + 40; gprint(time_str, 0xFFFFFF);
+    draw_rect(left_x + 10 + ((sub_w-5)/2) - 8, sb_y + 10, 16, 16, 0x4CEBFD);
+    draw_line_segment(left_x + 10 + ((sub_w-5)/2), sb_y + 18, left_x + 10 + ((sub_w-5)/2), sb_y + 14, 0x4CEBFD);
+    draw_line_segment(left_x + 10 + ((sub_w-5)/2), sb_y + 18, left_x + 10 + ((sub_w-5)/2) + 4, sb_y + 18, 0x4CEBFD);
+
+    int sm_x = left_x + 10 + sub_w + 5;
+    draw_filled_rect(sm_x, sb_y, sub_w - 5, sb_h, 0x1A2A3A); draw_rect(sm_x, sb_y, sub_w - 5, sb_h, 0x364E68);
+    cursor_x = sm_x + 12; cursor_y = sb_y + 8; gprint(mem_str, 0xAAAAAA);
+    int sb_chart_base = sb_y + sb_h - 10;
+    for(int i=0; i<sub_w-20; i+=2) {
+        int v = (used_mb/2) + ((tick/2+i)%5); if(v>25) v=25;
+        if(i == (sub_w-20)/2) draw_vline(sm_x + 10 + i, sb_y + 20, sb_h - 30, 0x24C655);
+        draw_line_segment(sm_x + 10 + i, sb_chart_base - v, sm_x + 12 + i, sb_chart_base - ((v+2)%10), 0x4CEBFD);
+    }
+    
+    int sc_x = sm_x + sub_w + 5;
+    draw_filled_rect(sc_x, sb_y, sub_w - 5, sb_h, 0x1A2A3A); draw_rect(sc_x, sb_y, sub_w - 5, sb_h, 0x364E68);
+    cursor_x = sc_x + ((sub_w-5)/2) - 12; cursor_y = sb_y + 8; gprint("CPU", 0xDDDDDD);
+    telemetry_itoa(cpu_load, cpu_str); clen=0; while(cpu_str[clen]) clen++; cpu_str[clen++]='%'; cpu_str[clen]=0;
+    cursor_x = sc_x + 8; cursor_y = sb_y + 40; gprint(cpu_str, 0xFFFFFF);
+    for(int i=0; i<6; i++) {
+        int h = (cpu_load * 30 / 100); uint32_t c = (h > 20) ? 0xFF8800 : 0x24C655; if(h<2) h=2;
+        draw_filled_rect(sc_x + 40 + i*7, sb_y + sb_h - h - 5, 5, h, c);
+    }
+
+    // ----- ROW 2 RIGHT: SPIKE ACTIVITY - NEMS -----
+    draw_filled_rect(right_x, row2_y, panel_w, row2_h, 0x0D2232);
+    draw_rect(right_x, row2_y, panel_w, row2_h, 0x4CEBFD);
+    draw_filled_rect(right_x, row2_y, panel_w, 20, 0x123A4A);
+    cursor_x = right_x + 8; cursor_y = row2_y + 6; gprint("SPIKE ACTIVITY - NEMS", 0xFFFFFF);
+    cursor_x = right_x + 10; cursor_y = row2_y + 30; gprint("Peak Firing Rate (ms)", 0xAAAAAA);
+    cursor_x = right_x + panel_w - 180; cursor_y = row2_y + 30; gprint("Raster Sparkline      Scrolls", 0xAAAAAA);
+    
+    int t0_voltage = os_memory_map[0].neurons[0].voltage;
+    int t1_voltage = os_memory_map[0].neurons[1].voltage;
+    int avg_volt = (t0_voltage + t1_voltage) / 2; if (avg_volt < 0) avg_volt = -avg_volt; 
+
+    for(int i=0; i<15; i++) {
+        int h = 5 + (avg_volt / 100) + (i*2); if(h>30) h=30;
+        uint32_t c = (h > 25) ? 0xFF8800 : ((h > 15) ? 0xFFFF00 : 0x24C655);
+        draw_filled_rect(right_x + 10 + i*10, row2_y + 70 - h, 8, h, c);
+        draw_line_segment(right_x + 10 + i*10, row2_y + 70 - h, right_x + 18 + i*10, row2_y + 70 - h - 2, 0xFFFFFF);
+    }
+    cursor_x = right_x + 10; cursor_y = row2_y + 80; gprint("Peak Firing Rate Points", 0x888888);
+    for(int i=0; i<8; i++) {
+        int spike = (os_memory_map[0].pixel_recent_spikes > i*10) ? 1 : 0;
+        uint32_t clrc = spike ? 0xFF8800 : 0x24C655;
+        draw_filled_rect(right_x + 10 + i*16 + (tick/2)%10, row2_y + 96 + (i%3)*2, 4, 4, clrc);
+    }
+
+    int spark_x = right_x + panel_w - 180, spark_w = 160, prev_v = 0;
+    for(int i=0; i<spark_w; i+=3) {
+        int v = ((i*13 + os_memory_map[1].neurons[2].voltage/100) % 40) - 20;
+        draw_line_segment(spark_x + i, row2_y + 65 + prev_v, spark_x + i + 3, row2_y + 65 + v, 0x24C655);
+        prev_v = v;
+    }
+    draw_filled_rect(spark_x + 10, row2_y + 90, 80, 4, 0x4CEBFD);
+
+    // ----- ROW 3 LEFT: NETWORK STATUS -----
+    draw_filled_rect(left_x, row3_y, panel_w, row3_h, 0x0D2232);
+    draw_rect(left_x, row3_y, panel_w, row3_h, 0x4CEBFD);
+    draw_filled_rect(left_x, row3_y, panel_w, 20, 0x123A4A);
+    cursor_x = left_x + 8; cursor_y = row3_y + 6; gprint("NETWORK STATUS", 0xFFFFFF);
+    cursor_x = left_x + 10; cursor_y = row3_y + 30; gprint("Total Frames RX", 0xAAAAAA);
+    
+    char n_frames[32]; telemetry_itoa(nstats.total_frames, n_frames);
+    cursor_x = left_x + 20; cursor_y = row3_y + 46; gprint(n_frames, 0xFFFFFF);
+    cursor_x = left_x + 10; cursor_y = row3_y + 70; gprint("Status: Active", 0x24C655);
+    for(int i=0; i<20; i++) {
+        int af = (nstats.total_frames / 100) % 20;
+        if (i <= af || af == 0) draw_filled_rect(left_x + 180 + i*8, row3_y + 70, 6, 14, 0x24C655);
+        else draw_filled_rect(left_x + 180 + i*8, row3_y + 70, 6, 14, 0x113311);
+    }
+
+    // ----- ROW 3 RIGHT: NETWORK QUALITY -----
+    draw_filled_rect(right_x, row3_y, panel_w, row3_h, 0x0D2232);
+    draw_rect(right_x, row3_y, panel_w, row3_h, 0x4CEBFD);
+    draw_filled_rect(right_x, row3_y, panel_w, 20, 0x123A4A);
+    cursor_x = right_x + 8; cursor_y = row3_y + 6; gprint("NETWORK QUALITY", 0xFFFFFF);
+    cursor_x = right_x + 10; cursor_y = row3_y + 26; gprint("Bytes Processed", 0xAAAAAA);
+    
+    char bytes_str[32]; telemetry_itoa(nstats.total_bytes, bytes_str);
+    cursor_x = right_x + 10; cursor_y = row3_y + 42; gprint(bytes_str, 0xFFFFFF);
+    
+    cursor_x = right_x + 200; cursor_y = row3_y + 26; gprint("Drop / IRQs", 0xAAAAAA);
+    for(int i=0; i<20; i++) {
+        int h = 4 + i; int errs = nstats.dropped_frames;
+        uint32_t c = (i > 15 && errs > 5) ? 0xFF8800 : ((i > 10 && errs > 0) ? 0xFFFF00 : 0x24C655);
+        draw_filled_rect(right_x + 200 + i*8, row3_y + 60 - h, 6, h, c);
+        draw_line_segment(right_x + 200 + i*8, row3_y + 60 - h, right_x + 206 + i*8, row3_y + 60 - h - 1, 0xFFFFFF);
+    }
+    
+    char drop_str[32]; telemetry_itoa(nstats.dropped_frames, drop_str);
+    cursor_x = right_x + 200; cursor_y = row3_y + 66; gprint(drop_str, 0xFF7777);
+}
+
+void wm_open_telemetry_cockpit(void) {
+    int j;
+    for (j = 0; j < wm_window_count; j++) {
+        if (wm_str_eq(wm_windows[j].title, "Telemetry Cockpit")) {
+            wm_windows[j].visible = 1;
+            bring_to_front(j);
+            return;
+        }
+    }
+    if (wm_window_count < 12) {
+        wm_add_window(10, 30, 780, 520, "Telemetry Cockpit", draw_content_telemetry, 0, -1);
+        wm_windows[wm_window_count - 1].visible = 1;
+        bring_to_front(wm_window_count - 1);
+    }
+}
+
+
+int handle_replay_control_click(WmWindow *w, int mx, int my) {
+    int cx = w->x + WM_BORDER;
+    int cy = w->y + WM_TITLEBAR_H;
+    int cw = w->w - WM_BORDER * 2;
+    int tx = mx - cx;
+    int ty = my - cy;
+
+    if (tx >= cw - 180 && tx <= cw - 20 && ty >= 10 && ty <= 70) {
+        process_command("replay rec toggle");
+        return 1;
+    }
+    if (ty >= 10 && ty <= 70 && tx >= 10 && tx <= cw - 200) {
+        int btn_pitch = (cw - 220) / 6;
+        int idx = (tx - 18) / (btn_pitch + 6);
+        if (idx == 3) {
+           process_command("replay run");
+        }
+        return 1;
+    }
+    if (ty >= 190 && ty <= 310) {
+        if (tx >= cw - 310 && tx <= cw - 170) {
+            process_command("replay clear");
+            return 1;
+        }
+        if (tx >= cw - 160 && tx <= cw - 20) {
+            process_command("dataset export session_manifest.dat");
+            return 1;
+        }
+    }
+    return 0;
+}
