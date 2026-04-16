@@ -3278,7 +3278,10 @@ void draw_content_telemetry(int cx, int cy, int cw, int ch) {
         char name[32]; wm_strcpy(name, "task_", 31);
         char tnum[4]; telemetry_itoa(i, tnum);
         int nlen=0; while(name[nlen]) nlen++; 
-        for(int m=0; tnum[m] && nlen<31; m++) name[nlen++] = tnum[m]; name[nlen] = 0;
+        for (int m = 0; tnum[m] && nlen < 31; m++) {
+            name[nlen++] = tnum[m];
+        }
+        name[nlen] = 0;
         
         char pid[8]; telemetry_itoa(os_tasks[i].task_id, pid);
         char status[32];
@@ -3309,16 +3312,21 @@ void draw_content_telemetry(int cx, int cy, int cw, int ch) {
     draw_filled_rect(b1_x + 5, sub_y, sub_w - 5, sub_h, 0x1A2A3A); draw_rect(b1_x + 5, sub_y, sub_w - 5, sub_h, 0x364E68);
     cursor_x = b1_x + ((sub_w-5)/2) - 20; cursor_y = sub_y + 8; gprint("Clock", 0xDDDDDD);
     
+    // Clock icon
+    draw_rect(b1_x + ((sub_w-5)/2) - 8, sub_y + 30, 16, 16, 0x4CEBFD);
+    draw_line_segment(b1_x + ((sub_w-5)/2), sub_y + 38, b1_x + ((sub_w-5)/2), sub_y + 34, 0x4CEBFD);
+    draw_line_segment(b1_x + ((sub_w-5)/2), sub_y + 38, b1_x + ((sub_w-5)/2) + 4, sub_y + 38, 0x4CEBFD);
+
     char time_str[16], hm_s[8]; telemetry_itoa(hrs % 24, time_str);
     int tlen=0; while(time_str[tlen]) tlen++;
     time_str[tlen++] = ':'; if ((mins%60) < 10) time_str[tlen++] = '0';
     telemetry_itoa(mins%60, hm_s); for(int m=0; hm_s[m]; m++) time_str[tlen++] = hm_s[m]; time_str[tlen] = 0;
-    cursor_x = b1_x + ((sub_w-5)/2) - 20; cursor_y = sub_y + 40; gprint(time_str, 0xFFFFFF);
-    
+    cursor_x = b1_x + ((sub_w-5)/2) - 20; cursor_y = sub_y + 55; gprint(time_str, 0xFFFFFF);
+
     int b2_x = b1_x + sub_w + 10;
     draw_filled_rect(b2_x + 5, sub_y, sub_w - 5, sub_h, 0x1A2A3A); draw_rect(b2_x + 5, sub_y, sub_w - 5, sub_h, 0x364E68);
     cursor_x = b2_x + ((sub_w-5)/2) - 24; cursor_y = sub_y + 8; gprint("Memory", 0xDDDDDD);
-    
+
     char mem_str[32], mb_str[8]; telemetry_itoa(used_mb, mem_str);
     int mlen=0; while(mem_str[mlen]) mlen++;
     mem_str[mlen++] = 'M'; mem_str[mlen++] = 'B'; mem_str[mlen++] = ' '; mem_str[mlen++] = '/'; mem_str[mlen++] = ' ';
@@ -3376,66 +3384,74 @@ void draw_content_telemetry(int cx, int cy, int cw, int ch) {
         draw_filled_rect(b3_x + 10 + i*(bar_w+2), sub_y + sub_h - h - 5, bar_w, h, bar_c);
     }
 
-    // ----- ROW 2 LEFT: SYSTEM RESOURCES -----
-    draw_filled_rect(left_x, row2_y, panel_w, 20, 0x123A4A);
-    cursor_x = left_x + 8; cursor_y = row2_y + 6; gprint("SYSTEM RESOURCES", 0xFFFFFF);
-    
-    int sb_y = row2_y + 30, sb_h = row2_h - 40;
-    draw_filled_rect(left_x + 10, sb_y, sub_w - 5, sb_h, 0x1A2A3A); draw_rect(left_x + 10, sb_y, sub_w - 5, sb_h, 0x364E68);
-    cursor_x = left_x + 10 + ((sub_w-5)/2) - 20; cursor_y = sb_y + 40; gprint(time_str, 0xFFFFFF);
-    draw_rect(left_x + 10 + ((sub_w-5)/2) - 8, sb_y + 10, 16, 16, 0x4CEBFD);
-    draw_line_segment(left_x + 10 + ((sub_w-5)/2), sb_y + 18, left_x + 10 + ((sub_w-5)/2), sb_y + 14, 0x4CEBFD);
-    draw_line_segment(left_x + 10 + ((sub_w-5)/2), sb_y + 18, left_x + 10 + ((sub_w-5)/2) + 4, sb_y + 18, 0x4CEBFD);
 
-    int sm_x = left_x + 10 + sub_w + 5;
-    draw_filled_rect(sm_x, sb_y, sub_w - 5, sb_h, 0x1A2A3A); draw_rect(sm_x, sb_y, sub_w - 5, sb_h, 0x364E68);
-    cursor_x = sm_x + 12; cursor_y = sb_y + 8; gprint(mem_str, 0xAAAAAA);
-    int sb_chart_base = sb_y + sb_h - 10;
-    for(int i=0; i<sub_w-20; i+=2) {
-        int v = (used_mb/2) + ((tick/2+i)%5); if(v>25) v=25;
-        if(i == (sub_w-20)/2) draw_vline(sm_x + 10 + i, sb_y + 20, sb_h - 30, 0x24C655);
-        draw_line_segment(sm_x + 10 + i, sb_chart_base - v, sm_x + 12 + i, sb_chart_base - ((v+2)%10), 0x4CEBFD);
+    // ----- ROW 2 LEFT: NETWORK QUALITY -----
+    draw_filled_rect(left_x, row2_y, panel_w, row2_h, 0x0D2232);       
+    draw_rect(left_x, row2_y, panel_w, row2_h, 0x4CEBFD);
+    draw_filled_rect(left_x, row2_y, panel_w, 20, 0x123A4A);
+    cursor_x = left_x + 8; cursor_y = row2_y + 6; gprint("NETWORK QUALITY", 0xFFFFFF);
+    cursor_x = left_x + 10; cursor_y = row2_y + 26; gprint("Bytes Processed", 0xAAAAAA);
+
+    char bytes_str[32]; telemetry_itoa(nstats.total_bytes, bytes_str);  
+    cursor_x = left_x + 10; cursor_y = row2_y + 42; gprint(bytes_str, 0xFFFFFF);
+
+    cursor_x = left_x + 200; cursor_y = row2_y + 26; gprint("Drop / IRQs", 0xAAAAAA);
+    for(int i=0; i<20; i++) {
+        int h = 4 + i; int errs = nstats.dropped_frames;
+        uint32_t c = (i > 15 && errs > 5) ? 0xFF8800 : ((i > 10 && errs > 0) ? 0xFFFF00 : 0x24C655);
+        draw_filled_rect(left_x + 200 + i*8, row2_y + 60 - h, 6, h, c);
+        draw_line_segment(left_x + 200 + i*8, row2_y + 60 - h, left_x + 206 + i*8, row2_y + 60 - h - 1, 0xFFFFFF);
     }
-    
-    int sc_x = sm_x + sub_w + 5;
-    draw_filled_rect(sc_x, sb_y, sub_w - 5, sb_h, 0x1A2A3A); draw_rect(sc_x, sb_y, sub_w - 5, sb_h, 0x364E68);
-    cursor_x = sc_x + ((sub_w-5)/2) - 12; cursor_y = sb_y + 8; gprint("CPU", 0xDDDDDD);
-    telemetry_itoa(cpu_load, cpu_str); clen=0; while(cpu_str[clen]) clen++; cpu_str[clen++]='%'; cpu_str[clen]=0;
-    cursor_x = sc_x + 8; cursor_y = sb_y + 40; gprint(cpu_str, 0xFFFFFF);
-    for(int i=0; i<6; i++) {
-        int h = (cpu_load * 30 / 100); uint32_t c = (h > 20) ? 0xFF8800 : 0x24C655; if(h<2) h=2;
-        draw_filled_rect(sc_x + 40 + i*7, sb_y + sb_h - h - 5, 5, h, c);
-    }
+
+    char drop_str[32]; telemetry_itoa(nstats.dropped_frames, drop_str); 
+    cursor_x = left_x + 200; cursor_y = row2_y + 66; gprint(drop_str, 0xFF7777);
 
     // ----- ROW 2 RIGHT: SPIKE ACTIVITY - NEMS -----
-    draw_filled_rect(right_x, row2_y, panel_w, row2_h, 0x0D2232);
+    spike_monitor_update();
+    draw_filled_rect(right_x, row2_y, panel_w, row2_h, 0x0D2232);       
     draw_rect(right_x, row2_y, panel_w, row2_h, 0x4CEBFD);
     draw_filled_rect(right_x, row2_y, panel_w, 20, 0x123A4A);
     cursor_x = right_x + 8; cursor_y = row2_y + 6; gprint("SPIKE ACTIVITY - NEMS", 0xFFFFFF);
     cursor_x = right_x + 10; cursor_y = row2_y + 30; gprint("Peak Firing Rate (ms)", 0xAAAAAA);
     cursor_x = right_x + panel_w - 180; cursor_y = row2_y + 30; gprint("Raster Sparkline      Scrolls", 0xAAAAAA);
-    
-    int t0_voltage = os_memory_map[0].neurons[0].voltage;
-    int t1_voltage = os_memory_map[0].neurons[1].voltage;
-    int avg_volt = (t0_voltage + t1_voltage) / 2; if (avg_volt < 0) avg_volt = -avg_volt; 
 
     for(int i=0; i<15; i++) {
-        int h = 5 + (avg_volt / 100) + (i*2); if(h>30) h=30;
+        int idx = (g_spike_mon.trend_col + i*8) % 120;
+        int v = g_spike_mon.trend_a[idx] / 2; // Increased multiplier for higher bars
+        int h = 5 + v; if(h>30) h=30;
         uint32_t c = (h > 25) ? 0xFF8800 : ((h > 15) ? 0xFFFF00 : 0x24C655);
         draw_filled_rect(right_x + 10 + i*10, row2_y + 70 - h, 8, h, c);
         draw_line_segment(right_x + 10 + i*10, row2_y + 70 - h, right_x + 18 + i*10, row2_y + 70 - h - 2, 0xFFFFFF);
     }
     cursor_x = right_x + 10; cursor_y = row2_y + 80; gprint("Peak Firing Rate Points", 0x888888);
     for(int i=0; i<8; i++) {
-        int spike = (os_memory_map[0].pixel_recent_spikes > i*10) ? 1 : 0;
+        int ry = (i * 6) % 48;
+        int spike = g_spike_mon.raster[ry][(g_spike_mon.col + 159) % 160];
         uint32_t clrc = spike ? 0xFF8800 : 0x24C655;
-        draw_filled_rect(right_x + 10 + i*16 + (tick/2)%10, row2_y + 96 + (i%3)*2, 4, 4, clrc);
+        int offset_y = spike ? 2 : 0;
+        int size = spike ? 6 : 4;
+        draw_filled_rect(right_x + 10 + i*16, row2_y + 96 - offset_y, size, size, clrc);
     }
 
-    int spark_x = right_x + panel_w - 180, spark_w = 160, prev_v = 0;
+    int spark_x = right_x + panel_w - 180, spark_w = 160, prev_v = 0;   
     for(int i=0; i<spark_w; i+=3) {
-        int v = ((i*13 + os_memory_map[1].neurons[2].voltage/100) % 40) - 20;
-        draw_line_segment(spark_x + i, row2_y + 65 + prev_v, spark_x + i + 3, row2_y + 65 + v, 0x24C655);
+        // Read historical data ordered oldest to newest smoothly
+        int idx = (g_spike_mon.trend_col + (i * 120) / spark_w) % 120;
+        
+        // Spike rate (avg_hz) naturally creates a noisy waveform based on traffic
+        int v = g_spike_mon.trend_a[idx] / 4; 
+        
+        // Inject realtime voltage from a neuron to give it immediate life instead of slow trend
+        int n_volt = os_memory_map[0].neurons[i % 5].voltage;
+        int real_spike = (n_volt > 200) ? n_volt/40 : 0;
+        
+        v += real_spike;
+        if(v > 20) v = 20;
+        if(v < 0) v = 0;
+        
+        if (i > 0) {
+            draw_line_segment(spark_x + i - 3, row2_y + 85 - prev_v, spark_x + i, row2_y + 85 - v, 0x24C655);
+        }
         prev_v = v;
     }
     draw_filled_rect(spark_x + 10, row2_y + 90, 80, 4, 0x4CEBFD);
@@ -3456,26 +3472,7 @@ void draw_content_telemetry(int cx, int cy, int cw, int ch) {
         else draw_filled_rect(left_x + 180 + i*8, row3_y + 70, 6, 14, 0x113311);
     }
 
-    // ----- ROW 3 RIGHT: NETWORK QUALITY -----
-    draw_filled_rect(right_x, row3_y, panel_w, row3_h, 0x0D2232);
-    draw_rect(right_x, row3_y, panel_w, row3_h, 0x4CEBFD);
-    draw_filled_rect(right_x, row3_y, panel_w, 20, 0x123A4A);
-    cursor_x = right_x + 8; cursor_y = row3_y + 6; gprint("NETWORK QUALITY", 0xFFFFFF);
-    cursor_x = right_x + 10; cursor_y = row3_y + 26; gprint("Bytes Processed", 0xAAAAAA);
-    
-    char bytes_str[32]; telemetry_itoa(nstats.total_bytes, bytes_str);
-    cursor_x = right_x + 10; cursor_y = row3_y + 42; gprint(bytes_str, 0xFFFFFF);
-    
-    cursor_x = right_x + 200; cursor_y = row3_y + 26; gprint("Drop / IRQs", 0xAAAAAA);
-    for(int i=0; i<20; i++) {
-        int h = 4 + i; int errs = nstats.dropped_frames;
-        uint32_t c = (i > 15 && errs > 5) ? 0xFF8800 : ((i > 10 && errs > 0) ? 0xFFFF00 : 0x24C655);
-        draw_filled_rect(right_x + 200 + i*8, row3_y + 60 - h, 6, h, c);
-        draw_line_segment(right_x + 200 + i*8, row3_y + 60 - h, right_x + 206 + i*8, row3_y + 60 - h - 1, 0xFFFFFF);
-    }
-    
-    char drop_str[32]; telemetry_itoa(nstats.dropped_frames, drop_str);
-    cursor_x = right_x + 200; cursor_y = row3_y + 66; gprint(drop_str, 0xFF7777);
+
 }
 
 void wm_open_telemetry_cockpit(void) {
