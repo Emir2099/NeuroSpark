@@ -2,15 +2,10 @@
 typedef unsigned int uint32_t;
 typedef unsigned char uint8_t;
 
-/* Graphics Constants */
-#define SCREEN_WIDTH  800
-#define SCREEN_HEIGHT 600
-#define SCREEN_SIZE   (SCREEN_WIDTH * SCREEN_HEIGHT)
-
-/* Backbuffer for Double Buffering (Allocated in BSS) */
-uint32_t backbuffer[SCREEN_SIZE];
-
-/* External dependency */
+int screen_w = 800;
+#define SCREEN_SIZE (screen_w * screen_h) 
+int screen_h = 600;
+uint32_t backbuffer[1024 * 768];
 #include "font.h"
 #include "../assets/ui/font12x18.h"
 extern uint32_t vbe_framebuffer; // Defined in kernel.c
@@ -23,8 +18,8 @@ extern uint32_t vbe_bpp;
 
 /* Put pixel into the backbuffer */
 void put_pixel(int x, int y, uint32_t color) {
-    if (x >= 0 && x < SCREEN_WIDTH && y >= 0 && y < SCREEN_HEIGHT) {
-        backbuffer[y * SCREEN_WIDTH + x] = color;
+    if (x >= 0 && x < screen_w && y >= 0 && y < screen_h) {
+        backbuffer[y * screen_w + x] = color;
     }
 }
 
@@ -36,11 +31,11 @@ void flip_buffer() {
 
     if (vbe_bpp == 24) {
         uint8_t* dst = (uint8_t*)vbe_framebuffer;
-        uint32_t pitch = vbe_pitch ? vbe_pitch : (SCREEN_WIDTH * 3);
-        for (int y = 0; y < SCREEN_HEIGHT; y++) {
+        uint32_t pitch = vbe_pitch ? vbe_pitch : (screen_w * 3);
+        for (int y = 0; y < screen_h; y++) {
             uint8_t* row = dst + (y * pitch);
-            uint32_t* src = &backbuffer[y * SCREEN_WIDTH];
-            for (int x = 0; x < SCREEN_WIDTH; x++) {
+            uint32_t* src = &backbuffer[y * screen_w];
+            for (int x = 0; x < screen_w; x++) {
                 uint32_t c = src[x];
                 row[x * 3 + 0] = (uint8_t)(c & 0xFF);
                 row[x * 3 + 1] = (uint8_t)((c >> 8) & 0xFF);
@@ -71,28 +66,28 @@ void clear_screen(uint32_t color) {
 
 /* Clear only a rectangular region */
 void clear_region(int x0, int y0, int x1, int y1, uint32_t color) {
-    for (int y = y0; y < y1 && y < SCREEN_HEIGHT; y++) {
-        for (int x = x0; x < x1 && x < SCREEN_WIDTH; x++) {
-            backbuffer[y * SCREEN_WIDTH + x] = color;
+    for (int y = y0; y < y1 && y < screen_h; y++) {
+        for (int x = x0; x < x1 && x < screen_w; x++) {
+            backbuffer[y * screen_w + x] = color;
         }
     }
 }
 
 /* Draw a horizontal line */
 void draw_hline(int y, int x0, int x1, uint32_t color) {
-    if (y < 0 || y >= SCREEN_HEIGHT) return;
-    for (int x = x0; x < x1 && x < SCREEN_WIDTH; x++) {
-        if (x >= 0) backbuffer[y * SCREEN_WIDTH + x] = color;
+    if (y < 0 || y >= screen_h) return;
+    for (int x = x0; x < x1 && x < screen_w; x++) {
+        if (x >= 0) backbuffer[y * screen_w + x] = color;
     }
 }
 
 /* Draw a vertical line segment */
 void draw_vline(int x, int y0, int y1, uint32_t color) {
-    if (x < 0 || x >= SCREEN_WIDTH) return;
+    if (x < 0 || x >= screen_w) return;
     int lo = y0 < y1 ? y0 : y1;
     int hi = y0 < y1 ? y1 : y0;
     for (int y = lo; y <= hi; y++) {
-        if (y >= 0 && y < SCREEN_HEIGHT) backbuffer[y * SCREEN_WIDTH + x] = color;
+        if (y >= 0 && y < screen_h) backbuffer[y * screen_w + x] = color;
     }
 }
 
@@ -124,21 +119,21 @@ void vga_scroll() {
     const int SCROLL_TOP = 310; /* below waveform window (y: 110-300) */
 
     /* Shift rows up by 8 pixels */
-    for (int y = SCROLL_TOP + 8; y < SCREEN_HEIGHT; y++) {
-        for (int x = 0; x < SCREEN_WIDTH; x++) {
-            backbuffer[(y - 8) * SCREEN_WIDTH + x] = backbuffer[y * SCREEN_WIDTH + x];
+    for (int y = SCROLL_TOP + 8; y < screen_h; y++) {
+        for (int x = 0; x < screen_w; x++) {
+            backbuffer[(y - 8) * screen_w + x] = backbuffer[y * screen_w + x];
         }
     }
 
     /* Clear the bottom 8 rows */
-    for (int y = SCREEN_HEIGHT - 8; y < SCREEN_HEIGHT; y++) {
-        for (int x = 0; x < SCREEN_WIDTH; x++) {
-            backbuffer[y * SCREEN_WIDTH + x] = 0x000033; /* NeuroSpark dark blue */
+    for (int y = screen_h - 8; y < screen_h; y++) {
+        for (int x = 0; x < screen_w; x++) {
+            backbuffer[y * screen_w + x] = 0x000033; /* NeuroSpark dark blue */
         }
     }
 
     /* Keep cursor inside the scroll region */
-    if (cursor_y > SCREEN_HEIGHT - 16) {
+    if (cursor_y > screen_h - 16) {
         cursor_y -= 8;
     }
 }
@@ -251,8 +246,8 @@ extern volatile int mouse_buttons;
 void draw_cursor(uint32_t tick) {
     int cx = shell_cursor_x;
     int cy = shell_cursor_y;
-    if (cx < 0 || cx >= SCREEN_WIDTH - 8) return;
-    if (cy < 0 || cy >= SCREEN_HEIGHT - 8) return;
+    if (cx < 0 || cx >= screen_w - 8) return;
+    if (cy < 0 || cy >= screen_h - 8) return;
 
     if ((tick / 30) % 2 == 0) {
         /* Visible half – bright green block */
@@ -273,7 +268,7 @@ void draw_mouse_cursor(void) {
     int my = mouse_y;
     uint32_t color = (mouse_buttons & 0x1) ? 0xFFAA44 : 0xFFFFFF;
 
-    if (mx < 3 || mx >= SCREEN_WIDTH - 3 || my < 3 || my >= SCREEN_HEIGHT - 3) {
+    if (mx < 3 || mx >= screen_w - 3 || my < 3 || my >= screen_h - 3) {
         return;
     }
 

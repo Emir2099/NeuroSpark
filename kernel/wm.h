@@ -42,7 +42,10 @@ typedef unsigned char uint8_t;
 #define WM_TITLEBAR_H    22
 #define WM_BORDER         2
 #define WM_TASKBAR_H     54
-#define WM_TASKBAR_Y     (600 - WM_TASKBAR_H)
+
+extern int screen_w;
+extern int screen_h;
+#define WM_TASKBAR_Y     (screen_h - WM_TASKBAR_H)
 
 #define WM_BTN_W         16
 #define WM_BTN_H         16

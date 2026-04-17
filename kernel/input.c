@@ -37,11 +37,12 @@ typedef struct {
 
 extern NeuralPixel os_memory_map[2];
 
-#define SCREEN_WIDTH 800
-#define SCREEN_HEIGHT 600
+// Use global screen variables
+extern int screen_width;
+extern int screen_height;
 
-volatile int mouse_x = SCREEN_WIDTH / 2;
-volatile int mouse_y = SCREEN_HEIGHT / 2;
+volatile int mouse_x = 0; // Updated in init
+volatile int mouse_y = 0;
 volatile int mouse_buttons = 0;
 static int prev_mouse_buttons = 0;
 static int mouse_enabled = 0;
@@ -178,8 +179,8 @@ void init_input_stack(void) {
 
   mouse_packet_idx = 0;
   mouse_enabled = 0;
-  mouse_x = SCREEN_WIDTH / 2;
-  mouse_y = SCREEN_HEIGHT / 2;
+  mouse_x = screen_width / 2;
+  mouse_y = screen_height / 2;
   mouse_buttons = 0;
   prev_mouse_buttons = 0;
 
@@ -342,12 +343,12 @@ void mouse_handler(void) {
 
   if (mouse_x < 0)
     mouse_x = 0;
-  if (mouse_x > SCREEN_WIDTH - 1)
-    mouse_x = SCREEN_WIDTH - 1;
+  if (mouse_x > screen_width - 1)
+    mouse_x = screen_width - 1;
   if (mouse_y < 0)
     mouse_y = 0;
-  if (mouse_y > SCREEN_HEIGHT - 1)
-    mouse_y = SCREEN_HEIGHT - 1;
+  if (mouse_y > screen_height - 1)
+    mouse_y = screen_height - 1;
 
   mouse_buttons = mouse_packet[0] & 0x07;
   wm_handle_mouse(mouse_x, mouse_y, mouse_buttons, prev_mouse_buttons);

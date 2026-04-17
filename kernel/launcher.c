@@ -50,8 +50,8 @@ extern int cursor_y;
 extern uint32_t tick;
 extern uint32_t backbuffer[];
 
-#define SCREEN_WIDTH 800
-#define SCREEN_HEIGHT 600
+extern int screen_width;
+extern int screen_height;
 
 /* App registry and launcher state */
 LauncherAppEntry launcher_apps[32];
@@ -184,9 +184,9 @@ static void draw_ripple_circle(int center_x, int center_y, int radius, uint32_t 
     int r_outer = radius;
 
     for (int y = center_y - r_outer; y <= center_y + r_outer; y++) {
-        if (y < 0 || y >= SCREEN_HEIGHT) continue;
+        if (y < 0 || y >= screen_height) continue;
         for (int x = center_x - r_outer; x <= center_x + r_outer; x++) {
-            if (x < 0 || x >= SCREEN_WIDTH) continue;
+            if (x < 0 || x >= screen_width) continue;
 
             int dx = x - center_x;
             int dy = y - center_y;
@@ -195,9 +195,9 @@ static void draw_ripple_circle(int center_x, int center_y, int radius, uint32_t 
 
             if (dist_sq >= r_inner * r_inner && dist_sq <= r_sq) {
                 /* Blend ripple into backbuffer with fade */
-                uint32_t existing = backbuffer[y * SCREEN_WIDTH + x];
+                uint32_t existing = backbuffer[y * screen_width + x];
                 uint32_t blended = ((existing >> 1) & 0x7F7F7F) + ((color >> 1) & 0x7F7F7F);
-                backbuffer[y * SCREEN_WIDTH + x] = blended;
+                backbuffer[y * screen_width + x] = blended;
             }
         }
     }
@@ -284,11 +284,11 @@ void launcher_render(void) {
     /* Draw background overlay with fade */
     int alpha = (progress * 200) / 256;
     if (alpha > 200) alpha = 200;
-    for (int y = 0; y < SCREEN_HEIGHT; y++) {
-        for (int x = 0; x < SCREEN_WIDTH; x++) {
-            uint32_t existing = backbuffer[y * SCREEN_WIDTH + x];
+    for (int y = 0; y < screen_height; y++) {
+        for (int x = 0; x < screen_width; x++) {
+            uint32_t existing = backbuffer[y * screen_width + x];
             uint32_t darkened = ((existing >> 1) & 0x7F7F7F);
-            backbuffer[y * SCREEN_WIDTH + x] = darkened;
+            backbuffer[y * screen_width + x] = darkened;
         }
     }
 

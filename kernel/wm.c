@@ -1,3 +1,4 @@
+extern int screen_w; extern int screen_h;
 #include "task.h"
 /* ================================================================
  * wm.c – NeuroSpark Desktop Window Manager
@@ -340,10 +341,10 @@ int wm_get_timezone_offset_minutes(void) {
 static void draw_glass_rect(int x, int y, int w, int h, uint32_t tint) {
     int yy, xx;
     for (yy = y; yy < y + h; yy++) {
-        if (yy < 0 || yy >= 600) continue;
+        if (yy < 0 || yy >= screen_h) continue;
         for (xx = x; xx < x + w; xx++) {
-            if (xx < 0 || xx >= 800) continue;
-            int idx = yy * 800 + xx;
+            if (xx < 0 || xx >= screen_w) continue;
+            int idx = yy * screen_w + xx;
             backbuffer[idx] = blend_50(backbuffer[idx], tint);
         }
     }
@@ -2191,7 +2192,7 @@ void wm_init(void) {
     wm_add_window(30, 34, 760, 450, "Spike Monitor App", draw_content_spike_monitor, 0, -1);
     wm_add_window(20, 26, 1000, 420, "Snapshot Browser App", draw_content_snapshot_browser, 0, -1);
     wm_add_window(20, 26, 760, 500, "Model Manager App", draw_content_model_manager, 0, -1);
-    wm_add_window(150, 150, 800, 360, "Replay Control App", draw_content_replay_control, 0, -1);
+    wm_add_window(150, 150, screen_w, 360, "Replay Control App", draw_content_replay_control, 0, -1);
     model_ui_sync_from_kernel();
 }
 
@@ -2244,7 +2245,7 @@ static void draw_desktop_bg(void) {
         int g = 34 + (126 * y) / WM_TASKBAR_Y;
         int b = 62 + (96 * y) / WM_TASKBAR_Y;
         uint32_t row_color = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-        draw_hline(y, 0, 800, row_color);
+        draw_hline(y, 0, screen_w, row_color);
     }
 }
 
@@ -2325,8 +2326,8 @@ static void draw_taskbar_icon_shape(int slot, int cx, int cy) {
 /*  Taskbar rendering                                            */
 /* ------------------------------------------------------------ */
 static int icon_x_pos(int slot) {
-    /* 6 icons, 80px each, centered in 800px */
-    int start_x = (800 - WM_ICON_SLOTS * 80) / 2;
+    /* 6 icons, 80px each, centered in screen_wpx */
+    int start_x = (screen_w - WM_ICON_SLOTS * 80) / 2;
     return start_x + slot * 80 + 40; /* center of slot */
 }
 
@@ -2399,12 +2400,12 @@ void wm_get_taskbar_icon_center(int slot, int *out_x, int *out_y) {
 
 static void draw_taskbar(void) {
     int i;
-    int panel_x = (800 - WM_ICON_SLOTS * 80) / 2 - 10;
+    int panel_x = (screen_w - WM_ICON_SLOTS * 80) / 2 - 10;
     int panel_w = WM_ICON_SLOTS * 80 + 20;
 
     /* Keep a subtle footer strip but float glass elements over it. */
-    draw_filled_rect(0, WM_TASKBAR_Y, 800, WM_TASKBAR_H, 0x071421);
-    draw_hline(WM_TASKBAR_Y, 0, 800, 0x123647);
+    draw_filled_rect(0, WM_TASKBAR_Y, screen_w, WM_TASKBAR_H, 0x071421);
+    draw_hline(WM_TASKBAR_Y, 0, screen_w, 0x123647);
 
     /* Glassmorphic app drawer */
     draw_glass_rect(panel_x, WM_TASKBAR_Y + 3, panel_w, WM_TASKBAR_H - 6, 0x284763);
@@ -2624,7 +2625,7 @@ void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons) {
                 /* Clamp to screen */
                 if (w->x < 0) w->x = 0;
                 if (w->y < 0) w->y = 0;
-                if (w->x + w->w > 800) w->x = 800 - w->w;
+                if (w->x + w->w > screen_w) w->x = screen_w - w->w;
                 if (w->y + w->h > WM_TASKBAR_Y) w->y = WM_TASKBAR_Y - w->h;
             }
             if (released) {
@@ -2747,7 +2748,7 @@ void wm_handle_mouse(int mx, int my, int buttons, int prev_buttons) {
                 w->ox = w->x; w->oy = w->y;
                 w->ow = w->w; w->oh = w->h;
                 w->x = 0; w->y = 0;
-                w->w = 800; w->h = WM_TASKBAR_Y;
+                w->w = screen_w; w->h = WM_TASKBAR_Y;
                 w->state = WM_STATE_MAXIMIZED;
             }
             return;
@@ -3090,7 +3091,7 @@ void wm_open_replay_control(void) {
         if (wm_str_eq(wm_windows[j].title, "Replay Control App")) {
             wm_windows[j].x = 150;
             wm_windows[j].y = 150;
-            wm_windows[j].w = 800;
+            wm_windows[j].w = screen_w;
             wm_windows[j].h = 360;
             wm_windows[j].visible = 1;
             wm_windows[j].state = WM_STATE_NORMAL;
@@ -3221,17 +3222,22 @@ void draw_content_telemetry(int cx, int cy, int cw, int ch) {
     gprint("ALL SYSTEMS NOMINAL", 0x24C655);
 
     int margin = 10;
-    int panel_w = cw / 2 - margin * 1.5;
+    int panel_w = (cw / 2) - (margin * 1.5);
     int left_x = cx + margin;
     int right_x = cx + cw / 2 + margin / 2;
-    
-    int row1_y = cy + 40;
-    int row1_h = 160;
-    int row2_y = row1_y + row1_h + 10;
-    int row2_h = 120;
-    int row3_y = row2_y + row2_h + 10;
-    int row3_h = 100;
 
+    int top_offset = 40;
+    int avail_h = ch - top_offset - 40; // Total available vertical space subtracting top/bottom margins
+    if (avail_h < 300) avail_h = 300;   // Layout minimum guard
+
+    int row1_y = cy + top_offset;
+    int row1_h = (avail_h * 40) / 100;
+
+    int row2_y = row1_y + row1_h + margin;
+    int row2_h = (avail_h * 32) / 100;
+
+    int row3_y = row2_y + row2_h + margin;
+    int row3_h = ch - (row3_y - cy) - margin;
     extern uint32_t tick;
     uint32_t secs = tick / 100;
     uint32_t mins = secs / 60;
@@ -3358,12 +3364,12 @@ void draw_content_telemetry(int cx, int cy, int cw, int ch) {
 
     // Draw Memory sparkline chart
     int max_mem_hist_w = (sub_w - 20) / 2;
+    int mem_chart_h = (sub_h * 40) / 100; // Takes 40% of the box height
     for(int i=0; i<max_mem_hist_w && i<64; i+=1) {
-        // v mapped to pixel height (max ~25px)
-        int v = (mem_hist[63 - max_mem_hist_w + i + 1] * 25) / total_mb;
-        if(v>25) { v=25; } if(v<0) { v=0; }
-        int next_v = (mem_hist[63 - max_mem_hist_w + i + 2] * 25) / total_mb;
-        if(next_v>25) { next_v=25; } if(next_v<0) { next_v=0; }
+        int v = (mem_hist[63 - max_mem_hist_w + i + 1] * mem_chart_h) / total_mb;
+        if(v>mem_chart_h) { v=mem_chart_h; } if(v<0) { v=0; }
+        int next_v = (mem_hist[63 - max_mem_hist_w + i + 2] * mem_chart_h) / total_mb;
+        if(next_v>mem_chart_h) { next_v=mem_chart_h; } if(next_v<0) { next_v=0; }
 
         draw_line_segment(b2_x + 10 + (i*2), chart_y_base - v, b2_x + 12 + (i*2), chart_y_base - next_v, 0x4CEBFD);
     }
@@ -3371,16 +3377,17 @@ void draw_content_telemetry(int cx, int cy, int cw, int ch) {
     int b3_x = b2_x + sub_w + 10;
     draw_filled_rect(b3_x + 5, sub_y, sub_w - 5, sub_h, 0x1A2A3A); draw_rect(b3_x + 5, sub_y, sub_w - 5, sub_h, 0x364E68);
     cursor_x = b3_x + ((sub_w-5)/2) - 12; cursor_y = sub_y + 8; gprint("CPU", 0xDDDDDD);
-    char cpu_str[16]; telemetry_itoa(cpu_load, cpu_str); 
+    char cpu_str[16]; telemetry_itoa(cpu_load, cpu_str);
     int clen=0; while(cpu_str[clen]) clen++; cpu_str[clen++]='%'; cpu_str[clen]=0;
     cursor_x = b3_x + ((sub_w-5)/2) - 10; cursor_y = sub_y + 24; gprint(cpu_str, 0xAAAAAA);
     int bar_w = ((sub_w-20)/8) - 2;
-    
+
     // Draw CPU history bars
+    int cpu_chart_h = (sub_h * 50) / 100; // Takes 50% of the box height
     for(int i=0; i<8; i++) {
-        int h = (cpu_hist[i] * 40) / 100;
-        if(h<2) h=2; else if (h>40) h=40;
-        uint32_t bar_c = (h > 30) ? 0xFF8800 : 0x24C655;
+        int h = (cpu_hist[i] * cpu_chart_h) / 100;
+        if(h<2) h=2; else if (h>cpu_chart_h) h=cpu_chart_h;
+        uint32_t bar_c = (h > (cpu_chart_h * 75)/100) ? 0xFF8800 : 0x24C655;
         draw_filled_rect(b3_x + 10 + i*(bar_w+2), sub_y + sub_h - h - 5, bar_w, h, bar_c);
     }
 
@@ -3412,49 +3419,58 @@ void draw_content_telemetry(int cx, int cy, int cw, int ch) {
     draw_rect(right_x, row2_y, panel_w, row2_h, 0x4CEBFD);
     draw_filled_rect(right_x, row2_y, panel_w, 20, 0x123A4A);
     cursor_x = right_x + 8; cursor_y = row2_y + 6; gprint("SPIKE ACTIVITY - NEMS", 0xFFFFFF);
+    
+    int spark_w = (panel_w * 40) / 100; if(spark_w < 120) spark_w = 120;
+    int spark_x = right_x + panel_w - spark_w - 20;
+    
     cursor_x = right_x + 10; cursor_y = row2_y + 30; gprint("Peak Firing Rate (ms)", 0xAAAAAA);
-    cursor_x = right_x + panel_w - 180; cursor_y = row2_y + 30; gprint("Raster Sparkline      Scrolls", 0xAAAAAA);
+    cursor_x = spark_x; cursor_y = row2_y + 30; gprint("Raster Sparkline      Scrolls", 0xAAAAAA);
+
+    int max_bar_h = (row2_h * 40) / 100;
+    int bar_y_base = row2_y + 40 + max_bar_h;
 
     for(int i=0; i<15; i++) {
         int idx = (g_spike_mon.trend_col + i*8) % 120;
-        int v = g_spike_mon.trend_a[idx] / 2; // Increased multiplier for higher bars
-        int h = 5 + v; if(h>30) h=30;
-        uint32_t c = (h > 25) ? 0xFF8800 : ((h > 15) ? 0xFFFF00 : 0x24C655);
-        draw_filled_rect(right_x + 10 + i*10, row2_y + 70 - h, 8, h, c);
-        draw_line_segment(right_x + 10 + i*10, row2_y + 70 - h, right_x + 18 + i*10, row2_y + 70 - h - 2, 0xFFFFFF);
+        int v = (g_spike_mon.trend_a[idx] * max_bar_h) / 100; // Increased multiplier for higher bars
+        int h = 5 + v; if(h>max_bar_h) h=max_bar_h;
+        uint32_t c = (h > (max_bar_h*80)/100) ? 0xFF8800 : ((h > (max_bar_h*50)/100) ? 0xFFFF00 : 0x24C655);
+        draw_filled_rect(right_x + 10 + i*10, bar_y_base - h, 8, h, c);
+        draw_line_segment(right_x + 10 + i*10, bar_y_base - h, right_x + 18 + i*10, bar_y_base - h - 2, 0xFFFFFF);
     }
-    cursor_x = right_x + 10; cursor_y = row2_y + 80; gprint("Peak Firing Rate Points", 0x888888);
+    cursor_x = right_x + 10; cursor_y = bar_y_base + 10; gprint("Peak Firing Rate Points", 0x888888);
     for(int i=0; i<8; i++) {
         int ry = (i * 6) % 48;
         int spike = g_spike_mon.raster[ry][(g_spike_mon.col + 159) % 160];
         uint32_t clrc = spike ? 0xFF8800 : 0x24C655;
         int offset_y = spike ? 2 : 0;
         int size = spike ? 6 : 4;
-        draw_filled_rect(right_x + 10 + i*16, row2_y + 96 - offset_y, size, size, clrc);
+        draw_filled_rect(right_x + 10 + i*16, bar_y_base + 26 - offset_y, size, size, clrc);
     }
 
-    int spark_x = right_x + panel_w - 180, spark_w = 160, prev_v = 0;   
+    int prev_v = 0;
+    int spark_y_base = row2_y + (row2_h * 75) / 100;
     for(int i=0; i<spark_w; i+=3) {
-        // Read historical data ordered oldest to newest smoothly
-        int idx = (g_spike_mon.trend_col + (i * 120) / spark_w) % 120;
-        
+        // Read historical data ordered oldest to newest smoothly       
+        int idx = (g_spike_mon.trend_col + (i * 120) / spark_w) % 120;  
+
         // Spike rate (avg_hz) naturally creates a noisy waveform based on traffic
-        int v = g_spike_mon.trend_a[idx] / 4; 
-        
+        int v = g_spike_mon.trend_a[idx] / 4;
+
         // Inject realtime voltage from a neuron to give it immediate life instead of slow trend
         int n_volt = os_memory_map[0].neurons[i % 5].voltage;
         int real_spike = (n_volt > 200) ? n_volt/40 : 0;
         
         v += real_spike;
-        if(v > 20) v = 20;
+        int max_spark_v = (row2_h * 30) / 100;
+        if(v > max_spark_v) v = max_spark_v;
         if(v < 0) v = 0;
-        
+
         if (i > 0) {
-            draw_line_segment(spark_x + i - 3, row2_y + 85 - prev_v, spark_x + i, row2_y + 85 - v, 0x24C655);
+            draw_line_segment(spark_x + i - 3, spark_y_base - prev_v, spark_x + i, spark_y_base - v, 0x24C655);
         }
         prev_v = v;
     }
-    draw_filled_rect(spark_x + 10, row2_y + 90, 80, 4, 0x4CEBFD);
+    draw_filled_rect(spark_x + 10, spark_y_base + 5, 80, 4, 0x4CEBFD);
 
     // ----- ROW 3 LEFT: NETWORK STATUS -----
     draw_filled_rect(left_x, row3_y, panel_w, row3_h, 0x0D2232);

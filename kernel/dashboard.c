@@ -19,6 +19,9 @@ typedef struct {
   int dynamic_threshold;
 } Neuron;
 
+extern int screen_w;
+extern int screen_h;
+
 typedef struct {
   Neuron neurons[5];
   uint8_t current_phase;
@@ -326,8 +329,8 @@ static void wm_handle_clicks(void) {
       /* Clamp to screen */
       if (w->x < 0) w->x = 0;
       if (w->y < 20) w->y = 20;
-      if (w->x + w->w > 800) w->x = 800 - w->w;
-      if (w->y + w->h > 600) w->y = 600 - w->h;
+      if (w->x + w->w > screen_w) w->x = screen_w - w->w;
+      if (w->y + w->h > screen_h) w->y = screen_h - w->h;
     }
     return;
   }
@@ -417,19 +420,21 @@ static void wm_handle_clicks(void) {
 }
 
 static void fill_gradient_background(void) {
-  for (int y = 0; y < 600; y++) {
+  for (int y = 0; y < screen_h; y++) {
     int r0 = (P_BG_ABYSS >> 16) & 0xFF;
     int g0 = (P_BG_ABYSS >> 8) & 0xFF;
     int b0 = P_BG_ABYSS & 0xFF;
     int r1 = (P_BG_TEAL >> 16) & 0xFF;
     int g1 = (P_BG_TEAL >> 8) & 0xFF;
     int b1 = P_BG_TEAL & 0xFF;
-    int r = r0 + ((r1 - r0) * y) / 600;
-    int g = g0 + ((g1 - g0) * y) / 600;
-    int b = b0 + ((b1 - b0) * y) / 600;
+    int r = r0 + ((r1 - r0) * y) / screen_h;
+    int g = g0 + ((g1 - g0) * y) / screen_h;
+    int b = b0 + ((b1 - b0) * y) / screen_h;
     uint32_t row = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-    for (int x = 0; x < 800; x++) {
-      int glow = ((x - 560) * (x - 560) + (y - 160) * (y - 160)) / 18000;
+    for (int x = 0; x < screen_w; x++) {
+      int cx = screen_w * 7 / 10;
+      int cy = screen_h * 3 / 10;
+      int glow = ((x - cx) * (x - cx) + (y - cy) * (y - cy)) / 18000;
       int add = (glow < 22) ? (22 - glow) : 0;
       int rr = r + add / 5;
       int gg = g + add;
@@ -460,12 +465,12 @@ static uint32_t blend_50(uint32_t a, uint32_t b) {
 
 static void draw_glass_panel(int x, int y, int w, int h, uint32_t tint) {
   for (int yy = y; yy < y + h; yy++) {
-    if (yy < 0 || yy >= 600)
+    if (yy < 0 || yy >= screen_h)
       continue;
     for (int xx = x; xx < x + w; xx++) {
-      if (xx < 0 || xx >= 800)
+      if (xx < 0 || xx >= screen_w)
         continue;
-      int idx = yy * 800 + xx;
+      int idx = yy * screen_w + xx;
       backbuffer[idx] = blend_50(backbuffer[idx], tint);
     }
   }
