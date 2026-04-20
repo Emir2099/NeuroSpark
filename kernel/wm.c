@@ -20,6 +20,7 @@ extern void process_command(char *);
 
 #include "launcher.h"
 #include "model_manager.h"
+#include "net.h"
 
 /* External graphics primitives (graphics.c) */
 extern void put_pixel(int x, int y, uint32_t color);
@@ -3251,14 +3252,7 @@ void draw_content_telemetry(int cx, int cy, int cw, int ch) {
     int used_mb = total_mb - free_mb;
     if (used_mb < 0) used_mb = 0;
 
-    typedef struct {
-        uint32_t total_frames; uint32_t total_bytes; uint32_t ipv4_frames; uint32_t arp_frames;
-        uint32_t neuro_frames; uint32_t unknown_frames; uint32_t dropped_frames; uint32_t irq_count;
-        uint32_t irq_rx_events; uint32_t tx_probe_ok; uint32_t tx_probe_fail; uint32_t poll_budget;
-        uint32_t irq_poll_budget; uint32_t coalesced_batches;
-    } UI_NetRxStats;
-    extern void net_get_rx_stats(UI_NetRxStats *out);
-    UI_NetRxStats nstats;
+    NetRxStats nstats;
     net_get_rx_stats(&nstats);
 
     extern TCB os_tasks[MAX_TASKS];

@@ -110,6 +110,9 @@ enum {
 #define SYS_IO_GETEVENTS 82
 #define SYS_TRACE 83
 #define SYS_PTRACE 84
+#define SYS_SETSOCKOPT 85
+#define SYS_GETSOCKOPT 86
+#define SYS_SHUTDOWN 87
 
 #define SIGKILL 9
 #define SIGINT 2
@@ -148,6 +151,16 @@ enum {
 #define NS_AF_INET 2
 #define NS_SOCK_STREAM 1
 #define NS_SOCK_DGRAM 2
+
+#define NS_SOL_SOCKET 1
+#define NS_SO_REUSEADDR 2
+#define NS_SO_RCVTIMEO 3
+#define NS_SO_SNDTIMEO 4
+#define NS_SO_KEEPALIVE 5
+
+#define NS_SHUT_RD 0
+#define NS_SHUT_WR 1
+#define NS_SHUT_RDWR 2
 
 #define MMAP_ANON_BASE 0x50000000u
 #define MMAP_ANON_LIMIT 0xB0000000u
@@ -334,6 +347,12 @@ typedef struct {
   uint16_t peer_port;
   int listening;
   int net_conn_id;
+  uint32_t rcv_timeout_ticks;
+  uint32_t snd_timeout_ticks;
+  uint8_t reuse_addr;
+  uint8_t keepalive;
+  uint8_t shut_rd;
+  uint8_t shut_wr;
 } NsSocketEntry;
 
 typedef struct {
@@ -484,6 +503,12 @@ static int socket_alloc_fd(int task_id, int type, int protocol) {
       task_sockets[task_id][i].peer_port = 0;
       task_sockets[task_id][i].listening = 0;
       task_sockets[task_id][i].net_conn_id = -1;
+      task_sockets[task_id][i].rcv_timeout_ticks = 0xFFFFFFFFu;
+      task_sockets[task_id][i].snd_timeout_ticks = 0xFFFFFFFFu;
+      task_sockets[task_id][i].reuse_addr = 0;
+      task_sockets[task_id][i].keepalive = 0;
+      task_sockets[task_id][i].shut_rd = 0;
+      task_sockets[task_id][i].shut_wr = 0;
       return NS_SOCKET_FD_BASE + i;
     }
   }
@@ -514,6 +539,12 @@ static void socket_close_entry(NsSocketEntry *s) {
   s->peer_port = 0;
   s->listening = 0;
   s->net_conn_id = -1;
+  s->rcv_timeout_ticks = 0xFFFFFFFFu;
+  s->snd_timeout_ticks = 0xFFFFFFFFu;
+  s->reuse_addr = 0;
+  s->keepalive = 0;
+  s->shut_rd = 0;
+  s->shut_wr = 0;
 }
 
 static int socket_is_nonblocking(const NsSocketEntry *s) {
@@ -522,6 +553,9 @@ static int socket_is_nonblocking(const NsSocketEntry *s) {
 
 static int socket_ready_for_read(const NsSocketEntry *s) {
   if (s == 0 || !s->used) {
+    return 0;
+  }
+  if (s->shut_rd) {
     return 0;
   }
   if (s->type == NS_SOCK_DGRAM) {
@@ -540,6 +574,9 @@ static int socket_ready_for_write(const NsSocketEntry *s) {
   if (s == 0 || !s->used) {
     return 0;
   }
+  if (s->shut_wr) {
+    return 0;
+  }
   if (s->type == NS_SOCK_DGRAM) {
     return s->peer_ip != 0u && s->peer_port != 0u;
   }
@@ -547,6 +584,40 @@ static int socket_ready_for_write(const NsSocketEntry *s) {
     return s->net_conn_id >= 0 && net_tcp_can_send(s->net_conn_id);
   }
   return 0;
+}
+
+static int socket_wait_for_readable(const NsSocketEntry *s, uint32_t timeout_ticks) {
+  uint32_t deadline = 0;
+  int infinite = (timeout_ticks == 0xFFFFFFFFu);
+
+  if (!infinite) {
+    deadline = scheduler_now_ticks() + timeout_ticks;
+  }
+
+  while (!socket_ready_for_read(s)) {
+    if (!infinite && scheduler_now_ticks() >= deadline) {
+      return 0;
+    }
+    task_sleep(1);
+  }
+  return 1;
+}
+
+static int socket_wait_for_writable(const NsSocketEntry *s, uint32_t timeout_ticks) {
+  uint32_t deadline = 0;
+  int infinite = (timeout_ticks == 0xFFFFFFFFu);
+
+  if (!infinite) {
+    deadline = scheduler_now_ticks() + timeout_ticks;
+  }
+
+  while (!socket_ready_for_write(s)) {
+    if (!infinite && scheduler_now_ticks() >= deadline) {
+      return 0;
+    }
+    task_sleep(1);
+  }
+  return 1;
 }
 
 static int epoll_fd_to_slot(int fd) {
@@ -1396,13 +1467,18 @@ void syscall_handler(uint32_t *regs) {
       }
       s = socket_entry_for_fd(os_current_task, fd);
       if (s != 0) {
+        if (s->shut_rd) {
+          syscall_complete(regs, syscall_num, (uint32_t)NS_ERR_INVALID_ARG);
+          break;
+        }
         if (!socket_ready_for_read(s)) {
           if (socket_is_nonblocking(s)) {
             syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
             break;
           }
-          while (!socket_ready_for_read(s)) {
-            task_sleep(1);
+          if (!socket_wait_for_readable(s, s->rcv_timeout_ticks)) {
+            syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
+            break;
           }
         }
         if (s->type == NS_SOCK_STREAM && s->net_conn_id >= 0) {
@@ -2540,8 +2616,9 @@ void syscall_handler(uint32_t *regs) {
         syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
         break;
       }
-      while (!socket_ready_for_read(s)) {
-        task_sleep(1);
+      if (!socket_wait_for_readable(s, s->rcv_timeout_ticks)) {
+        syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
+        break;
       }
     }
 
@@ -2566,6 +2643,12 @@ void syscall_handler(uint32_t *regs) {
     child->listening = 0;
     child->net_conn_id = conn_id;
     child->flags = s->flags;
+    child->rcv_timeout_ticks = s->rcv_timeout_ticks;
+    child->snd_timeout_ticks = s->snd_timeout_ticks;
+    child->reuse_addr = s->reuse_addr;
+    child->keepalive = s->keepalive;
+    child->shut_rd = 0;
+    child->shut_wr = 0;
 
     if (peer != 0) {
       peer->sin_family = NS_AF_INET;
@@ -2628,8 +2711,22 @@ void syscall_handler(uint32_t *regs) {
       break;
     }
 
-    while (!net_tcp_is_established(conn_id)) {
-      task_sleep(1);
+    {
+      uint32_t deadline = 0;
+      int infinite = (s->snd_timeout_ticks == 0xFFFFFFFFu);
+      if (!infinite) {
+        deadline = scheduler_now_ticks() + s->snd_timeout_ticks;
+      }
+      while (!net_tcp_is_established(conn_id)) {
+        if (!infinite && scheduler_now_ticks() >= deadline) {
+          syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
+          break;
+        }
+        task_sleep(1);
+      }
+      if (!net_tcp_is_established(conn_id)) {
+        break;
+      }
     }
     syscall_complete(regs, syscall_num, NS_OK);
     break;
@@ -2650,6 +2747,10 @@ void syscall_handler(uint32_t *regs) {
       syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
       break;
     }
+    if (s->shut_wr) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
 
     if (s->type == NS_SOCK_DGRAM) {
       if (s->peer_ip != 0 && s->peer_port != 0) {
@@ -2666,8 +2767,9 @@ void syscall_handler(uint32_t *regs) {
           syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
           break;
         }
-        while (!socket_ready_for_write(s)) {
-          task_sleep(1);
+        if (!socket_wait_for_writable(s, s->snd_timeout_ticks)) {
+          syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
+          break;
         }
       }
       rc = net_tcp_send(s->net_conn_id, buf, (uint16_t)len);
@@ -2692,6 +2794,10 @@ void syscall_handler(uint32_t *regs) {
       syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
       break;
     }
+    if (s->shut_rd) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
 
     if (s->type == NS_SOCK_DGRAM && s->bound) {
       uint32_t src_ip = 0;
@@ -2701,8 +2807,9 @@ void syscall_handler(uint32_t *regs) {
           syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
           break;
         }
-        while (!socket_ready_for_read(s)) {
-          task_sleep(1);
+        if (!socket_wait_for_readable(s, s->rcv_timeout_ticks)) {
+          syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
+          break;
         }
       }
       rc = net_udp_recv(s->local_port, &src_ip, &src_port, buf, (uint16_t)len);
@@ -2716,8 +2823,9 @@ void syscall_handler(uint32_t *regs) {
           syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
           break;
         }
-        while (!socket_ready_for_read(s)) {
-          task_sleep(1);
+        if (!socket_wait_for_readable(s, s->rcv_timeout_ticks)) {
+          syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
+          break;
         }
       }
       rc = net_tcp_recv(s->net_conn_id, buf, (uint16_t)len);
@@ -2727,6 +2835,100 @@ void syscall_handler(uint32_t *regs) {
       rc = (int)NS_ERR_WOULD_BLOCK;
     }
     syscall_complete(regs, syscall_num, (uint32_t)rc);
+    break;
+  }
+
+  case SYS_SETSOCKOPT: {
+    int fd = (int)regs[4];
+    int opt = (int)regs[5];
+    uint32_t val = regs[6];
+    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+
+    if (s == 0) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+
+    switch (opt) {
+    case NS_SO_REUSEADDR:
+      s->reuse_addr = (uint8_t)(val ? 1 : 0);
+      syscall_complete(regs, syscall_num, NS_OK);
+      break;
+    case NS_SO_KEEPALIVE:
+      s->keepalive = (uint8_t)(val ? 1 : 0);
+      syscall_complete(regs, syscall_num, NS_OK);
+      break;
+    case NS_SO_RCVTIMEO:
+      s->rcv_timeout_ticks = val;
+      syscall_complete(regs, syscall_num, NS_OK);
+      break;
+    case NS_SO_SNDTIMEO:
+      s->snd_timeout_ticks = val;
+      syscall_complete(regs, syscall_num, NS_OK);
+      break;
+    default:
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+    break;
+  }
+
+  case SYS_GETSOCKOPT: {
+    int fd = (int)regs[4];
+    int opt = (int)regs[5];
+    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+    uint32_t out = 0;
+
+    if (s == 0) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+
+    switch (opt) {
+    case NS_SO_REUSEADDR:
+      out = (uint32_t)s->reuse_addr;
+      break;
+    case NS_SO_KEEPALIVE:
+      out = (uint32_t)s->keepalive;
+      break;
+    case NS_SO_RCVTIMEO:
+      out = s->rcv_timeout_ticks;
+      break;
+    case NS_SO_SNDTIMEO:
+      out = s->snd_timeout_ticks;
+      break;
+    default:
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+    if (opt == NS_SO_REUSEADDR || opt == NS_SO_KEEPALIVE ||
+        opt == NS_SO_RCVTIMEO || opt == NS_SO_SNDTIMEO) {
+      syscall_complete(regs, syscall_num, out);
+    }
+    break;
+  }
+
+  case SYS_SHUTDOWN: {
+    int fd = (int)regs[4];
+    int how = (int)regs[5];
+    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+
+    if (s == 0 || (how != NS_SHUT_RD && how != NS_SHUT_WR && how != NS_SHUT_RDWR)) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+
+    if (how == NS_SHUT_RD || how == NS_SHUT_RDWR) {
+      s->shut_rd = 1;
+    }
+    if (how == NS_SHUT_WR || how == NS_SHUT_RDWR) {
+      s->shut_wr = 1;
+      if (s->type == NS_SOCK_STREAM && s->net_conn_id >= 0) {
+        (void)net_tcp_close(s->net_conn_id);
+      }
+    }
+
+    syscall_complete(regs, syscall_num, NS_OK);
     break;
   }
 
@@ -3098,6 +3300,10 @@ void syscall_handler(uint32_t *regs) {
         syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
         break;
       }
+      if (s->shut_wr) {
+        syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+        break;
+      }
 
       if (s->type == NS_SOCK_STREAM && s->net_conn_id >= 0) {
         if (!socket_ready_for_write(s)) {
@@ -3105,8 +3311,9 @@ void syscall_handler(uint32_t *regs) {
             syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
             break;
           }
-          while (!socket_ready_for_write(s)) {
-            task_sleep(1);
+          if (!socket_wait_for_writable(s, s->snd_timeout_ticks)) {
+            syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
+            break;
           }
         }
         wrote = net_tcp_send(s->net_conn_id, buf, (uint16_t)size);

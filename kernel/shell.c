@@ -1684,6 +1684,7 @@ static void cmd_net(const char *args) {
   char d[24];
   NetRxStats rx;
   uint32_t ip = 0, mask = 0, gw = 0;
+  uint32_t fi_loss = 0, fi_reorder = 0;
   args = next_token(args, sub, sizeof(sub));
   args = next_token(args, a, sizeof(a));
   args = next_token(args, b, sizeof(b));
@@ -1718,6 +1719,7 @@ static void cmd_net(const char *args) {
     uint16_t mtu = net_mtu_bytes();
     int jumbo = net_supports_jumbo();
     net_get_rx_stats(&rx);
+    net_get_fault_injection(&fi_loss, &fi_reorder);
     net_get_ipv4(&ip, &mask, &gw);
     link_mbps = net_link_speed_mbps();
     gprint("NET: ", 0x99EEFF);
@@ -1784,6 +1786,32 @@ static void cmd_net(const char *args) {
     gprint("/", 0x666666);
     gprint_dec((int)rx.tx_probe_fail, 0xFFAA66);
     gprint("\n", 0x000000);
+
+    gprint("RX malformed/quarantine/loss/reorder ", 0x99EEFF);
+    gprint_dec((int)rx.malformed_frames, 0xFFAA66);
+    gprint("/", 0x666666);
+    gprint_dec((int)rx.quarantined_frames, 0xFFAA66);
+    gprint("/", 0x666666);
+    gprint_dec((int)rx.injected_loss_frames, 0xFFE066);
+    gprint("/", 0x666666);
+    gprint_dec((int)rx.injected_reorder_frames, 0xFFE066);
+    gprint("\n", 0x000000);
+
+    gprint("TCP retx/fail/halfopen/rst ", 0x99EEFF);
+    gprint_dec((int)rx.tcp_retransmits, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)rx.tcp_retransmit_failures, 0xFFAA66);
+    gprint("/", 0x666666);
+    gprint_dec((int)rx.tcp_half_open_cleanups, 0xFFAA66);
+    gprint("/", 0x666666);
+    gprint_dec((int)rx.tcp_reset_events, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("FAULT INJECT loss/reorder % ", 0x99EEFF);
+    gprint_dec((int)fi_loss, 0xFFE066);
+    gprint("/", 0x666666);
+    gprint_dec((int)fi_reorder, 0xFFE066);
+    gprint("\n", 0x000000);
     gprint("RX coalesce poll/irq/batches ", 0x99EEFF);
     gprint_dec((int)rx.poll_budget, 0xFFFFFF);
     gprint("/", 0x666666);
@@ -1802,6 +1830,21 @@ static void cmd_net(const char *args) {
     net_set_rx_coalesce((uint32_t)parse_u32_dec(a),
                         (uint32_t)parse_u32_dec(b));
     set_cmd_output("NET COALESCE OK");
+    return;
+  }
+
+  if (str_eq(sub, "fault")) {
+    uint32_t loss;
+    uint32_t reorder;
+
+    if (!is_dec_number(a) || !is_dec_number(b)) {
+      set_cmd_output("USAGE: net fault <loss%> <reorder%>");
+      return;
+    }
+    loss = (uint32_t)parse_u32_dec(a);
+    reorder = (uint32_t)parse_u32_dec(b);
+    net_set_fault_injection(loss, reorder);
+    set_cmd_output("NET FAULT INJECTION SET");
     return;
   }
 
@@ -1847,7 +1890,192 @@ static void cmd_net(const char *args) {
     return;
   }
 
-  set_cmd_output("USAGE: net up|cfg|status|coalesce <poll> <irqpoll>|tx|export <slot>|manifest|profile");
+  if (str_eq(sub, "tcpserve")) {
+    int port;
+    int loops = 600;
+    int listener;
+    int accepts = 0;
+    int echoed = 0;
+
+    if (!is_dec_number(a)) {
+      set_cmd_output("USAGE: net tcpserve <port> [loops]");
+      return;
+    }
+    if (is_dec_number(b)) {
+      loops = clamp_i32(parse_u32_dec(b), 1, 100000);
+    }
+    port = parse_u32_dec(a);
+    if (port <= 0 || port > 65535) {
+      set_cmd_output("NET TCPSERVE BAD PORT");
+      return;
+    }
+
+    listener = net_tcp_listen((uint16_t)port);
+    if (listener < 0) {
+      set_cmd_output("NET TCPSERVE LISTEN FAIL");
+      return;
+    }
+
+    for (int i = 0; i < loops; i++) {
+      uint32_t peer_ip = 0;
+      uint16_t peer_port = 0;
+      int conn = net_tcp_accept((uint16_t)port, &peer_ip, &peer_port);
+      if (conn >= 0) {
+        uint8_t buf[256];
+        accepts++;
+        for (int r = 0; r < 64; r++) {
+          int got = net_tcp_recv(conn, buf, (uint16_t)sizeof(buf));
+          if (got <= 0) {
+            break;
+          }
+          if (net_tcp_send(conn, buf, (uint16_t)got) > 0) {
+            echoed++;
+          }
+          (void)net_tcp_poll();
+        }
+        (void)net_tcp_close(conn);
+      }
+      (void)net_rx_poll();
+      (void)net_tcp_poll();
+    }
+
+    (void)net_tcp_unlisten((uint16_t)port);
+    gprint("TCPSERVE accepts/echo ", 0x99EEFF);
+    gprint_dec(accepts, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec(echoed, 0x77FFAA);
+    gprint("\n", 0x000000);
+    set_cmd_output("NET TCPSERVE DONE");
+    return;
+  }
+
+  if (str_eq(sub, "tcpdial")) {
+    uint32_t dst_ip = 0;
+    int port;
+    int loops = 8;
+    int sent = 0;
+    int recv = 0;
+    int conn;
+    uint8_t payload[64];
+    uint8_t rxbuf[128];
+
+    if (!parse_ipv4(a, &dst_ip) || !is_dec_number(b)) {
+      set_cmd_output("USAGE: net tcpdial <ip> <port> [count]");
+      return;
+    }
+    if (is_dec_number(c)) {
+      loops = clamp_i32(parse_u32_dec(c), 1, 4096);
+    }
+    port = parse_u32_dec(b);
+    if (port <= 0 || port > 65535) {
+      set_cmd_output("NET TCPDIAL BAD PORT");
+      return;
+    }
+
+    conn = net_tcp_connect(dst_ip, (uint16_t)port, (uint16_t)(42000u + (tick & 0x1FFu)));
+    if (conn < 0) {
+      set_cmd_output("NET TCPDIAL CONNECT FAIL");
+      return;
+    }
+
+    for (int w = 0; w < 300 && !net_tcp_is_established(conn); w++) {
+      (void)net_rx_poll();
+      (void)net_tcp_poll();
+    }
+    if (!net_tcp_is_established(conn)) {
+      (void)net_tcp_close(conn);
+      set_cmd_output("NET TCPDIAL TIMEOUT");
+      return;
+    }
+
+    payload[0] = 'N';
+    payload[1] = 'S';
+    payload[2] = 'T';
+    payload[3] = 'C';
+
+    for (int i = 0; i < loops; i++) {
+      *((uint32_t *)&payload[4]) = i;
+      if (net_tcp_send(conn, payload, 8) > 0) {
+        sent++;
+      }
+      for (int r = 0; r < 64; r++) {
+        int got;
+        (void)net_rx_poll();
+        (void)net_tcp_poll();
+        got = net_tcp_recv(conn, rxbuf, (uint16_t)sizeof(rxbuf));
+        if (got > 0) {
+          recv++;
+          break;
+        }
+      }
+    }
+
+    (void)net_tcp_close(conn);
+    gprint("TCPDIAL sent/recv ", 0x99EEFF);
+    gprint_dec(sent, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec(recv, 0x77FFAA);
+    gprint("\n", 0x000000);
+    set_cmd_output("NET TCPDIAL DONE");
+    return;
+  }
+
+  if (str_eq(sub, "udpbench")) {
+    uint32_t dst_ip = 0;
+    uint32_t local_ip = 0;
+    int count = 128;
+    int bytes = 32;
+    uint16_t port = 39100u;
+    int sent = 0;
+    int recvd = 0;
+    uint8_t payload[256];
+    uint8_t rxbuf[256];
+
+    net_get_ipv4(&local_ip, 0, 0);
+    dst_ip = local_ip;
+    if (a[0] != '\0' && !str_eq(a, "self")) {
+      if (!parse_ipv4(a, &dst_ip)) {
+        set_cmd_output("USAGE: net udpbench [ip|self] [count] [bytes]");
+        return;
+      }
+    }
+    if (is_dec_number(b)) {
+      count = clamp_i32(parse_u32_dec(b), 1, 16384);
+    }
+    if (is_dec_number(c)) {
+      bytes = clamp_i32(parse_u32_dec(c), 8, 200);
+    }
+
+    if (!net_udp_bind(port)) {
+      set_cmd_output("NET UDPBENCH BIND FAIL");
+      return;
+    }
+
+    for (int i = 0; i < bytes; i++) {
+      payload[i] = (uint8_t)((i * 17) & 0xFF);
+    }
+
+    for (int i = 0; i < count; i++) {
+      if (net_udp_send(dst_ip, port, port, payload, (uint16_t)bytes)) {
+        sent++;
+      }
+      (void)net_rx_poll();
+      if (net_udp_recv(port, 0, 0, rxbuf, (uint16_t)sizeof(rxbuf)) > 0) {
+        recvd++;
+      }
+    }
+
+    (void)net_udp_unbind(port);
+    gprint("UDPBENCH sent/recv ", 0x99EEFF);
+    gprint_dec(sent, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec(recvd, 0x77FFAA);
+    gprint("\n", 0x000000);
+    set_cmd_output("NET UDPBENCH DONE");
+    return;
+  }
+
+  set_cmd_output("USAGE: net up|cfg|status|coalesce <poll> <irqpoll>|fault <loss%> <reorder%>|tx|export <slot>|manifest|profile|tcpserve <port> [loops]|tcpdial <ip> <port> [count]|udpbench [ip|self] [count] [bytes]");
 }
 
 static void cmd_memstat(const char *args) {
@@ -1919,14 +2147,18 @@ static void cmd_memstat(const char *args) {
 static void cmd_diag(const char *args) {
   char sub[16];
   char a[16];
+  char b[16];
   uint32_t wm_frames = 0;
   uint32_t fps_x10 = 0;
   NetRxStats before;
   NetRxStats after;
+  uint32_t fi_loss = 0;
+  uint32_t fi_reorder = 0;
   int loops = 128;
 
   args = next_token(args, sub, sizeof(sub));
-  next_token(args, a, sizeof(a));
+  args = next_token(args, a, sizeof(a));
+  next_token(args, b, sizeof(b));
 
   if (sub[0] == '\0' || str_eq(sub, "show")) {
     net_get_rx_stats(&after);
@@ -1962,6 +2194,21 @@ static void cmd_diag(const char *args) {
     gprint_dec((int)after.irq_count, 0xFFFFFF);
     gprint(" RX-IRQ:", 0x99EEFF);
     gprint_dec((int)after.irq_rx_events, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    net_get_fault_injection(&fi_loss, &fi_reorder);
+    gprint("NIC malformed/quarantine/loss/reorder ", 0x99EEFF);
+    gprint_dec((int)after.malformed_frames, 0xFFAA66);
+    gprint("/", 0x666666);
+    gprint_dec((int)after.quarantined_frames, 0xFFAA66);
+    gprint("/", 0x666666);
+    gprint_dec((int)after.injected_loss_frames, 0xFFE066);
+    gprint("/", 0x666666);
+    gprint_dec((int)after.injected_reorder_frames, 0xFFE066);
+    gprint(" FI ", 0x99EEFF);
+    gprint_dec((int)fi_loss, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)fi_reorder, 0xFFFFFF);
     gprint("\n", 0x000000);
 
     set_cmd_output("DIAG SHOW OK");
@@ -2126,7 +2373,124 @@ static void cmd_diag(const char *args) {
     return;
   }
 
-  set_cmd_output("USAGE: diag show|cursor|netstress [count]|phase24");
+  if (str_eq(sub, "netloss")) {
+    uint32_t old_loss = 0;
+    uint32_t old_reorder = 0;
+    uint32_t loss_pct = 5u;
+    uint32_t t0;
+    uint32_t elapsed;
+
+    if (is_dec_number(a)) {
+      loss_pct = (uint32_t)clamp_i32(parse_u32_dec(a), 0, 100);
+    }
+    if (is_dec_number(b)) {
+      loops = clamp_i32(parse_u32_dec(b), 1, 4096);
+    }
+
+    net_get_fault_injection(&old_loss, &old_reorder);
+    net_set_fault_injection(loss_pct, 0u);
+    net_get_rx_stats(&before);
+
+    t0 = tick;
+    for (int i = 0; i < loops; i++) {
+      (void)net_send_probe();
+    }
+    for (int k = 0; k < 128; k++) {
+      (void)net_rx_poll();
+      (void)net_tcp_poll();
+    }
+    net_get_rx_stats(&after);
+    elapsed = tick - t0;
+    if (elapsed == 0u) {
+      elapsed = 1u;
+    }
+
+    gprint("NETLOSS cfg/loops ", 0x99EEFF);
+    gprint_dec((int)loss_pct, 0xFFFFFF);
+    gprint("%/", 0x666666);
+    gprint_dec(loops, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("NETLOSS dInjectedLoss dDrop dFrames ", 0x99EEFF);
+    gprint_dec((int)(after.injected_loss_frames - before.injected_loss_frames), 0xFFE066);
+    gprint("/", 0x666666);
+    gprint_dec((int)(after.dropped_frames - before.dropped_frames), 0xFFAA66);
+    gprint("/", 0x666666);
+    gprint_dec((int)(after.total_frames - before.total_frames), 0xFFFFFF);
+    gprint(" t=", 0x99EEFF);
+    gprint_dec((int)elapsed, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    net_set_fault_injection(old_loss, old_reorder);
+    set_cmd_output("DIAG NETLOSS OK");
+    return;
+  }
+
+  if (str_eq(sub, "netreorder")) {
+    uint32_t old_loss = 0;
+    uint32_t old_reorder = 0;
+    uint32_t reorder_pct = 10u;
+    uint16_t port = 39100u;
+    int sent = 0;
+    int recvd = 0;
+    uint8_t payload[64];
+    uint8_t rxbuf[64];
+
+    if (is_dec_number(a)) {
+      reorder_pct = (uint32_t)clamp_i32(parse_u32_dec(a), 0, 100);
+    }
+    if (is_dec_number(b)) {
+      loops = clamp_i32(parse_u32_dec(b), 1, 4096);
+    }
+
+    net_get_fault_injection(&old_loss, &old_reorder);
+    net_set_fault_injection(0u, reorder_pct);
+    net_get_rx_stats(&before);
+    if (!net_udp_bind(port)) {
+      net_set_fault_injection(old_loss, old_reorder);
+      set_cmd_output("DIAG NETREORDER BIND FAIL");
+      return;
+    }
+
+    for (int i = 0; i < 32; i++) {
+      payload[i] = (uint8_t)i;
+    }
+
+    for (int i = 0; i < loops; i++) {
+      if (net_udp_send(0x7F000001u, port, port, payload, 32u)) {
+        sent++;
+      }
+      (void)net_rx_poll();
+      if (net_udp_recv(port, 0, 0, rxbuf, (uint16_t)sizeof(rxbuf)) > 0) {
+        recvd++;
+      }
+    }
+
+    (void)net_udp_unbind(port);
+    net_get_rx_stats(&after);
+
+    gprint("NETREORDER cfg/loops sent/recv ", 0x99EEFF);
+    gprint_dec((int)reorder_pct, 0xFFFFFF);
+    gprint("%/", 0x666666);
+    gprint_dec(loops, 0xFFFFFF);
+    gprint(" ", 0x000000);
+    gprint_dec(sent, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec(recvd, 0x77FFAA);
+    gprint("\n", 0x000000);
+
+    gprint("NETREORDER dInjectedReorder dDrop ", 0x99EEFF);
+    gprint_dec((int)(after.injected_reorder_frames - before.injected_reorder_frames), 0xFFE066);
+    gprint("/", 0x666666);
+    gprint_dec((int)(after.dropped_frames - before.dropped_frames), 0xFFAA66);
+    gprint("\n", 0x000000);
+
+    net_set_fault_injection(old_loss, old_reorder);
+    set_cmd_output("DIAG NETREORDER OK");
+    return;
+  }
+
+  set_cmd_output("USAGE: diag show|cursor|netstress [count]|netloss [loss%] [count]|netreorder [reorder%] [count]|phase24");
 }
 
 static void cmd_remote(const char *args) {
@@ -2134,7 +2498,7 @@ static void cmd_remote(const char *args) {
   char tok[24];
   char ttl[12];
   args = next_token(args, sub, sizeof(sub));
-  next_token(args, tok, sizeof(tok));
+  args = next_token(args, tok, sizeof(tok));
   next_token(args, ttl, sizeof(ttl));
 
   if (sub[0] == '\0') {
@@ -2148,6 +2512,14 @@ static void cmd_remote(const char *args) {
     gprint(remote_is_authorized() ? "VALID" : "EXPIRED", remote_is_authorized() ? 0x44FF88 : 0xFFAA66);
     gprint(" EXP:", 0x99EEFF);
     gprint_hex(remote_get_auth_deadline(), 8, 0xFFFFFF);
+    gprint(" ROLE:", 0x99EEFF);
+    if (remote_get_role() == 1u) {
+      gprint("viewer", 0xFFE066);
+    } else if (remote_get_role() == 3u) {
+      gprint("admin", 0xFFAA66);
+    } else {
+      gprint("operator", 0x77FFAA);
+    }
     gprint("\n", 0x000000);
     return;
   }
@@ -2188,7 +2560,29 @@ static void cmd_remote(const char *args) {
     return;
   }
 
-  set_cmd_output("USAGE: remote on|off|auth <hex> [ttl]|token <hex>");
+  if (str_eq(sub, "role")) {
+    if (tok[0] == '\0') {
+      set_cmd_output("USAGE: remote role <viewer|operator|admin>");
+      return;
+    }
+    if (str_ieq(tok, "viewer")) {
+      remote_set_role(1u);
+    } else if (str_ieq(tok, "admin")) {
+      remote_set_role(3u);
+    } else {
+      remote_set_role(2u);
+    }
+    set_cmd_output("REMOTE ROLE SET");
+    return;
+  }
+
+  if (str_eq(sub, "rotate")) {
+    remote_rotate_session_key();
+    set_cmd_output("REMOTE SESSION ROTATED");
+    return;
+  }
+
+  set_cmd_output("USAGE: remote on|off|auth <hex> [ttl]|token <hex>|role <viewer|operator|admin>|rotate");
 }
 
 static void cmd_synview(const char *args) {

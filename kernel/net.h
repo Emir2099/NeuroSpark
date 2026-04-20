@@ -13,6 +13,14 @@ typedef struct {
 	uint32_t neuro_frames;
 	uint32_t unknown_frames;
 	uint32_t dropped_frames;
+	uint32_t malformed_frames;
+	uint32_t quarantined_frames;
+	uint32_t injected_loss_frames;
+	uint32_t injected_reorder_frames;
+	uint32_t tcp_retransmits;
+	uint32_t tcp_retransmit_failures;
+	uint32_t tcp_half_open_cleanups;
+	uint32_t tcp_reset_events;
 	uint32_t irq_count;
 	uint32_t irq_rx_events;
 	uint32_t tx_probe_ok;
@@ -34,6 +42,9 @@ int net_send_probe(void);
 int net_export_snapshot(int slot);
 int net_export_profile(void);
 int net_export_manifest(void);
+
+void net_set_fault_injection(uint32_t loss_percent, uint32_t reorder_percent);
+void net_get_fault_injection(uint32_t *loss_percent, uint32_t *reorder_percent);
 
 int net_set_ipv4(uint32_t ip, uint32_t mask, uint32_t gw);
 void net_get_ipv4(uint32_t *ip, uint32_t *mask, uint32_t *gw);
@@ -77,6 +88,9 @@ int remote_is_authorized(void);
 uint32_t remote_get_token(void);
 uint32_t remote_get_session(void);
 uint32_t remote_get_auth_deadline(void);
+void remote_rotate_session_key(void);
+void remote_set_role(uint32_t role);
+uint32_t remote_get_role(void);
 int remote_send_command_result(const char *cmd_text);
 
 #endif

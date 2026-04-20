@@ -103,6 +103,10 @@ typedef unsigned short uint16_t;
 #define REMOTE_STATUS_TOKEN_EXPIRED 2u
 #define REMOTE_STATUS_INVALID_TOKEN 3u
 
+#define REMOTE_ROLE_VIEWER 1u
+#define REMOTE_ROLE_OPERATOR 2u
+#define REMOTE_ROLE_ADMIN 3u
+
 typedef struct {
   uint32_t magic;
   uint32_t version;
@@ -111,6 +115,8 @@ typedef struct {
   uint32_t session;
   uint32_t request_id;
   uint32_t token;
+  uint32_t nonce;
+  uint32_t role;
   uint32_t checksum;
   uint32_t status;
   uint32_t payload_len;
@@ -228,6 +234,23 @@ static uint32_t remote_session = 0;
 static uint32_t remote_seq = 1;
 static uint32_t remote_auth_deadline = 0;
 static uint32_t remote_dst_ip = 0xFFFFFFFFu;
+static uint32_t remote_role = REMOTE_ROLE_OPERATOR;
+static uint32_t remote_key_epoch = 1u;
+static uint32_t remote_nonce_state = 0x9E3779B9u;
+static uint32_t net_fault_loss_percent = 0u;
+static uint32_t net_fault_reorder_percent = 0u;
+static uint32_t net_fault_prng_state = 0xC0FFEE11u;
+
+typedef struct {
+  int valid;
+  uint32_t src_ip;
+  uint16_t src_port;
+  uint16_t dst_port;
+  uint16_t len;
+  uint8_t data[UDP_MAX_PAYLOAD];
+} UdpReorderHold;
+
+static UdpReorderHold udp_reorder_hold = {0};
 
 static uint8_t rtl_rx_buffer[8192 + 16 + 1500] __attribute__((aligned(16)));
 static uint8_t rtl_tx_buffer[4][1600] __attribute__((aligned(16)));
@@ -604,6 +627,11 @@ static int tcp_retransmit_last(TcpConn *c) {
     return 0;
   }
   if (c->last_tx_retries >= TCP_RETX_MAX) {
+    net_rx_stats.tcp_retransmit_failures++;
+    if (c->state == TCP_STATE_SYN_SENT || c->state == TCP_STATE_SYN_RCVD ||
+        c->state == TCP_STATE_CLOSING) {
+      net_rx_stats.tcp_half_open_cleanups++;
+    }
     c->used = 0;
     c->state = TCP_STATE_CLOSED;
     return 0;
@@ -617,6 +645,7 @@ static int tcp_retransmit_last(TcpConn *c) {
   }
   c->last_tx_tick = tick;
   c->last_tx_retries++;
+  net_rx_stats.tcp_retransmits++;
   return 1;
 }
 
@@ -734,6 +763,49 @@ static int tcp_queue_rx(TcpConn *c, const uint8_t *payload, uint16_t len) {
   return 1;
 }
 
+static uint32_t net_fault_prng_next(void) {
+  net_fault_prng_state = net_fault_prng_state * 1664525u + 1013904223u;
+  return net_fault_prng_state;
+}
+
+static int net_fault_should_apply(uint32_t percent) {
+  if (percent == 0u) {
+    return 0;
+  }
+  if (percent >= 100u) {
+    return 1;
+  }
+  return (net_fault_prng_next() % 100u) < percent;
+}
+
+static void net_count_malformed(void) {
+  net_rx_stats.malformed_frames++;
+  net_rx_stats.quarantined_frames++;
+  net_rx_stats.dropped_frames++;
+}
+
+static int tcp_checksum_valid(uint32_t src_ip, uint32_t dst_ip,
+                              const uint8_t *tcp, uint16_t tcp_len) {
+  uint8_t pseudo[1600];
+  uint16_t pseudo_len;
+
+  if (tcp == 0 || tcp_len < 20u) {
+    return 0;
+  }
+  pseudo_len = (uint16_t)(12u + tcp_len);
+  if (pseudo_len > sizeof(pseudo)) {
+    return 0;
+  }
+
+  write_be32(&pseudo[0], src_ip);
+  write_be32(&pseudo[4], dst_ip);
+  pseudo[8] = 0;
+  pseudo[9] = IP_PROTO_TCP;
+  write_be16(&pseudo[10], tcp_len);
+  mem_copy(&pseudo[12], tcp, tcp_len);
+  return internet_checksum(pseudo, pseudo_len) == 0u;
+}
+
 static int net_handle_tcp_segment(uint32_t src_ip, uint32_t dst_ip,
                                   const uint8_t *tcp, uint16_t tcp_len) {
   uint16_t src_port;
@@ -751,6 +823,11 @@ static int net_handle_tcp_segment(uint32_t src_ip, uint32_t dst_ip,
   (void)dst_ip;
 
   if (tcp == 0 || tcp_len < 20u) {
+    return 0;
+  }
+
+  if (!tcp_checksum_valid(src_ip, dst_ip, tcp, tcp_len)) {
+    net_count_malformed();
     return 0;
   }
 
@@ -807,6 +884,7 @@ static int net_handle_tcp_segment(uint32_t src_ip, uint32_t dst_ip,
   c = &tcp_conns[conn_idx];
 
   if ((flags & TCP_FLAG_RST) != 0u) {
+    net_rx_stats.tcp_reset_events++;
     c->state = TCP_STATE_CLOSED;
     c->used = 0;
     return 1;
@@ -866,6 +944,12 @@ static int net_handle_tcp_segment(uint32_t src_ip, uint32_t dst_ip,
     }
 
     if (seg_payload_len > 0u) {
+      if (net_fault_should_apply(net_fault_loss_percent)) {
+        net_rx_stats.injected_loss_frames++;
+        (void)tcp_send_segment(c->remote_ip, c->local_port, c->remote_port,
+                               c->snd_nxt, c->rcv_nxt, TCP_FLAG_ACK, 0, 0);
+        return 1;
+      }
       if (seq == c->rcv_nxt) {
         if (tcp_queue_rx(c, &tcp[hdr_len], seg_payload_len)) {
           c->rcv_nxt += seg_payload_len;
@@ -949,6 +1033,49 @@ static int udp_enqueue_packet(uint16_t dst_port, uint32_t src_ip,
   return 1;
 }
 
+static int udp_enqueue_with_faults(uint16_t dst_port, uint32_t src_ip,
+                                   uint16_t src_port, const uint8_t *payload,
+                                   uint16_t payload_len) {
+  int ok;
+
+  if (net_fault_should_apply(net_fault_loss_percent)) {
+    net_rx_stats.injected_loss_frames++;
+    return 1;
+  }
+
+  if (udp_reorder_hold.valid) {
+    ok = udp_enqueue_packet(dst_port, src_ip, src_port, payload, payload_len);
+    if (!ok) {
+      return 0;
+    }
+    ok = udp_enqueue_packet(udp_reorder_hold.dst_port,
+                            udp_reorder_hold.src_ip,
+                            udp_reorder_hold.src_port,
+                            udp_reorder_hold.data,
+                            udp_reorder_hold.len);
+    if (!ok) {
+      return 0;
+    }
+    udp_reorder_hold.valid = 0;
+    net_rx_stats.injected_reorder_frames++;
+    return 1;
+  }
+
+  if (net_fault_should_apply(net_fault_reorder_percent) && payload_len <= UDP_MAX_PAYLOAD) {
+    udp_reorder_hold.valid = 1;
+    udp_reorder_hold.src_ip = src_ip;
+    udp_reorder_hold.src_port = src_port;
+    udp_reorder_hold.dst_port = dst_port;
+    udp_reorder_hold.len = payload_len;
+    if (payload_len > 0u) {
+      mem_copy(udp_reorder_hold.data, payload, payload_len);
+    }
+    return 1;
+  }
+
+  return udp_enqueue_packet(dst_port, src_ip, src_port, payload, payload_len);
+}
+
 static int net_handle_udp_datagram(uint32_t src_ip, uint32_t dst_ip,
                                    const uint8_t *udp_packet,
                                    uint16_t udp_len) {
@@ -961,6 +1088,7 @@ static int net_handle_udp_datagram(uint32_t src_ip, uint32_t dst_ip,
   (void)dst_ip;
 
   if (udp_packet == 0 || udp_len < 8u) {
+    net_count_malformed();
     return 0;
   }
 
@@ -970,6 +1098,7 @@ static int net_handle_udp_datagram(uint32_t src_ip, uint32_t dst_ip,
   checksum = read_be16(&udp_packet[6]);
 
   if (header_len < 8u || header_len > udp_len) {
+    net_count_malformed();
     return 0;
   }
   payload_len = (uint16_t)(header_len - 8u);
@@ -978,6 +1107,7 @@ static int net_handle_udp_datagram(uint32_t src_ip, uint32_t dst_ip,
     uint8_t verify[1600];
     uint16_t verify_len = (uint16_t)(12u + header_len);
     if (verify_len > sizeof(verify)) {
+      net_count_malformed();
       return 0;
     }
 
@@ -988,11 +1118,12 @@ static int net_handle_udp_datagram(uint32_t src_ip, uint32_t dst_ip,
     write_be16(&verify[10], header_len);
     mem_copy(&verify[12], udp_packet, header_len);
     if (internet_checksum(verify, verify_len) != 0u) {
+      net_count_malformed();
       return 0;
     }
   }
 
-  return udp_enqueue_packet(dst_port, src_ip, src_port, &udp_packet[8], payload_len);
+  return udp_enqueue_with_faults(dst_port, src_ip, src_port, &udp_packet[8], payload_len);
 }
 
 static uint16_t internet_checksum(const uint8_t *data, uint32_t len) {
@@ -1349,7 +1480,7 @@ static int net_handle_ipv4_frame(const uint8_t *frame, uint16_t len) {
   const uint8_t *ip = &frame[14];
 
   if (frame == 0 || len < 34u) {
-    net_rx_stats.dropped_frames++;
+    net_count_malformed();
     return 0;
   }
 
@@ -1362,18 +1493,18 @@ static int net_handle_ipv4_frame(const uint8_t *frame, uint16_t len) {
 
   header_len = (uint16_t)((version_ihl & 0x0Fu) * 4u);
   if (header_len < 20u || header_len > 60u || len < (uint16_t)(14u + header_len)) {
-    net_rx_stats.dropped_frames++;
+    net_count_malformed();
     return 0;
   }
 
   total_len = read_be16(&frame[16]);
   if (total_len < header_len || len < (uint16_t)(14u + total_len)) {
-    net_rx_stats.dropped_frames++;
+    net_count_malformed();
     return 0;
   }
 
   if (internet_checksum(&frame[14], header_len) != 0u) {
-    net_rx_stats.dropped_frames++;
+    net_count_malformed();
     return 0;
   }
 
@@ -1453,7 +1584,7 @@ static int net_handle_arp_frame(const uint8_t *frame, uint16_t len) {
   const uint8_t *target_mac;
 
   if (frame == 0 || len < 42) {
-    net_rx_stats.dropped_frames++;
+    net_count_malformed();
     return 0;
   }
 
@@ -1508,6 +1639,32 @@ static uint32_t remote_checksum32(const uint8_t *data, uint32_t len) {
   return hash;
 }
 
+static void remote_seed_nonce_state(void) {
+  remote_nonce_state = remote_token ^ remote_session ^ remote_key_epoch ^ 0x9E3779B9u;
+  if (remote_nonce_state == 0u) {
+    remote_nonce_state = 0xA341316Cu;
+  }
+}
+
+static uint32_t remote_next_nonce(uint32_t request_id) {
+  remote_nonce_state ^= remote_nonce_state << 13;
+  remote_nonce_state ^= remote_nonce_state >> 17;
+  remote_nonce_state ^= remote_nonce_state << 5;
+  remote_nonce_state ^= request_id;
+  if (remote_nonce_state == 0u) {
+    remote_nonce_state = 0x7F4A7C15u ^ request_id;
+  }
+  return remote_nonce_state;
+}
+
+static void remote_rotate_session_key_internal(void) {
+  uint32_t base = (tick ^ remote_token ^ (remote_key_epoch * 0x45D9F3Bu));
+  remote_key_epoch++;
+  remote_session = (base | 1u);
+  remote_seq = 1u;
+  remote_seed_nonce_state();
+}
+
 static int remote_auth_valid(void) {
   if (remote_token == 0) {
     return 0;
@@ -1516,6 +1673,9 @@ static int remote_auth_valid(void) {
     return 0;
   }
   if (tick > remote_auth_deadline) {
+    return 0;
+  }
+  if (remote_role < REMOTE_ROLE_VIEWER || remote_role > REMOTE_ROLE_ADMIN) {
     return 0;
   }
   return 1;
@@ -1708,6 +1868,29 @@ void net_get_rx_stats(NetRxStats *out) {
   *out = net_rx_stats;
 }
 
+void net_set_fault_injection(uint32_t loss_percent, uint32_t reorder_percent) {
+  if (loss_percent > 100u) {
+    loss_percent = 100u;
+  }
+  if (reorder_percent > 100u) {
+    reorder_percent = 100u;
+  }
+  net_fault_loss_percent = loss_percent;
+  net_fault_reorder_percent = reorder_percent;
+  if (loss_percent == 0u && reorder_percent == 0u) {
+    udp_reorder_hold.valid = 0;
+  }
+}
+
+void net_get_fault_injection(uint32_t *loss_percent, uint32_t *reorder_percent) {
+  if (loss_percent != 0) {
+    *loss_percent = net_fault_loss_percent;
+  }
+  if (reorder_percent != 0) {
+    *reorder_percent = net_fault_reorder_percent;
+  }
+}
+
 static int rtl8139_send_frame(const uint8_t *frame, uint32_t len) {
   uint32_t tx_addr_port;
   uint32_t tx_stat_port;
@@ -1752,6 +1935,10 @@ static int net_send_udp(uint32_t dst_ip, uint16_t src_port, uint16_t dst_port,
     mem_copy(&udp_packet[8], payload, payload_len);
   }
 
+  if (dst_ip == net_ip || dst_ip == 0x7F000001u || dst_ip == 0xFFFFFFFFu) {
+    (void)udp_enqueue_with_faults(dst_port, net_ip, src_port, payload, payload_len);
+  }
+
   return net_send_ipv4_raw(dst_ip, (uint8_t)IP_PROTO_UDP, udp_packet, udp_len,
                            64u, ipv4_tx_ident++);
 }
@@ -1781,6 +1968,8 @@ static int remote_send_payload(uint8_t type, const uint8_t *data, uint16_t len,
   header.session = be32(remote_session);
   header.request_id = be32(request_id);
   header.token = be32(remote_token);
+  header.nonce = be32(remote_next_nonce(request_id));
+  header.role = be32(remote_role);
   header.checksum = 0;
   header.status = be32(status);
   header.payload_len = be32((uint32_t)len);
@@ -1900,10 +2089,21 @@ int net_init(void) {
   net_rx_stats.neuro_frames = 0;
   net_rx_stats.unknown_frames = 0;
   net_rx_stats.dropped_frames = 0;
+  net_rx_stats.malformed_frames = 0;
+  net_rx_stats.quarantined_frames = 0;
+  net_rx_stats.injected_loss_frames = 0;
+  net_rx_stats.injected_reorder_frames = 0;
+  net_rx_stats.tcp_retransmits = 0;
+  net_rx_stats.tcp_retransmit_failures = 0;
+  net_rx_stats.tcp_half_open_cleanups = 0;
+  net_rx_stats.tcp_reset_events = 0;
   net_rx_stats.irq_count = 0;
   net_rx_stats.irq_rx_events = 0;
   net_rx_stats.tx_probe_ok = 0;
   net_rx_stats.tx_probe_fail = 0;
+  net_fault_loss_percent = 0u;
+  net_fault_reorder_percent = 0u;
+  udp_reorder_hold.valid = 0;
   route_table_refresh_defaults();
   ipv4_tx_ident = 1u;
   for (int i = 0; i < IPV4_REASS_SLOT_MAX; i++) {
@@ -1942,7 +2142,7 @@ int net_init(void) {
   }
   net_ready = rtl8139_hw_init(rtl_iobase);
   if (net_ready && remote_session == 0) {
-    remote_session = (tick ^ 0x4E53504Bu) | 1u;
+    remote_rotate_session_key_internal();
   }
   return net_ready;
 }
@@ -2495,11 +2695,15 @@ void remote_set_enabled(int enabled) { remote_enabled = enabled ? 1 : 0; }
 
 int remote_is_enabled(void) { return remote_enabled; }
 
-void remote_set_token(uint32_t token) { remote_token = token; }
+void remote_set_token(uint32_t token) {
+  remote_token = token;
+  remote_seed_nonce_state();
+}
 
 void remote_set_auth(uint32_t token, uint32_t ttl_ticks) {
   remote_token = token;
   remote_auth_deadline = ttl_ticks ? (tick + ttl_ticks) : 0;
+  remote_rotate_session_key_internal();
 }
 
 void remote_clear_auth(void) {
@@ -2515,10 +2719,24 @@ uint32_t remote_get_auth_deadline(void) { return remote_auth_deadline; }
 
 uint32_t remote_get_session(void) {
   if (remote_session == 0) {
-    remote_session = (tick ^ 0x4E53504Bu) | 1u;
+    remote_rotate_session_key_internal();
   }
   return remote_session;
 }
+
+void remote_rotate_session_key(void) { remote_rotate_session_key_internal(); }
+
+void remote_set_role(uint32_t role) {
+  if (role < REMOTE_ROLE_VIEWER) {
+    role = REMOTE_ROLE_VIEWER;
+  }
+  if (role > REMOTE_ROLE_ADMIN) {
+    role = REMOTE_ROLE_ADMIN;
+  }
+  remote_role = role;
+}
+
+uint32_t remote_get_role(void) { return remote_role; }
 
 int remote_send_command_result(const char *cmd_text) {
   uint8_t payload[128];
@@ -2526,6 +2744,9 @@ int remote_send_command_result(const char *cmd_text) {
   uint32_t request_id;
 
   if (!remote_enabled || !net_ready || cmd_text == 0 || !remote_auth_valid()) {
+    return 0;
+  }
+  if (remote_role < REMOTE_ROLE_OPERATOR) {
     return 0;
   }
 
