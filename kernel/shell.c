@@ -17,6 +17,9 @@
 #include "page_cache.h"
 #include "module_loader.h"
 #include "posix.h"
+#include "usb_core.h"
+#include "usb_xhci.h"
+#include "audio.h"
 
 typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
@@ -630,6 +633,7 @@ static void cmd_help(const char *args) {
   (void)args;
   gprint("commands: help save load ls stat mount umount pcache diag clear delete eval stim mall free map\n", 0xFFFFFF);
     gprint("          tsave tload pci pci bar ahci [show|backend|reset|identify|read|smoke]\n", 0xFFFFFF);
+    gprint("          usb tree|info|reset [id|all]  audio list|play|stop|stat\n", 0xFFFFFF);
     gprint("          exec <path> mkdemo net up|cfg|status|coalesce|tx|export|profile|manifest remote ...\n", 0xFFFFFF);
   gprint("phase8:   manifest save|load|show  replay rec on|off|run|show|clear\n", 0x88E0FF);
   gprint("          dataset export <path>  dataset import <path>\n", 0x88E0FF);
@@ -652,6 +656,7 @@ static void cmd_help(const char *args) {
   gprint("          net coalesce <poll> <irqpoll>\n", 0x77C8FF);
   gprint("phase28:  kdbg show|stack|mem|trace  trace <pid> on|off|show\n", 0x77C8FF);
   gprint("          profile samples [n]  profile export <path>\n", 0x77C8FF);
+  gprint("phase31:  audio play [hz] [vol]  audio stop [id|all]  audio stat  sonify on|off|stat\n", 0x77C8FF);
   gprint("system:   tz show | tz set <+HH[:MM]|-HH[:MM]>\n", 0x77C8FF);
 }
 
@@ -3769,6 +3774,438 @@ static void cmd_pci(const char *args) {
   }
 }
 
+static void cmd_usb(const char *args) {
+  char sub[16];
+  char arg1[16];
+  UsbXhciReport xhci;
+  UsbCoreStats stats;
+
+  args = next_token(args, sub, sizeof(sub));
+  next_token(args, arg1, sizeof(arg1));
+
+  if (!usb_core_is_ready()) {
+    set_cmd_output("USB OFFLINE");
+    return;
+  }
+
+  if (sub[0] == '\0' || str_eq(sub, "tree")) {
+    UsbDeviceInfo devs[USB_MAX_DEVICES];
+    int count = usb_core_get_devices(devs, USB_MAX_DEVICES);
+
+    usb_xhci_get_report(&xhci);
+    gprint("USB XHCI B", 0x99EEFF);
+    gprint_hex(xhci.bus, 2, 0xFFFFFF);
+    gprint(":D", 0x99EEFF);
+    gprint_hex(xhci.slot, 2, 0xFFFFFF);
+    gprint(":F", 0x99EEFF);
+    gprint_hex(xhci.function, 2, 0xFFFFFF);
+    gprint(" MMIO=", 0x99EEFF);
+    gprint_hex(xhci.mmio_base, 8, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("ROOT PORTS ", 0x99EEFF);
+    gprint_dec((int)xhci.ports_total, 0xFFFFFF);
+    gprint(" CONNECTED ", 0x99EEFF);
+    gprint_dec((int)xhci.ports_connected, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    if (count == 0) {
+      gprint("  <no usb devices>\n", 0xFFAA66);
+      set_cmd_output("USB TREE EMPTY");
+      return;
+    }
+
+    for (int i = 0; i < count; i++) {
+      gprint("  dev", 0xAAAAAA);
+      gprint_dec(devs[i].id, 0xFFFFFF);
+      gprint(" addr", 0xAAAAAA);
+      gprint_dec(devs[i].address, 0xFFFFFF);
+      gprint(" p", 0xAAAAAA);
+      gprint_dec(devs[i].port + 1, 0xFFFFFF);
+      gprint(" class=", 0xAAAAAA);
+      gprint_hex(devs[i].class_code, 2, 0xFFFFFF);
+      gprint(" vid:pid=", 0xAAAAAA);
+      gprint_hex(devs[i].vendor_id, 4, 0xFFFFFF);
+      gprint(":", 0x666666);
+      gprint_hex(devs[i].product_id, 4, 0xFFFFFF);
+      gprint(" drv=", 0xAAAAAA);
+      gprint((char *)usb_core_driver_name(devs[i].driver), 0x77FFAA);
+      if (devs[i].quarantined) {
+        gprint(" QUAR", 0xFF5555);
+      }
+      gprint("\n", 0x000000);
+    }
+
+    set_cmd_output("USB TREE");
+    return;
+  }
+
+  if (str_eq(sub, "info")) {
+    usb_core_get_stats(&stats);
+    usb_xhci_get_report(&xhci);
+
+    gprint("USB stats enum/attach/detach ", 0x99EEFF);
+    gprint_dec((int)stats.enumerate_cycles, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)stats.attach_events, 0x77FFAA);
+    gprint("/", 0x666666);
+    gprint_dec((int)stats.detach_events, 0xFFAA66);
+    gprint("\n", 0x000000);
+
+    gprint("USB reset ok/fail errors ", 0x99EEFF);
+    gprint_dec((int)stats.reset_ok, 0x77FFAA);
+    gprint("/", 0x666666);
+    gprint_dec((int)stats.reset_fail, 0xFFAA66);
+    gprint("/", 0x666666);
+    gprint_dec((int)stats.errors, 0xFFAA66);
+    gprint("\n", 0x000000);
+
+    gprint("xHCI enum/hotplug resetOK/resetFAIL ", 0x99EEFF);
+    gprint_dec((int)xhci.enumerate_cycles, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)xhci.hotplug_events, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)xhci.reset_ok, 0x77FFAA);
+    gprint("/", 0x666666);
+    gprint_dec((int)xhci.reset_fail, 0xFFAA66);
+    gprint("\n", 0x000000);
+
+    set_cmd_output("USB INFO");
+    return;
+  }
+
+  if (str_eq(sub, "reset")) {
+    if (arg1[0] == '\0' || str_eq(arg1, "all")) {
+      if (usb_core_reset_all()) {
+        set_cmd_output("USB RESET ALL OK");
+      } else {
+        set_cmd_output("USB RESET ALL FAIL");
+      }
+      return;
+    }
+
+    if (!is_dec_number(arg1)) {
+      set_cmd_output("USAGE: usb reset [id|all]");
+      return;
+    }
+
+    if (usb_core_reset_device(parse_u32_dec(arg1))) {
+      set_cmd_output("USB RESET OK");
+    } else {
+      set_cmd_output("USB RESET FAIL");
+    }
+    return;
+  }
+
+  set_cmd_output("USAGE: usb tree|info|reset [id|all]");
+}
+
+static void cmd_audio(const char *args) {
+  char sub[16];
+  char arg1[16];
+  char arg2[16];
+  AudioStream streams[AUDIO_MAX_STREAMS];
+  AudioStats stats;
+
+  args = next_token(args, sub, sizeof(sub));
+  args = next_token(args, arg1, sizeof(arg1));
+  next_token(args, arg2, sizeof(arg2));
+
+  if (sub[0] == '\0' || str_eq(sub, "list")) {
+    int count = audio_get_streams(streams, AUDIO_MAX_STREAMS);
+    int active = 0;
+
+    gprint("AUDIO STREAMS (max 8)\n", 0x99EEFF);
+    for (int i = 0; i < count; i++) {
+      if (!streams[i].active) {
+        continue;
+      }
+      active++;
+      gprint("  id=", 0xAAAAAA);
+      gprint_dec(streams[i].id, 0xFFFFFF);
+      gprint(" hz=", 0xAAAAAA);
+      gprint_dec((int)streams[i].freq_hz, 0xFFFFFF);
+      gprint(" vol=", 0xAAAAAA);
+      gprint_dec(streams[i].volume_pct, 0xFFFFFF);
+      gprint("% underrun=", 0xAAAAAA);
+      gprint_dec((int)streams[i].underruns, 0xFFFFFF);
+      gprint("\n", 0x000000);
+    }
+    if (!active) {
+      gprint("  <no active streams>\n", 0xFFAA66);
+    }
+    set_cmd_output("AUDIO LIST");
+    return;
+  }
+
+  if (str_eq(sub, "play")) {
+    int freq = 440;
+    int vol = 60;
+    int id;
+
+    if (arg1[0] != '\0') {
+      if (!is_dec_number(arg1)) {
+        set_cmd_output("USAGE: audio play [hz] [vol]");
+        return;
+      }
+      freq = parse_u32_dec(arg1);
+    }
+    if (arg2[0] != '\0') {
+      if (!is_dec_number(arg2)) {
+        set_cmd_output("USAGE: audio play [hz] [vol]");
+        return;
+      }
+      vol = parse_u32_dec(arg2);
+    }
+
+    id = audio_play_tone((uint32_t)freq, vol);
+    if (id < 0) {
+      set_cmd_output("AUDIO PLAY FAIL");
+      return;
+    }
+
+    gprint("AUDIO PLAY id=", 0x44FF88);
+    gprint_dec(id, 0xFFFFFF);
+    gprint(" hz=", 0x99EEFF);
+    gprint_dec(freq, 0xFFFFFF);
+    gprint(" vol=", 0x99EEFF);
+    gprint_dec(vol, 0xFFFFFF);
+    gprint("%\n", 0x000000);
+    set_cmd_output("AUDIO PLAY");
+    return;
+  }
+
+  if (str_eq(sub, "stop")) {
+    if (arg1[0] == '\0' || str_eq(arg1, "all")) {
+      audio_stop_all();
+      set_cmd_output("AUDIO STOP ALL");
+      return;
+    }
+    if (!is_dec_number(arg1)) {
+      set_cmd_output("USAGE: audio stop [id|all]");
+      return;
+    }
+    if (!audio_stop_stream(parse_u32_dec(arg1))) {
+      set_cmd_output("AUDIO STOP FAIL");
+      return;
+    }
+    set_cmd_output("AUDIO STOP");
+    return;
+  }
+
+  if (str_eq(sub, "stat")) {
+    audio_get_stats(&stats);
+    gprint("AUDIO tickHz=", 0x99EEFF);
+    gprint_dec((int)stats.tick_hz, 0xFFFFFF);
+    gprint(" active=", 0x99EEFF);
+    gprint_dec((int)stats.active_streams, 0xFFFFFF);
+    gprint(" mix=", 0x99EEFF);
+    gprint_dec((int)stats.mix_samples, 0xFFFFFF);
+    gprint(" underrun=", 0x99EEFF);
+    gprint_dec((int)stats.mix_underruns, 0xFFFFFF);
+    gprint(" overrun=", 0x99EEFF);
+    gprint_dec((int)stats.output_overruns, 0xFFFFFF);
+    gprint("\n", 0x000000);
+    set_cmd_output("AUDIO STAT");
+    return;
+  }
+
+  if (str_eq(sub, "volume")) {
+    if (!is_dec_number(arg1) || !is_dec_number(arg2)) {
+      set_cmd_output("USAGE: audio volume <id> <0..100>");
+      return;
+    }
+    if (!audio_set_stream_volume(parse_u32_dec(arg1), parse_u32_dec(arg2))) {
+      set_cmd_output("AUDIO VOLUME FAIL");
+      return;
+    }
+    set_cmd_output("AUDIO VOLUME");
+    return;
+  }
+
+  set_cmd_output("USAGE: audio list|play [hz] [vol]|stop [id|all]|stat|volume <id> <0..100>");
+}
+
+static void cmd_sonify(const char *args) {
+  char sub[16];
+  char arg1[16];
+  char arg2[16];
+  AudioStats stats;
+  uint32_t base = 220;
+  uint32_t span = 880;
+
+  args = next_token(args, sub, sizeof(sub));
+  args = next_token(args, arg1, sizeof(arg1));
+  next_token(args, arg2, sizeof(arg2));
+
+  if (sub[0] == '\0' || str_eq(sub, "stat")) {
+    audio_get_stats(&stats);
+    gprint("SONIFY ", 0x99EEFF);
+    gprint(stats.sonify_enabled ? "ON" : "OFF", stats.sonify_enabled ? 0x77FFAA : 0xFFAA66);
+    gprint(" base=", 0x99EEFF);
+    gprint_dec((int)stats.sonify_base_hz, 0xFFFFFF);
+    gprint(" span=", 0x99EEFF);
+    gprint_dec((int)stats.sonify_span_hz, 0xFFFFFF);
+    gprint("\n", 0x000000);
+    set_cmd_output("SONIFY STAT");
+    return;
+  }
+
+  if (str_eq(sub, "off")) {
+    audio_sonify_set(0, 220, 880);
+    set_cmd_output("SONIFY OFF");
+    return;
+  }
+
+  if (str_eq(sub, "on")) {
+    if (arg1[0] != '\0') {
+      if (!is_dec_number(arg1)) {
+        set_cmd_output("USAGE: sonify on [base_hz] [span_hz]");
+        return;
+      }
+      base = (uint32_t)parse_u32_dec(arg1);
+    }
+    if (arg2[0] != '\0') {
+      if (!is_dec_number(arg2)) {
+        set_cmd_output("USAGE: sonify on [base_hz] [span_hz]");
+        return;
+      }
+      span = (uint32_t)parse_u32_dec(arg2);
+    }
+    audio_sonify_set(1, base, span);
+    set_cmd_output("SONIFY ON");
+    return;
+  }
+
+  set_cmd_output("USAGE: sonify on [base_hz] [span_hz]|off|stat");
+}
+
+static void cmd_usb(const char *args) {
+  char sub[16];
+  char arg1[16];
+  UsbXhciReport xhci;
+  UsbCoreStats stats;
+
+  args = next_token(args, sub, sizeof(sub));
+  next_token(args, arg1, sizeof(arg1));
+
+  if (!usb_core_is_ready()) {
+    set_cmd_output("USB OFFLINE");
+    return;
+  }
+
+  if (sub[0] == '\0' || str_eq(sub, "tree")) {
+    UsbDeviceInfo devs[USB_MAX_DEVICES];
+    int count = usb_core_get_devices(devs, USB_MAX_DEVICES);
+
+    usb_xhci_get_report(&xhci);
+    gprint("USB XHCI B", 0x99EEFF);
+    gprint_hex(xhci.bus, 2, 0xFFFFFF);
+    gprint(":D", 0x99EEFF);
+    gprint_hex(xhci.slot, 2, 0xFFFFFF);
+    gprint(":F", 0x99EEFF);
+    gprint_hex(xhci.function, 2, 0xFFFFFF);
+    gprint(" MMIO=", 0x99EEFF);
+    gprint_hex(xhci.mmio_base, 8, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    gprint("ROOT PORTS ", 0x99EEFF);
+    gprint_dec((int)xhci.ports_total, 0xFFFFFF);
+    gprint(" CONNECTED ", 0x99EEFF);
+    gprint_dec((int)xhci.ports_connected, 0xFFFFFF);
+    gprint("\n", 0x000000);
+
+    if (count == 0) {
+      gprint("  <no usb devices>\n", 0xFFAA66);
+      set_cmd_output("USB TREE EMPTY");
+      return;
+    }
+
+    for (int i = 0; i < count; i++) {
+      gprint("  dev", 0xAAAAAA);
+      gprint_dec(devs[i].id, 0xFFFFFF);
+      gprint(" addr", 0xAAAAAA);
+      gprint_dec(devs[i].address, 0xFFFFFF);
+      gprint(" p", 0xAAAAAA);
+      gprint_dec(devs[i].port + 1, 0xFFFFFF);
+      gprint(" class=", 0xAAAAAA);
+      gprint_hex(devs[i].class_code, 2, 0xFFFFFF);
+      gprint(" vid:pid=", 0xAAAAAA);
+      gprint_hex(devs[i].vendor_id, 4, 0xFFFFFF);
+      gprint(":", 0x666666);
+      gprint_hex(devs[i].product_id, 4, 0xFFFFFF);
+      gprint(" drv=", 0xAAAAAA);
+      gprint((char *)usb_core_driver_name(devs[i].driver), 0x77FFAA);
+      if (devs[i].quarantined) {
+        gprint(" QUAR", 0xFF5555);
+      }
+      gprint("\n", 0x000000);
+    }
+
+    set_cmd_output("USB TREE");
+    return;
+  }
+
+  if (str_eq(sub, "info")) {
+    usb_core_get_stats(&stats);
+    usb_xhci_get_report(&xhci);
+
+    gprint("USB stats enum/attach/detach ", 0x99EEFF);
+    gprint_dec((int)stats.enumerate_cycles, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)stats.attach_events, 0x77FFAA);
+    gprint("/", 0x666666);
+    gprint_dec((int)stats.detach_events, 0xFFAA66);
+    gprint("\n", 0x000000);
+
+    gprint("USB reset ok/fail errors ", 0x99EEFF);
+    gprint_dec((int)stats.reset_ok, 0x77FFAA);
+    gprint("/", 0x666666);
+    gprint_dec((int)stats.reset_fail, 0xFFAA66);
+    gprint("/", 0x666666);
+    gprint_dec((int)stats.errors, 0xFFAA66);
+    gprint("\n", 0x000000);
+
+    gprint("xHCI enum/hotplug resetOK/resetFAIL ", 0x99EEFF);
+    gprint_dec((int)xhci.enumerate_cycles, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)xhci.hotplug_events, 0xFFFFFF);
+    gprint("/", 0x666666);
+    gprint_dec((int)xhci.reset_ok, 0x77FFAA);
+    gprint("/", 0x666666);
+    gprint_dec((int)xhci.reset_fail, 0xFFAA66);
+    gprint("\n", 0x000000);
+
+    set_cmd_output("USB INFO");
+    return;
+  }
+
+  if (str_eq(sub, "reset")) {
+    if (arg1[0] == '\0' || str_eq(arg1, "all")) {
+      if (usb_core_reset_all()) {
+        set_cmd_output("USB RESET ALL OK");
+      } else {
+        set_cmd_output("USB RESET ALL FAIL");
+      }
+      return;
+    }
+
+    if (!is_dec_number(arg1)) {
+      set_cmd_output("USAGE: usb reset [id|all]");
+      return;
+    }
+
+    if (usb_core_reset_device(parse_u32_dec(arg1))) {
+      set_cmd_output("USB RESET OK");
+    } else {
+      set_cmd_output("USB RESET FAIL");
+    }
+    return;
+  }
+
+  set_cmd_output("USAGE: usb tree|info|reset [id|all]");
+}
+
 static void ahci_print_report(const AhciProbeReport *r) {
   if (r == 0 || !r->controller_found) {
     gprint("AHCI: no controller found\n", 0xFFAA66);
@@ -4138,6 +4575,9 @@ static const CommandEntry command_table[] = {
     {"map", cmd_map},   {"tsave", cmd_tsave}, {"tload", cmd_tload},
     {"pci", cmd_pci},   {"zoom+", cmd_zoomp}, {"zoom-", cmd_zoomm},
     {"ahci", cmd_ahci},
+    {"usb", cmd_usb},
+    {"audio", cmd_audio},
+    {"sonify", cmd_sonify},
     {"zpan+", cmd_zpanp},
     {"zpan-", cmd_zpanm},
     {"wipe", cmd_wipe},

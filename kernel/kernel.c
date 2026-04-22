@@ -17,6 +17,8 @@ extern void pmm_print_map();
 extern void init_paging();
 extern void wm_init(void);
 extern void wm_render(void);
+extern void audio_init(uint32_t tick_hz);
+extern void audio_tick(void);
 extern int storage_manifest_load(const char *path);
 extern int wm_focused_needs_keyboard(void);
 
@@ -26,6 +28,26 @@ extern uint32_t page_directory[1024];
 // Link to the address saved by the bootloader
 extern uint32_t vbe_framebuffer;
 static int graphics_enabled = 0;
+
+static void boot_trace(const char *msg) {
+  if (graphics_enabled) {
+    gprint((char *)msg, 0x44FF88);
+    gprint("\n", 0x000000);
+  } else {
+    kprint((char *)msg, 0, 0, 0x0F);
+  }
+}
+
+static void boot_marker(void) {
+  if (!graphics_enabled) {
+    return;
+  }
+
+  clear_region(0, 0, 240, 40, 0x000000);
+  gprint("NEUROSPARK BOOT\n", 0xFFFFFF);
+  gprint("GRAPHICS OK\n", 0x00FFFF);
+  flip_buffer();
+}
 
 // This will be our working pointer in the kernel
 uint32_t *lfb;
@@ -276,7 +298,6 @@ extern void gprint_hex(uint32_t val, int digits, uint32_t color);
 #include "model_manager.h"
 #include "module_loader.h"
 #include "posix.h"
-#include "audio.h"
 
 volatile int current_shell_row = SHELL_START_ROW;
 
@@ -359,6 +380,8 @@ int shell_line =
 static inline void outb(uint16_t port, uint8_t val) {
   __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
 }
+
+static inline void boot_dbg_mark(char c) { outb(0xE9, (uint8_t)c); }
 
 // Additional I/O functions for disk operations
 static inline uint8_t inb(uint16_t port) {
@@ -613,6 +636,7 @@ uint32_t tick = 0;
 uint32_t render_frame = 0;
 void timer_handler(void) {
   tick++;
+  audio_tick();
 
   if (profile_is_enabled() && (tick & 3u) == 0u && os_current_task >= 0 &&
       os_current_task < os_task_count) {
@@ -1507,6 +1531,8 @@ void neuro_task_entry() {
 
     /* Render the glass desktop shell and taskbar. */
     wm_render();
+    shell_render();
+    draw_cursor(tick);
 
     /* SYS_FLIP: blit backbuffer -> VRAM (CLI+STI guarded in syscall.c) */
     asm volatile("mov $10, %%eax; int $0x80" : : : "eax");
@@ -2121,14 +2147,18 @@ static void ahci_print_boot_report(const AhciProbeReport *report,
 
 /* 6. Kernel Entry Point */
 extern void pci_scan_all(); // Added for PCI Discovery
+extern void usb_core_init(void); // Added for USB Core Initialization
+extern void usb_core_poll(void); // Added for USB Core Polling
 extern void flip_buffer();
 extern void clear_screen(uint32_t color);
 extern void put_pixel(int x, int y, uint32_t color);
 
 __attribute__((section(".text.entry"))) void kernel_main(void) {
-
+  boot_dbg_mark('A');
   /* Bootloader may leave IF enabled; block IRQs until IDT is ready. */
   __asm__ volatile("cli");
+
+  kprint("BOOT: kernel_main\n", 0, 0, 0x0F);
 
   /* Deterministic startup: clear BSS even if firmware/loader doesn't. */
   extern uint32_t __bss_start;
@@ -2159,12 +2189,17 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
   vbe_pitch = *((volatile uint32_t *)0x504);
   vbe_bpp = *((volatile uint32_t *)0x508);
   graphics_enabled =
-      (vbe_framebuffer != 0) && (vbe_bpp == 24 || vbe_bpp == 32);
+      (vbe_framebuffer != 0) && (vbe_bpp == 16 || vbe_bpp == 24 || vbe_bpp == 32);
+  boot_dbg_mark('B');
+
+  kprint("BOOT: vbe handoff\n", 0, 0, 0x0F);
 
   // Load kernel-space GDT immediately so we don't depend on the bootloader's
   // GDT at 0x7C00 (which gets overwritten by BSS/page tables during
   // init_paging)
   load_kernel_gdt();
+
+  kprint("BOOT: gdt loaded\n", 0, 0, 0x0F);
 
   // --- Hardware Discovery ---
   // NOTE: pci_scan_all is called AFTER init_idt (below) to ensure
@@ -2239,7 +2274,11 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
   /* Setup the NeuroCore pulse */
   init_idt();      /* Register timer_handler and enable interrupts FIRST */
   init_timer(100); /* 100Hz frequency - now IDT is ready for IRQ0 */
+  audio_init(100);
   init_input_stack();
+  boot_dbg_mark('C');
+
+  kprint("BOOT: idt/timer/input\n", 0, 0, 0x0F);
 
   /* Detect ATA disk controller */
   ata_disk_available = ata_detect_disk();
@@ -2247,7 +2286,6 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
   vfs_init();
   module_loader_init();
   posix_init();
-  audio_init(100); /* Initialize audio mixer at 100Hz tick rate */
   profile_init();
   storage_manifest_load("/session.manifest");
 
@@ -2272,10 +2310,12 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
     /* the WM desktop layer instead of the old dashboard renderer. */
     wm_init();
   } else {
+    boot_trace("BOOT: text mode");
     kprint("TEXT MODE BOOT (NO VBE)", 0, 0, 0x0F);
   }
 
   init_pmm();
+  boot_dbg_mark('D');
 
   {
     uint32_t isr_stack = (uint32_t)pmm_alloc_page();
@@ -2285,14 +2325,35 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
   }
 
   init_paging(); // The "Nervous System" is now active — 8MB identity mapped
+  boot_dbg_mark('E');
 
   os_tasks[0].page_dir = (uint32_t)page_directory;
 
   if (graphics_enabled) {
-    /* Explicitly initialize graphics cursor (BSS may not be zeroed by bootloader)
-     */
+    /* Hardware graphics init now happens after paging so framebuffer access
+       is backed by the new page tables before we touch VRAM. */
+    init_graphics();
+
+    clear_screen(0x000044); // NeuroSpark dark blue
+
     extern int cursor_x;
     extern int cursor_y;
+    cursor_x = 0;
+    cursor_y = 10;
+
+    gprint("BOOT: graphics online\n", 0xFFFFFF);
+    gprint("TIMER ACTIVE - NEURO CORE PULSING\n", 0x00FFFF);
+
+    boot_marker();
+    boot_dbg_mark('F');
+    wm_init();
+    boot_dbg_mark('G');
+    wm_render();
+    boot_dbg_mark('H');
+    boot_marker();
+    flip_buffer();
+    boot_dbg_mark('I');
+
     cursor_x = 0;
     cursor_y = 120; /* Below status bar (top 100px) */
   }
@@ -2307,6 +2368,8 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
   }
 
   net_init();
+  boot_dbg_mark('J');
+  kprint("BOOT: net init\n", 0, 0, 0x0F);
 
   void init_syscalls();
   init_syscalls(); // Plug in 'int 0x80'
@@ -2357,6 +2420,7 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
    */
   /* to allow the background graphics task to render the UI each cycle. */
   extern void schedule();
+  boot_dbg_mark('K');
   while (1) {
     net_rx_poll();
     net_tcp_poll();
