@@ -1,4 +1,5 @@
 #include "audio.h"
+#include "audio_ac97.h"
 
 typedef int int32_t;
 
@@ -228,6 +229,7 @@ void audio_tick(void) {
   if (contributing > 0) {
     mixed = clamp_i32(mixed, -32768, 32767);
     mix_ring_push((int16_t)mixed);
+    audio_ac97_submit_frames(1u);
   }
 
   g_stats.active_streams = 0;
@@ -264,8 +266,13 @@ int audio_play_tone(uint32_t freq_hz, int volume_pct) {
 int audio_stream_open(uint32_t sample_rate, uint32_t channels,
                       uint32_t bits_per_sample, uint32_t flags) {
   int i;
+  uint32_t negotiated_rate = normalized_sample_rate(sample_rate);
+  uint32_t negotiated_channels = channels;
+  uint32_t negotiated_bits = bits_per_sample;
 
-  if ((channels != 1u && channels != 2u) || bits_per_sample != 16u) {
+  if (!audio_ac97_negotiate_format(negotiated_rate, channels, bits_per_sample,
+                                   &negotiated_rate, &negotiated_channels,
+                                   &negotiated_bits)) {
     return -2;
   }
 
@@ -279,9 +286,9 @@ int audio_stream_open(uint32_t sample_rate, uint32_t channels,
     s->volume_pct = 80;
     s->mode = AUDIO_STREAM_MODE_PCM;
     s->freq_hz = 0;
-    s->sample_rate = normalized_sample_rate(sample_rate);
-    s->channels = channels;
-    s->bits_per_sample = bits_per_sample;
+    s->sample_rate = negotiated_rate;
+    s->channels = negotiated_channels;
+    s->bits_per_sample = negotiated_bits;
     s->flags = flags;
     s->phase_accum = 0;
     s->phase_step = 0;

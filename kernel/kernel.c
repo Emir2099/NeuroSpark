@@ -19,6 +19,9 @@ extern void wm_init(void);
 extern void wm_render(void);
 extern void audio_init(uint32_t tick_hz);
 extern void audio_tick(void);
+extern void usb_core_init(void);
+extern void usb_core_poll(void);
+extern void audio_ac97_driver_init(void);
 extern int storage_manifest_load(const char *path);
 extern int wm_focused_needs_keyboard(void);
 
@@ -637,6 +640,7 @@ uint32_t render_frame = 0;
 void timer_handler(void) {
   tick++;
   audio_tick();
+  usb_core_poll();
 
   if (profile_is_enabled() && (tick & 3u) == 0u && os_current_task >= 0 &&
       os_current_task < os_task_count) {
@@ -2360,6 +2364,8 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
 
   /* PCI scan now happens safely AFTER IDT is set up */
   pci_scan_all();
+  usb_core_init();
+  audio_ac97_driver_init();
 
   {
     AhciProbeReport ahci_report;

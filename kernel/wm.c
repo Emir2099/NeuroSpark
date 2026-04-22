@@ -2224,9 +2224,10 @@ int wm_add_window(int x, int y, int w, int h, const char *title,
 }
 
 int wm_focused_needs_keyboard(void) {
-    if (wm_focused < 0 || wm_focused >= wm_window_count) return 0;
+    if (wm_focused < 0 || wm_focused >= wm_window_count) return 1;
     WmWindow *w = &wm_windows[wm_focused];
-    return w->visible && w->state != WM_STATE_MINIMIZED && w->needs_keyboard;
+    if (!w->visible || w->state == WM_STATE_MINIMIZED) return 1;
+    return w->needs_keyboard;
 }
 
 /* ------------------------------------------------------------ */
