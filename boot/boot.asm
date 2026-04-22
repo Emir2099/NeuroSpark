@@ -3,13 +3,9 @@
 
 KERNEL_OFFSET equ 0x10000
 KERNEL_SEGMENT equ 0x1000
-; INT 13h extended read commonly allows up to 127 sectors per request.
-; Read in multiple passes to support kernels larger than 127 sectors while
-; keeping each INT 13h request BIOS-safe.
+; INT 13h extended read allows up to 127 sectors per call.
+; The LBA loop in load_kernel reads 5 passes of 127 sectors (635 total = 325 KB).
 KERNEL_LOAD_SECTORS equ 127
-KERNEL_LOAD_EXTRA_SECTORS equ 127
-KERNEL_LOAD_THIRD_SECTORS equ 127
-KERNEL_LOAD_FOURTH_SECTORS equ 127
 %define FORCE_TEXT_MODE 0
 
 ; Entry point - BIOS loads us at 0x7c00
@@ -115,8 +111,9 @@ protected_mode:
     mov ss, ax
     
     ; Setup stack
-    ; Setup stack well above BSS (backbuffer ends at ~0x200000)
-    mov ebp, 0x400000
+    ; Setup stack well above BSS (backbuffer[1024*768] = 3MB from 0x100000,
+    ; plus audio + syscall BSS; total can reach ~0x500000+).
+    mov ebp, 0x800000
     mov esp, ebp
     
     ; Jump to kernel
@@ -138,30 +135,25 @@ load_kernel:
     int 0x13
     jc .try_chs              ; No LBA support, fallback to CHS
 
-    ; --- LBA path (preferred): two-pass read ---
-    mov si, dap              ; Pass 1: 127 sectors from LBA 1 -> 0x1000:0000
+    ; --- LBA path (preferred): loop-based multi-pass read ---
+    ; Load 5 passes of 127 sectors each (635 sectors = 325 KB)
+    mov cx, 5
+
+.lba_loop:
+    push cx
+    mov si, dap
     mov ah, 0x42
     mov dl, [BOOT_DRIVE]
     int 0x13
     jc disk_error
 
-    mov si, dap2             ; Pass 2: extra sectors from LBA 128 -> next segment
-    mov ah, 0x42
-    mov dl, [BOOT_DRIVE]
-    int 0x13
-    jc disk_error
+    ; Advance DAP: segment += 0x0FE0, LBA += 127
+    add word [dap+6], 0x0FE0
+    add dword [dap+8], 127
 
-    mov si, dap3             ; Pass 3: extra sectors from LBA 255 -> next segment
-    mov ah, 0x42
-    mov dl, [BOOT_DRIVE]
-    int 0x13
-    jc disk_error
-
-    mov si, dap4             ; Pass 4: extra sectors from LBA 382 -> next segment
-    mov ah, 0x42
-    mov dl, [BOOT_DRIVE]
-    int 0x13
-    jc disk_error
+    pop cx
+    dec cx
+    jnz .lba_loop
     ret
 
 .try_chs:
@@ -258,42 +250,16 @@ print_hex_digit:
 
 ; ----- DATA -----
 
-; Disk Address Packet for INT 13h AH=42h
+; Single Disk Address Packet (mutated in-place by .lba_loop)
 ALIGN 4
 dap:
     db 0x10                  ; Size of DAP (16 bytes)
     db 0                     ; Reserved
-    dw KERNEL_LOAD_SECTORS    ; Number of sectors to read
-    dw 0x0000                 ; Offset of destination buffer
-    dw KERNEL_SEGMENT         ; Segment of destination buffer
-    dq 1                      ; Start LBA (sector 1 = first sector after bootsector)
-
-dap2:
-    db 0x10
-    db 0
-    dw KERNEL_LOAD_EXTRA_SECTORS
-    dw 0x0000
-    ; Segment advance: 127 sectors * 512 bytes / 16 = 0x0FE0 paragraphs
-    dw (KERNEL_SEGMENT + 0x0FE0)
-    dq 128                    ; Continue loading from LBA 128
-
-dap3:
-    db 0x10
-    db 0
-    dw KERNEL_LOAD_THIRD_SECTORS
-    dw 0x0000
-    ; Segment advance: 2 * 0x0FE0 paragraphs from first load
-    dw (KERNEL_SEGMENT + 0x1FC0)
-    dq 255                    ; Continue loading from LBA 255
-
-dap4:
-    db 0x10
-    db 0
-    dw KERNEL_LOAD_FOURTH_SECTORS
-    dw 0x0000
-    ; Segment advance: 3 * 0x0FE0 paragraphs from first load
-    dw (KERNEL_SEGMENT + 0x2FA0)
-    dq 382                    ; Continue loading from LBA 382
+    dw 127                   ; Sectors per pass
+    dw 0x0000                ; Offset
+    dw KERNEL_SEGMENT        ; Segment (updated each pass: +0x0FE0)
+    dd 1                     ; LBA low  (updated each pass: +127)
+    dd 0                     ; LBA high
 
 ; GDT Definition
 gdt_start:

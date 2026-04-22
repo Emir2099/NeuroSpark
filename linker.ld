@@ -28,8 +28,8 @@ SECTIONS {
     }
 
     /* Jump BSS past the 1MB mark to avoid the BIOS ROM region (0xC0000-0xFFFFF).
-       The backbuffer (~1.9MB in BSS) would otherwise land in ROM addresses where
-       writes are silently ignored, causing a garbled noise band on screen. */
+       The backbuffer (~3MB in BSS) would otherwise land in ROM addresses where
+       writes are silently ignored, causing garbled rendering. */
     . = 0x100000;
 
     .bss : ALIGN(4096) {

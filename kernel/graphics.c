@@ -1,6 +1,7 @@
 /* Typedefs */
 typedef unsigned int uint32_t;
 typedef unsigned char uint8_t;
+typedef unsigned short uint16_t;
 
 int screen_w = 800;
 #define SCREEN_SIZE (screen_w * screen_h) 
@@ -26,6 +27,23 @@ void put_pixel(int x, int y, uint32_t color) {
 /* Fast Copy to VRAM (The Flip) */
 void flip_buffer() {
     if (vbe_framebuffer == 0) {
+        return;
+    }
+
+    if (vbe_bpp == 16) {
+        uint8_t* dst = (uint8_t*)vbe_framebuffer;
+        uint32_t pitch = vbe_pitch ? vbe_pitch : (screen_w * 2);
+        for (int y = 0; y < screen_h; y++) {
+            uint16_t* row = (uint16_t*)(dst + (y * pitch));
+            uint32_t* src = &backbuffer[y * screen_w];
+            for (int x = 0; x < screen_w; x++) {
+                uint32_t c = src[x];
+                uint16_t r = (uint16_t)((c >> 19) & 0x1F);
+                uint16_t g = (uint16_t)((c >> 10) & 0x3F);
+                uint16_t b = (uint16_t)((c >> 3) & 0x1F);
+                row[x] = (uint16_t)((r << 11) | (g << 5) | b);
+            }
+        }
         return;
     }
 

@@ -11,6 +11,8 @@ typedef unsigned char uint8_t;
 #include "disk.h"
 #include "module_loader.h"
 #include "posix.h"
+#include "audio.h"
+#include "uapi_audio.h"
 
 extern int is_user_range(const void *ptr, uint32_t size);
 
@@ -113,6 +115,9 @@ enum {
 #define SYS_SETSOCKOPT 85
 #define SYS_GETSOCKOPT 86
 #define SYS_SHUTDOWN 87
+#define SYS_AUDIO_OPEN 88
+#define SYS_AUDIO_WRITE 89
+#define SYS_AUDIO_CTL 90
 
 #define SIGKILL 9
 #define SIGINT 2
@@ -2929,6 +2934,78 @@ void syscall_handler(uint32_t *regs) {
     }
 
     syscall_complete(regs, syscall_num, NS_OK);
+    break;
+  }
+
+  case SYS_AUDIO_OPEN: {
+    const uapi_audio_open_t *req = (const uapi_audio_open_t *)regs[4];
+    int stream_id;
+
+    if (cpl == 3 && !validate_user_ptr(req, sizeof(uapi_audio_open_t))) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+    if (req == 0) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+
+    stream_id = audio_stream_open(req->sample_rate, req->channels,
+                                  req->bits_per_sample, req->flags);
+    if (stream_id < 0) {
+      syscall_complete(regs, syscall_num,
+                       stream_id == -2 ? NS_ERR_INVALID_ARG : NS_ERR_WOULD_BLOCK);
+      break;
+    }
+
+    syscall_complete(regs, syscall_num, (uint32_t)stream_id);
+    break;
+  }
+
+  case SYS_AUDIO_WRITE: {
+    int stream_id = (int)regs[4];
+    const void *pcm = (const void *)regs[6];
+    uint32_t bytes = regs[5];
+    int wrote;
+
+    if (cpl == 3 && !validate_user_ptr(pcm, bytes)) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+
+    wrote = audio_stream_write(stream_id, pcm, bytes);
+    if (wrote < 0) {
+      syscall_complete(regs, syscall_num, wrote == -3 ? NS_ERR_WOULD_BLOCK : NS_ERR_INVALID_ARG);
+      break;
+    }
+
+    syscall_complete(regs, syscall_num, (uint32_t)wrote);
+    break;
+  }
+
+  case SYS_AUDIO_CTL: {
+    const uapi_audio_ctl_t *req = (const uapi_audio_ctl_t *)regs[4];
+    int rc;
+
+    if (cpl == 3 && !validate_user_ptr(req, sizeof(uapi_audio_ctl_t))) {
+      syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
+      break;
+    }
+
+    if (req == 0) {
+      syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+      break;
+    }
+
+    if (req->stream_id < 0 || req->stream_id >= AUDIO_MAX_STREAMS) {
+      if (req->cmd != AUDIO_CTL_SONIFY) {
+        syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
+        break;
+      }
+    }
+
+    rc = audio_stream_ctl(req->stream_id, req->cmd, req->arg0, req->arg1);
+    syscall_complete(regs, syscall_num, rc ? NS_OK : NS_ERR_INVALID_ARG);
     break;
   }
 

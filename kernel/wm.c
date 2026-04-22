@@ -109,6 +109,8 @@ static uint32_t wm_last_fps_tick = 0;
 static uint32_t wm_last_fps_frames = 0;
 static uint32_t wm_fps_x10 = 0;
 
+static void bring_to_front(int idx);
+
 
 /* Taskbar icon labels */
 static const char *icon_labels[WM_ICON_SLOTS] = {
@@ -2195,6 +2197,11 @@ void wm_init(void) {
     wm_add_window(20, 26, 760, 500, "Model Manager App", draw_content_model_manager, 0, -1);
     wm_add_window(150, 150, screen_w, 360, "Replay Control App", draw_content_replay_control, 0, -1);
     model_ui_sync_from_kernel();
+
+    /* Boot directly into the console so the user gets an interactive UI immediately. */
+    wm_windows[2].visible = 1;
+    wm_windows[2].state = WM_STATE_NORMAL;
+    bring_to_front(2);
 }
 
 int wm_add_window(int x, int y, int w, int h, const char *title,
