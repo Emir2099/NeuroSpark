@@ -216,7 +216,7 @@ extern void disk_read_sector(uint32_t lba, uint16_t *buffer);
 #define MAX_FILES 4
 #define FILENAME_LEN 8
 
-#define COMMAND_MAX_LEN 32
+#define COMMAND_MAX_LEN SHELL_CMD_MAX
 
 #define AUTO_LAUNCH_USER_PROCESS 0
 #define AUTO_EXEC_DISK_ON_BOOT 0
@@ -299,6 +299,9 @@ extern void gprint_hex(uint32_t val, int digits, uint32_t color);
 #include "net.h"
 #include "profiling.h"
 #include "model_manager.h"
+#include "ai_runtime.h"
+#include "ai_scheduler.h"
+#include "ai_train.h"
 #include "module_loader.h"
 #include "posix.h"
 
@@ -2274,6 +2277,9 @@ __attribute__((section(".text.entry"))) void kernel_main(void) {
 
   /* Model parameters must be initialized before IRQ0 starts firing. */
   model_manager_init();
+  ai_runtime_init();
+  ai_scheduler_init();
+  ai_train_init();
 
   /* Setup the NeuroCore pulse */
   init_idt();      /* Register timer_handler and enable interrupts FIRST */

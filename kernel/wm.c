@@ -10,6 +10,7 @@ extern int screen_w; extern int screen_h;
  *   • Z-order management and focus tracking
  * ================================================================ */
 #include "wm.h"
+#include "shell.h"
 int storage_get_snapshot_tag(int slot, char *out, int out_len);
 
 int handle_replay_control_click(WmWindow *w, int mx, int my);
@@ -35,7 +36,7 @@ extern int cursor_y;
 
 extern uint32_t tick;
 extern int potentials[16];
-extern volatile char input_buffer[32];
+extern volatile char input_buffer[SHELL_CMD_MAX];
 extern volatile int buffer_idx;
 extern char cmd_output[256];
 extern int cmd_output_valid;
@@ -1329,7 +1330,7 @@ static void draw_content_console(int x, int y, int w, int h) {
     cursor_x = tx + 6;
     cursor_y = ty + th - 22;
     gprint("> ", 0x55FF88);
-    for (i = 0; i < buffer_idx && i < 31 && i < chars - 3; i++) {
+    for (i = 0; i < buffer_idx && i < SHELL_CMD_MAX - 1 && i < chars - 3; i++) {
         char ch[2];
         ch[0] = (char)input_buffer[i];
         ch[1] = '\0';
@@ -2917,7 +2918,7 @@ typedef struct {
 WmReplayState replay_state = {0, 0, -1};
 
 extern int shell_is_recording_replay(void);
-extern char replay_cmds[64][32];
+extern char replay_cmds[64][SHELL_CMD_MAX];
 extern int replay_count;
 
 static void draw_hex_button(int x, int y, int w, int h, const char *txt1, const char *txt2, uint32_t border_col, uint32_t fill_col) {
@@ -3045,10 +3046,10 @@ static void draw_content_replay_control(int x, int y, int w, int h) {
             
             if (replay_state.playing && phx >= px && p > replay_state.last_cmd_executed) {
                 replay_state.last_cmd_executed = p;
-                char cmd_copy[32];
+                char cmd_copy[SHELL_CMD_MAX];
                 extern void copy_cmd_text(char *, const char *, int);
                 int k = 0;
-                while (replay_cmds[p][k] && k < 31) {
+                while (replay_cmds[p][k] && k < SHELL_CMD_MAX - 1) {
                     cmd_copy[k] = replay_cmds[p][k];
                     k++;
                 }

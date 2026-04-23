@@ -1,11 +1,12 @@
 #include "input.h"
+#include "shell.h"
 #include "posix.h"
 
 typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
 
-extern volatile char input_buffer[32];
+extern volatile char input_buffer[SHELL_CMD_MAX];
 extern volatile int buffer_idx;
 extern volatile int shell_dirty;
 extern volatile char kb_buf[32];
@@ -240,10 +241,10 @@ void keyboard_handler(void) {
 
   if (code == 0x1C) {
     input_buffer[buffer_idx] = '\0';
-    char cmd_copy[32];
-    for (int i = 0; i <= buffer_idx && i < 32; i++)
+    char cmd_copy[SHELL_CMD_MAX];
+    for (int i = 0; i <= buffer_idx && i < SHELL_CMD_MAX; i++)
       cmd_copy[i] = input_buffer[i];
-    cmd_copy[31] = '\0';
+    cmd_copy[SHELL_CMD_MAX - 1] = '\0';
     process_command(cmd_copy);
     buffer_idx = 0;
     shell_dirty = 1;
@@ -298,7 +299,7 @@ void keyboard_handler(void) {
     return;
   }
 
-  if (c && buffer_idx < 31) {
+  if (c && buffer_idx < SHELL_CMD_MAX - 1) {
     input_buffer[buffer_idx++] = c;
     int next_head = (kb_head + 1) % 32;
     if (next_head != kb_tail) {

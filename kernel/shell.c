@@ -21,6 +21,9 @@
 #include "usb_xhci.h"
 #include "audio.h"
 #include "audio_ac97.h"
+#include "ai_runtime.h"
+#include "ai_scheduler.h"
+#include "ai_train.h"
 
 typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
@@ -77,7 +80,7 @@ typedef struct {
 } TaskControlBlock;
 
 extern volatile int current_shell_row;
-extern volatile char input_buffer[32];
+extern volatile char input_buffer[SHELL_CMD_MAX];
 extern volatile int buffer_idx;
 extern volatile int mouse_x;
 extern volatile int mouse_y;
@@ -489,7 +492,7 @@ static int require_admin_context(void) {
 }
 
 #define REPLAY_MAX_CMDS 64
-char replay_cmds[REPLAY_MAX_CMDS][32];
+char replay_cmds[REPLAY_MAX_CMDS][SHELL_CMD_MAX];
 int replay_count = 0;
 static int replay_recording = 0;
 static int replay_running = 0;
@@ -519,7 +522,7 @@ static void replay_record_command(const char *cmd) {
     return;
   }
   if (replay_count < REPLAY_MAX_CMDS) {
-    copy_cmd_text(replay_cmds[replay_count], cmd, 32);
+    copy_cmd_text(replay_cmds[replay_count], cmd, SHELL_CMD_MAX);
     replay_count++;
   }
 }
@@ -660,6 +663,7 @@ static void cmd_help(const char *args) {
   gprint("phase30/31: phasecheck [usb_cycles] [audio_frames]\n", 0x77C8FF);
   gprint("phase31:  audio play [hz] [vol]  audio stop [id|all]  audio stat\n", 0x77C8FF);
   gprint("          audio drv stat|reset|loopback [frames] [hz] [ch] [bits]  sonify on|off|stat\n", 0x77C8FF);
+  gprint("phase32:  ai model ls|load|verify  ai qos  ai infer  ai bench  ai train ...\n", 0x77C8FF);
   gprint("system:   tz show | tz set <+HH[:MM]|-HH[:MM]>\n", 0x77C8FF);
   set_cmd_output("HELP: pci usb audio help");
 }
@@ -1337,6 +1341,452 @@ static void cmd_stdp(const char *args) {
   set_cmd_output("USAGE: stdp on|off");
 }
 
+static const char *ai_backend_name(uint32_t backend) {
+  if (backend == AI_BACKEND_NEURO) {
+    return "neuro";
+  }
+  return "cpu";
+}
+
+static const char *ai_kind_name(uint32_t kind) {
+  if (kind == AI_MODEL_KIND_SNN) {
+    return "snn";
+  }
+  return "ann";
+}
+
+static int ai_parse_kind(const char *s, uint32_t *out_kind) {
+  if (str_ieq(s, "ann")) {
+    *out_kind = AI_MODEL_KIND_ANN;
+    return 1;
+  }
+  if (str_ieq(s, "snn")) {
+    *out_kind = AI_MODEL_KIND_SNN;
+    return 1;
+  }
+  return 0;
+}
+
+static int ai_parse_backend(const char *s, uint32_t *out_backend) {
+  if (str_ieq(s, "cpu")) {
+    *out_backend = AI_BACKEND_CPU;
+    return 1;
+  }
+  if (str_ieq(s, "neuro") || str_ieq(s, "npu")) {
+    *out_backend = AI_BACKEND_NEURO;
+    return 1;
+  }
+  return 0;
+}
+
+static void u32_to_hex8(uint32_t value, char out[9]) {
+  static const char hex[16] = "0123456789ABCDEF";
+  int i;
+  for (i = 0; i < 8; i++) {
+    uint32_t shift = (uint32_t)(28 - (i * 4));
+    out[i] = hex[(value >> shift) & 0xFu];
+  }
+  out[8] = '\0';
+}
+
+static void cmd_ai(const char *args) {
+  char sub[12];
+  char a[16];
+  char b[16];
+  char c[16];
+  char d[16];
+  char e[16];
+  char f[16];
+  AiRuntimeStats rt;
+  AiSchedulerStats sched;
+  AiTrainStats tr;
+
+  args = next_token(args, sub, sizeof(sub));
+  args = next_token(args, a, sizeof(a));
+  args = next_token(args, b, sizeof(b));
+  args = next_token(args, c, sizeof(c));
+  args = next_token(args, d, sizeof(d));
+  args = next_token(args, e, sizeof(e));
+  next_token(args, f, sizeof(f));
+
+  if (sub[0] == '\0' || str_eq(sub, "stat") || str_eq(sub, "show")) {
+    ai_runtime_get_stats(&rt);
+    ai_scheduler_get_stats(&sched);
+    ai_train_get_stats(&tr);
+
+    gprint("AI backend=", 0x99EEFF);
+    gprint((char *)ai_backend_name(rt.active_backend), 0x77FFAA);
+    gprint(" models=", 0x99EEFF);
+    gprint_dec((int)rt.model_count, 0xFFFFFF);
+    gprint(" infer(ok/fail)=", 0x99EEFF);
+    gprint_dec((int)rt.infer_ok, 0x77FFAA);
+    gprint("/", 0x99EEFF);
+    gprint_dec((int)rt.infer_fail, 0xFFAA66);
+    gprint("\n", 0x000000);
+
+    gprint("AI sched qos=", 0x99EEFF);
+    gprint((char *)(sched.qos_mode == AI_QOS_LATENCY ? "latency" : "throughput"),
+           0x77FFAA);
+    gprint(" budget=", 0x99EEFF);
+    gprint_dec((int)sched.budget_pct, 0xFFFFFF);
+    gprint("% q=", 0x99EEFF);
+    gprint_dec((int)sched.queue_depth, 0xFFFFFF);
+    gprint(" drop=", 0x99EEFF);
+    gprint_dec((int)sched.dropped, 0xFFAA66);
+    gprint("\n", 0x000000);
+
+    gprint("AI train ", 0x99EEFF);
+    gprint(tr.active ? "ON" : "OFF", tr.active ? 0x44FF88 : 0xFFAA66);
+    gprint(" paused=", 0x99EEFF);
+    gprint(tr.paused ? "1" : "0", 0xFFFFFF);
+    gprint(" steps=", 0x99EEFF);
+    gprint_dec((int)tr.total_steps, 0xFFFFFF);
+    gprint(" rollbacks=", 0x99EEFF);
+    gprint_dec((int)tr.rollbacks, 0xFFAA66);
+    gprint("\n", 0x000000);
+    set_cmd_output("AI STAT");
+    return;
+  }
+
+  if (str_eq(sub, "model")) {
+    if (a[0] == '\0' || str_eq(a, "ls")) {
+      AiModelInfo models[8];
+      int count = ai_runtime_list_models(models, 8);
+      char status[64];
+      int i;
+      gprint("AI MODELS\n", 0x99EEFF);
+      for (i = 0; i < count; i++) {
+        gprint("  ", 0x000000);
+        gprint(models[i].name, 0x77FFAA);
+        gprint(" kind=", 0x99EEFF);
+        gprint((char *)ai_kind_name(models[i].kind), 0xFFFFFF);
+        gprint(" v=", 0x99EEFF);
+        gprint_dec((int)models[i].version, 0xFFFFFF);
+        gprint(" backend=", 0x99EEFF);
+        gprint((char *)ai_backend_name(models[i].preferred_backend), 0xFFFFFF);
+        gprint("\n", 0x000000);
+      }
+      if (count == 0) {
+        gprint("  <empty>\n", 0xFFAA66);
+        set_cmd_output("AI MODEL LS EMPTY");
+        return;
+      }
+
+      copy_cmd_text(status, "AI MODEL LS FIRST=", sizeof(status));
+      {
+        int si = 0;
+        int ni = 0;
+        while (status[si]) {
+          si++;
+        }
+        while (models[0].name[ni] && si < (int)sizeof(status) - 1) {
+          status[si++] = models[0].name[ni++];
+        }
+        if (count > 1 && si < (int)sizeof(status) - 2) {
+          status[si++] = '+';
+        }
+        status[si] = '\0';
+      }
+      set_cmd_output(status);
+      return;
+    }
+
+    if (str_eq(a, "load")) {
+      uint32_t kind = AI_MODEL_KIND_ANN;
+      uint32_t backend = ai_runtime_get_backend();
+      uint32_t seed = tick;
+      uint32_t version = 1;
+      uint32_t provenance;
+
+      if (b[0] == '\0' || c[0] == '\0') {
+        set_cmd_output("USAGE: ai model load <name> <ann|snn> [cpu|neuro] [seed] [version]");
+        return;
+      }
+      if (!ai_parse_kind(c, &kind)) {
+        set_cmd_output("AI MODEL KIND ERR");
+        return;
+      }
+      if (d[0] != '\0') {
+        uint32_t parsed_backend = AI_BACKEND_CPU;
+        if (ai_parse_backend(d, &parsed_backend)) {
+          backend = parsed_backend;
+          if (e[0] != '\0' && is_dec_number(e)) {
+            seed = (uint32_t)parse_u32_dec(e);
+          }
+          if (f[0] != '\0' && is_dec_number(f)) {
+            version = (uint32_t)parse_u32_dec(f);
+          }
+        } else {
+          if (!is_dec_number(d)) {
+            set_cmd_output("AI MODEL ARG ERR");
+            return;
+          }
+          seed = (uint32_t)parse_u32_dec(d);
+          if (e[0] != '\0' && is_dec_number(e)) {
+            version = (uint32_t)parse_u32_dec(e);
+          }
+        }
+      }
+
+      provenance = tick ^ (version << 8);
+      if (ai_runtime_load_model(b, kind, version, backend, seed, provenance)) {
+        set_cmd_output("AI MODEL LOAD OK");
+      } else {
+        set_cmd_output("AI MODEL LOAD FAIL");
+      }
+      return;
+    }
+
+    if (str_eq(a, "verify")) {
+      uint32_t checksum = 0;
+      char hexsum[9];
+      char status[48];
+      int si = 0;
+      int hi = 0;
+      if (b[0] == '\0') {
+        set_cmd_output("USAGE: ai model verify <name>");
+        return;
+      }
+      if (!ai_runtime_verify_model(b, &checksum)) {
+        set_cmd_output("AI MODEL VERIFY FAIL");
+        return;
+      }
+      gprint("AI VERIFY ", 0x99EEFF);
+      gprint(b, 0x77FFAA);
+      gprint(" checksum=", 0x99EEFF);
+      gprint_hex(checksum, 8, 0xFFFFFF);
+      gprint("\n", 0x000000);
+      u32_to_hex8(checksum, hexsum);
+      copy_cmd_text(status, "AI VERIFY OK 0x", sizeof(status));
+      while (status[si]) {
+        si++;
+      }
+      while (hexsum[hi] && si < (int)sizeof(status) - 1) {
+        status[si++] = hexsum[hi++];
+      }
+      status[si] = '\0';
+      set_cmd_output(status);
+      return;
+    }
+
+    set_cmd_output("USAGE: ai model ls|load|verify");
+    return;
+  }
+
+  if (str_eq(sub, "qos")) {
+    if (a[0] == '\0' || str_eq(a, "show")) {
+      ai_scheduler_get_stats(&sched);
+      gprint("AI QOS ", 0x99EEFF);
+      gprint((char *)(sched.qos_mode == AI_QOS_LATENCY ? "latency" : "throughput"),
+             0x77FFAA);
+      gprint(" budget=", 0x99EEFF);
+      gprint_dec((int)sched.budget_pct, 0xFFFFFF);
+      gprint("%\n", 0x000000);
+      set_cmd_output("AI QOS SHOW");
+      return;
+    }
+
+    {
+      uint32_t mode;
+      uint32_t budget = 50;
+      if (str_eq(a, "latency")) {
+        mode = AI_QOS_LATENCY;
+      } else if (str_eq(a, "throughput")) {
+        mode = AI_QOS_THROUGHPUT;
+      } else {
+        set_cmd_output("USAGE: ai qos [latency|throughput] [budget_pct]");
+        return;
+      }
+
+      if (b[0] != '\0') {
+        if (!is_dec_number(b)) {
+          set_cmd_output("AI QOS BUDGET ERR");
+          return;
+        }
+        budget = (uint32_t)parse_u32_dec(b);
+      }
+
+      if (ai_scheduler_set_qos(mode, budget)) {
+        set_cmd_output("AI QOS OK");
+      } else {
+        set_cmd_output("AI QOS FAIL");
+      }
+      return;
+    }
+  }
+
+  if (str_eq(sub, "infer")) {
+    int input_val;
+    uint32_t seed = 0;
+    int out = 0;
+
+    if (a[0] == '\0' || b[0] == '\0' || !is_dec_number(b)) {
+      set_cmd_output("USAGE: ai infer <model> <input> [seed]");
+      return;
+    }
+    input_val = parse_u32_dec(b);
+    if (c[0] != '\0') {
+      if (!is_dec_number(c)) {
+        set_cmd_output("AI INFER SEED ERR");
+        return;
+      }
+      seed = (uint32_t)parse_u32_dec(c);
+    }
+
+    if (!ai_scheduler_submit_infer(a, input_val, seed, &out)) {
+      set_cmd_output("AI INFER FAIL");
+      return;
+    }
+
+    gprint("AI INFER out=", 0x99EEFF);
+    gprint_dec(out, 0x77FFAA);
+    gprint("\n", 0x000000);
+    set_cmd_output("AI INFER OK");
+    return;
+  }
+
+  if (str_eq(sub, "bench")) {
+    int rounds = 128;
+    int input_val = 1;
+    uint32_t seed = 1;
+    uint32_t ok = 0;
+    uint32_t avg_lat = 0;
+    uint32_t max_lat = 0;
+
+    if (a[0] == '\0') {
+      set_cmd_output("USAGE: ai bench <model> [rounds] [input] [seed]");
+      return;
+    }
+    if (b[0] != '\0') {
+      if (!is_dec_number(b)) {
+        set_cmd_output("AI BENCH ROUNDS ERR");
+        return;
+      }
+      rounds = parse_u32_dec(b);
+    }
+    if (c[0] != '\0') {
+      if (!is_dec_number(c)) {
+        set_cmd_output("AI BENCH INPUT ERR");
+        return;
+      }
+      input_val = parse_u32_dec(c);
+    }
+    if (d[0] != '\0') {
+      if (!is_dec_number(d)) {
+        set_cmd_output("AI BENCH SEED ERR");
+        return;
+      }
+      seed = (uint32_t)parse_u32_dec(d);
+    }
+
+    if (!ai_scheduler_run_bench(a, rounds, input_val, seed,
+                                &ok, &avg_lat, &max_lat)) {
+      set_cmd_output("AI BENCH FAIL");
+      return;
+    }
+
+    gprint("AI BENCH ok=", 0x99EEFF);
+    gprint_dec((int)ok, 0x77FFAA);
+    gprint(" avg=", 0x99EEFF);
+    gprint_dec((int)avg_lat, 0xFFFFFF);
+    gprint(" max=", 0x99EEFF);
+    gprint_dec((int)max_lat, 0xFFFFFF);
+    gprint("\n", 0x000000);
+    set_cmd_output("AI BENCH OK");
+    return;
+  }
+
+  if (str_eq(sub, "train")) {
+    if (a[0] == '\0' || str_eq(a, "stat")) {
+      ai_train_get_stats(&tr);
+      gprint("AI TRAIN model=", 0x99EEFF);
+      gprint(tr.model_name[0] ? tr.model_name : "<none>", 0x77FFAA);
+      gprint(" active=", 0x99EEFF);
+      gprint_dec((int)tr.active, 0xFFFFFF);
+      gprint(" paused=", 0x99EEFF);
+      gprint_dec((int)tr.paused, 0xFFFFFF);
+      gprint(" steps=", 0x99EEFF);
+      gprint_dec((int)tr.total_steps, 0xFFFFFF);
+      gprint(" driftAlm=", 0x99EEFF);
+      gprint_dec((int)tr.drift_alarms, 0xFFAA66);
+      gprint("\n", 0x000000);
+      set_cmd_output("AI TRAIN STAT");
+      return;
+    }
+
+    if (str_eq(a, "start")) {
+      uint32_t lr_ppm = 100;
+      uint32_t max_drift = 5000;
+      if (b[0] == '\0') {
+        set_cmd_output("USAGE: ai train start <model> [lr_ppm] [max_drift]");
+        return;
+      }
+      if (c[0] != '\0') {
+        if (!is_dec_number(c)) {
+          set_cmd_output("AI TRAIN LR ERR");
+          return;
+        }
+        lr_ppm = (uint32_t)parse_u32_dec(c);
+      }
+      if (d[0] != '\0') {
+        if (!is_dec_number(d)) {
+          set_cmd_output("AI TRAIN DRIFT ERR");
+          return;
+        }
+        max_drift = (uint32_t)parse_u32_dec(d);
+      }
+
+      if (ai_train_start(b, lr_ppm, max_drift)) {
+        set_cmd_output("AI TRAIN START OK");
+      } else {
+        set_cmd_output("AI TRAIN START FAIL");
+      }
+      return;
+    }
+
+    if (str_eq(a, "step")) {
+      uint32_t steps = 1;
+      if (b[0] != '\0') {
+        if (!is_dec_number(b)) {
+          set_cmd_output("AI TRAIN STEP ERR");
+          return;
+        }
+        steps = (uint32_t)parse_u32_dec(b);
+      }
+      if (ai_train_step(steps)) {
+        set_cmd_output("AI TRAIN STEP OK");
+      } else {
+        set_cmd_output("AI TRAIN STEP FAIL/ROLLBACK");
+      }
+      return;
+    }
+
+    if (str_eq(a, "pause")) {
+      set_cmd_output(ai_train_pause() ? "AI TRAIN PAUSED" : "AI TRAIN PAUSE FAIL");
+      return;
+    }
+    if (str_eq(a, "resume")) {
+      set_cmd_output(ai_train_resume() ? "AI TRAIN RESUMED" : "AI TRAIN RESUME FAIL");
+      return;
+    }
+    if (str_eq(a, "checkpoint")) {
+      set_cmd_output(ai_train_checkpoint() ? "AI TRAIN CHECKPOINT OK" :
+                                         "AI TRAIN CHECKPOINT FAIL");
+      return;
+    }
+    if (str_eq(a, "rollback")) {
+      set_cmd_output(ai_train_rollback() ? "AI TRAIN ROLLBACK OK" :
+                                       "AI TRAIN ROLLBACK FAIL");
+      return;
+    }
+
+    set_cmd_output("USAGE: ai train stat|start|step|pause|resume|checkpoint|rollback");
+    return;
+  }
+
+  set_cmd_output("USAGE: ai model|qos|infer|bench|train|stat");
+}
+
 static uint32_t metric_avg_cycles(const ProfileMetric *m) {
   if (m == 0 || m->count == 0) {
     return 0;
@@ -1673,7 +2123,7 @@ static void cmd_replay(const char *args) {
 
     replay_running = 1;
     for (int i = 0; i < replay_count; i++) {
-      char cmd_copy[32];
+      char cmd_copy[SHELL_CMD_MAX];
       copy_cmd_text(cmd_copy, replay_cmds[i], sizeof(cmd_copy));
       process_command(cmd_copy);
     }
@@ -4779,6 +5229,7 @@ static const CommandEntry command_table[] = {
     {"usb", cmd_usb},
     {"phasecheck", cmd_phasecheck},
     {"audio", cmd_audio},
+    {"ai", cmd_ai},
     {"sonify", cmd_sonify},
     {"zpan+", cmd_zpanp},
     {"zpan-", cmd_zpanm},

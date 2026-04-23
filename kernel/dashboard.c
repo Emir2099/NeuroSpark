@@ -6,6 +6,7 @@
 #include "net.h"
 #include "profiling.h"
 #include "model_manager.h"
+#include "shell.h"
 #include "../assets/ui/icon_atlas_96x96.h"
 
 typedef unsigned char uint8_t;
@@ -48,7 +49,7 @@ extern int zoom_level;
 extern int zoom_offset;
 extern int potentials[16];
 extern volatile int buffer_idx;
-extern volatile char input_buffer[32];
+extern volatile char input_buffer[SHELL_CMD_MAX];
 extern volatile int shell_dirty;
 extern int cursor_x;
 extern int cursor_y;
@@ -1076,7 +1077,7 @@ void shell_render(void) {
   cursor_y = prompt_y;
   gprint("> ", 0x55FF88);
 
-  for (int i = 0; i < buffer_idx && i < 32; i++) {
+  for (int i = 0; i < buffer_idx && i < SHELL_CMD_MAX; i++) {
     char ch[2] = {input_buffer[i], '\0'};
     gprint(ch, 0xEAF2F8);
   }
