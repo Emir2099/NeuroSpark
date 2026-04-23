@@ -220,6 +220,15 @@ int audio_ac97_run_loopback_test(uint32_t frames, uint32_t sample_rate,
       return 0;
     }
 
+    /*
+     * In phasecheck/driver self-tests there may be no periodic scheduler tick
+     * draining PCM rings. Drain explicitly so loopback validates I/O behavior
+     * instead of failing on temporary ring backpressure.
+     */
+    for (i = 0; i < wrote_frames; i++) {
+      audio_tick();
+    }
+
     audio_ac97_submit_frames(wrote_frames);
     remaining -= wrote_frames;
   }

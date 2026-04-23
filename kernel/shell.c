@@ -657,6 +657,7 @@ static void cmd_help(const char *args) {
   gprint("          net coalesce <poll> <irqpoll>\n", 0x77C8FF);
   gprint("phase28:  kdbg show|stack|mem|trace  trace <pid> on|off|show\n", 0x77C8FF);
   gprint("          profile samples [n]  profile export <path>\n", 0x77C8FF);
+  gprint("phase30/31: phasecheck [usb_cycles] [audio_frames]\n", 0x77C8FF);
   gprint("phase31:  audio play [hz] [vol]  audio stop [id|all]  audio stat\n", 0x77C8FF);
   gprint("          audio drv stat|reset|loopback [frames] [hz] [ch] [bits]  sonify on|off|stat\n", 0x77C8FF);
   gprint("system:   tz show | tz set <+HH[:MM]|-HH[:MM]>\n", 0x77C8FF);
@@ -4020,6 +4021,96 @@ static void cmd_usb(const char *args) {
   set_cmd_output("USAGE: usb tree|info|reset [id|all]|recover <id>|fault <id> [err]|power <suspend|resume>|hotplug [n]");
 }
 
+static void cmd_phasecheck(const char *args) {
+  char sub[16];
+  char arg1[16];
+  AudioAc97Report ac97;
+  uint32_t usb_cycles = 50;
+  uint32_t audio_frames = 1024;
+  uint32_t audio_rate = 44100;
+  uint32_t audio_channels = 2;
+  uint32_t audio_bits = 16;
+  uint32_t crc = 0;
+  int injected_reset_ok;
+  int recovery_reset_ok;
+  int loopback_ok;
+  int usb_ready;
+  int ac97_detected;
+  int usb_ok = 1;
+  int audio_ok = 1;
+  int ok = 1;
+
+  args = next_token(args, sub, sizeof(sub));
+  args = next_token(args, arg1, sizeof(arg1));
+
+  if (sub[0] != '\0') {
+    if (!is_dec_number(sub)) {
+      set_cmd_output("USAGE: phasecheck [usb_cycles] [audio_frames]");
+      return;
+    }
+    usb_cycles = (uint32_t)parse_u32_dec(sub);
+  }
+  if (arg1[0] != '\0') {
+    if (!is_dec_number(arg1)) {
+      set_cmd_output("USAGE: phasecheck [usb_cycles] [audio_frames]");
+      return;
+    }
+    audio_frames = (uint32_t)parse_u32_dec(arg1);
+  }
+
+  gprint("PHASECHECK 30 USB HOTPLUG: ", 0x99EEFF);
+  usb_ready = usb_core_is_ready();
+  if (!usb_ready) {
+    gprint("SKIP (no xHCI)\n", 0xFFCC66);
+  } else {
+    if (!usb_core_run_hotplug_regression(usb_cycles)) {
+      gprint("FAIL\n", 0xFF5555);
+      usb_ok = 0;
+      ok = 0;
+    } else {
+      gprint("OK\n", 0x44FF88);
+    }
+  }
+
+  gprint("PHASECHECK 31 AC97 RESET/LOOPBACK: ", 0x99EEFF);
+  audio_ac97_get_report(&ac97);
+  ac97_detected = ac97.detected ? 1 : 0;
+  audio_stop_all();
+
+  injected_reset_ok = 1;
+  recovery_reset_ok = 1;
+  if (ac97_detected) {
+    injected_reset_ok = !audio_ac97_reset(1);
+    recovery_reset_ok = audio_ac97_reset(0);
+  }
+
+  loopback_ok = audio_ac97_run_loopback_test(audio_frames, audio_rate,
+                                              audio_channels, audio_bits,
+                                              &crc);
+
+  if (!injected_reset_ok || !recovery_reset_ok || !loopback_ok) {
+    gprint("FAIL\n", 0xFF5555);
+    audio_ok = 0;
+    ok = 0;
+  } else {
+    gprint("OK CRC=", 0x44FF88);
+    gprint_hex(crc, 8, 0xFFFFFF);
+    gprint("\n", 0x000000);
+  }
+
+  if (ok) {
+    set_cmd_output("PHASECHECK OK");
+  } else if (!usb_ok && !audio_ok) {
+    set_cmd_output("PHASECHECK FAIL USB+AUDIO");
+  } else if (!usb_ok) {
+    set_cmd_output("PHASECHECK FAIL USB");
+  } else if (!audio_ok) {
+    set_cmd_output("PHASECHECK FAIL AUDIO");
+  } else {
+    set_cmd_output("PHASECHECK FAIL");
+  }
+}
+
 static void cmd_audio(const char *args) {
   char sub[16];
   char arg1[16];
@@ -4686,6 +4777,7 @@ static const CommandEntry command_table[] = {
     {"pci", cmd_pci},   {"zoom+", cmd_zoomp}, {"zoom-", cmd_zoomm},
     {"ahci", cmd_ahci},
     {"usb", cmd_usb},
+    {"phasecheck", cmd_phasecheck},
     {"audio", cmd_audio},
     {"sonify", cmd_sonify},
     {"zpan+", cmd_zpanp},
