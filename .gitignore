@@ -6,6 +6,7 @@
 NeuroSpark.bin
 kernel.bin
 boot/boot.bin
+tinyllm.pkg
 
 # Disassembly dumps
 *.dump

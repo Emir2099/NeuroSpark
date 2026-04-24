@@ -1,6 +1,14 @@
 # Cross-compiler toolchain
 CC = gcc -m32
 LD = ld -m elf_i386
+PYTHON3 ?= python3
+
+# Raw disk image size (must be large enough for guest TFS payloads)
+DISK_IMAGE_SIZE ?= 67108864
+
+# Optional host file to pre-seed into guest TFS at build time
+MODEL_FILE ?= tinyllm.pkg
+MODEL_GUEST_NAME ?= tinyllm.pkg
 
 # Compiler flags
 CFLAGS = -ffreestanding -m32 -O2 -Wall -Wextra \
@@ -14,7 +22,13 @@ all: NeuroSpark.bin
 # Total: 512KB = 1024 sectors — gives room for kernel growth and 4 save slots
 NeuroSpark.bin: boot/boot.bin kernel.bin
 	cat boot/boot.bin kernel.bin > $@
-	truncate -s 524288 $@
+	truncate -s $(DISK_IMAGE_SIZE) $@
+	@if [ -f "$(MODEL_FILE)" ]; then \
+		echo "[pack] injecting $(MODEL_FILE) -> /$(MODEL_GUEST_NAME)"; \
+		$(PYTHON3) tools/tfs_inject.py "$@" "$(MODEL_FILE)" "$(MODEL_GUEST_NAME)"; \
+	else \
+		echo "[pack] skip: $(MODEL_FILE) not found"; \
+	fi
 
 # Assemble bootloader
 boot/boot.bin: boot/boot.asm
@@ -86,4 +100,7 @@ validate-phase15-17:
 validate-phase20:
 	bash tools/validate_phase20.sh
 
-.PHONY: all clean run validate-phase15-17 validate-phase20
+tfs-inject: NeuroSpark.bin
+	$(PYTHON3) tools/tfs_inject.py NeuroSpark.bin $(MODEL_FILE) $(MODEL_GUEST_NAME)
+
+.PHONY: all clean run validate-phase15-17 validate-phase20 tfs-inject

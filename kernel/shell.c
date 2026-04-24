@@ -663,7 +663,7 @@ static void cmd_help(const char *args) {
   gprint("phase30/31: phasecheck [usb_cycles] [audio_frames]\n", 0x77C8FF);
   gprint("phase31:  audio play [hz] [vol]  audio stop [id|all]  audio stat\n", 0x77C8FF);
   gprint("          audio drv stat|reset|loopback [frames] [hz] [ch] [bits]  sonify on|off|stat\n", 0x77C8FF);
-  gprint("phase32:  ai model ls|load|verify  ai qos  ai infer  ai bench  ai train ...\n", 0x77C8FF);
+  gprint("phase32:  ai model ls|load|import|verify  ai qos  ai infer  ai bench  ai train ...\n", 0x77C8FF);
   gprint("system:   tz show | tz set <+HH[:MM]|-HH[:MM]>\n", 0x77C8FF);
   set_cmd_output("HELP: pci usb audio help");
 }
@@ -1392,11 +1392,11 @@ static void u32_to_hex8(uint32_t value, char out[9]) {
 static void cmd_ai(const char *args) {
   char sub[12];
   char a[16];
-  char b[16];
-  char c[16];
-  char d[16];
-  char e[16];
-  char f[16];
+  char b[48];
+  char c[48];
+  char d[48];
+  char e[48];
+  char f[48];
   AiRuntimeStats rt;
   AiSchedulerStats sched;
   AiTrainStats tr;
@@ -1452,7 +1452,7 @@ static void cmd_ai(const char *args) {
     if (a[0] == '\0' || str_eq(a, "ls")) {
       AiModelInfo models[8];
       int count = ai_runtime_list_models(models, 8);
-      char status[64];
+      char status[96];
       int i;
       gprint("AI MODELS\n", 0x99EEFF);
       for (i = 0; i < count; i++) {
@@ -1464,6 +1464,10 @@ static void cmd_ai(const char *args) {
         gprint_dec((int)models[i].version, 0xFFFFFF);
         gprint(" backend=", 0x99EEFF);
         gprint((char *)ai_backend_name(models[i].preferred_backend), 0xFFFFFF);
+        if (models[i].source_path[0] != '\0') {
+          gprint(" src=", 0x99EEFF);
+          gprint(models[i].source_path, 0xFFFFFF);
+        }
         gprint("\n", 0x000000);
       }
       if (count == 0) {
@@ -1482,11 +1486,76 @@ static void cmd_ai(const char *args) {
         while (models[0].name[ni] && si < (int)sizeof(status) - 1) {
           status[si++] = models[0].name[ni++];
         }
+        if (models[0].source_path[0] != '\0' && si < (int)sizeof(status) - 2) {
+          status[si++] = '@';
+          for (int pi = 0; models[0].source_path[pi] && si < (int)sizeof(status) - 1; pi++) {
+            status[si++] = models[0].source_path[pi];
+          }
+        }
         if (count > 1 && si < (int)sizeof(status) - 2) {
           status[si++] = '+';
         }
         status[si] = '\0';
       }
+      set_cmd_output(status);
+      return;
+    }
+
+    if (str_eq(a, "import")) {
+      AiModelPackageInfo imported;
+      VfsFileStat model_file;
+      char status[96];
+      int si = 0;
+      int ni = 0;
+
+      if (b[0] == '\0') {
+        set_cmd_output("USAGE: ai model import <path> [alias]");
+        return;
+      }
+
+      if (vfs_stat(b, &model_file) < 0) {
+        set_cmd_output("AI MODEL IMPORT PATH NOT IN GUEST VFS");
+        return;
+      }
+      if (model_file.size > AI_MODEL_PACKAGE_MAX_BYTES) {
+        set_cmd_output("AI MODEL IMPORT TOO BIG (>64MB)");
+        return;
+      }
+
+      if (!ai_runtime_import_model_package(b, c[0] ? c : 0, &imported)) {
+        set_cmd_output("AI MODEL IMPORT FAIL (use alias, <=64MB)");
+        return;
+      }
+
+      copy_cmd_text(status, "AI MODEL IMPORT OK ", sizeof(status));
+      while (status[si]) {
+        si++;
+      }
+      while (imported.name[ni] && si < (int)sizeof(status) - 1) {
+        status[si++] = imported.name[ni++];
+      }
+      if (si < (int)sizeof(status) - 2) {
+        status[si++] = ' ';
+        status[si++] = '0';
+      }
+      if (si < (int)sizeof(status) - 2) {
+        status[si++] = 'x';
+      }
+      {
+        char hexsum[9];
+        u32_to_hex8(imported.checksum, hexsum);
+        for (int hi = 0; hi < 8 && si < (int)sizeof(status) - 1; hi++) {
+          status[si++] = hexsum[hi];
+        }
+      }
+      if (imported.source_path[0] != '\0' && si < (int)sizeof(status) - 3) {
+        status[si++] = ' ';
+        status[si++] = '@';
+        for (int pi = 0; imported.source_path[pi] && si < (int)sizeof(status) - 1; pi++) {
+          status[si++] = imported.source_path[pi];
+        }
+      }
+      status[si] = '\0';
       set_cmd_output(status);
       return;
     }
@@ -1569,7 +1638,7 @@ static void cmd_ai(const char *args) {
       return;
     }
 
-    set_cmd_output("USAGE: ai model ls|load|verify");
+    set_cmd_output("USAGE: ai model ls|load|import|verify");
     return;
   }
 
