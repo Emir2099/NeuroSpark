@@ -6,6 +6,21 @@
 typedef unsigned int uint32_t;
 #endif
 
+#ifndef _UINT16_T_DEFINED
+#define _UINT16_T_DEFINED
+typedef unsigned short uint16_t;
+#endif
+
+#ifndef _UINT8_T_DEFINED
+#define _UINT8_T_DEFINED
+typedef unsigned char uint8_t;
+#endif
+
+#ifndef _UINT64_T_DEFINED
+#define _UINT64_T_DEFINED
+typedef unsigned long long uint64_t;
+#endif
+
 typedef struct {
   uint32_t bus;
   uint32_t slot;

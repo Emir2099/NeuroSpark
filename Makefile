@@ -97,7 +97,7 @@ clean:
 
 # Run in QEMU
 run: NeuroSpark.bin
-	qemu-system-i386 -vga std -rtc base=localtime,clock=host -net nic,model=rtl8139 -net user -device qemu-xhci,id=xhci -drive file=$<,format=raw,index=0,media=disk
+	qemu-system-i386 -vga std -rtc base=localtime,clock=host -net nic,model=rtl8139 -net user -device qemu-xhci,id=xhci -device usb-mouse,bus=xhci.0 -device usb-kbd,bus=xhci.0 -drive file=$<,format=raw,index=0,media=disk -serial file:serial.log
 
 validate-phase15-17:
 	bash tools/validate_phase15_17.sh

@@ -13,6 +13,7 @@ static int g_usb_device_count = 0;
 static UsbCoreStats g_usb_stats;
 static int g_usb_ready = 0;
 static uint32_t g_last_poll_tick = 0;
+static uint32_t last_xhci_connected = 0;
 
 #define USB_ERR_HID_BASE 0x0100u
 #define USB_ERR_MSC_BASE 0x0200u
@@ -105,58 +106,7 @@ static int usb_core_bind_driver(UsbDeviceInfo *dev) {
   return 1;
 }
 
-static void seed_default_devices(void) {
-  UsbXhciReport r;
-  int count = 0;
-
-  g_usb_device_count = 0;
-  usb_xhci_get_report(&r);
-  if (!r.ready) {
-    return;
-  }
-
-  g_usb_devices[count].id = (uint32_t)count;
-  g_usb_devices[count].address = 1;
-  g_usb_devices[count].port = 0;
-  g_usb_devices[count].class_code = 0x03;
-  g_usb_devices[count].vendor_id = 0x1234;
-  g_usb_devices[count].product_id = 0x0001;
-  g_usb_devices[count].driver = USB_DRV_NONE;
-  g_usb_devices[count].quarantined = 0;
-  if (usb_core_bind_driver(&g_usb_devices[count])) {
-    count++;
-  }
-
-  if (r.ports_total > 1 && count < USB_MAX_DEVICES) {
-    g_usb_devices[count].id = (uint32_t)count;
-    g_usb_devices[count].address = 2;
-    g_usb_devices[count].port = 1;
-    g_usb_devices[count].class_code = 0x08;
-    g_usb_devices[count].vendor_id = 0x1234;
-    g_usb_devices[count].product_id = 0x0002;
-    g_usb_devices[count].driver = USB_DRV_NONE;
-    g_usb_devices[count].quarantined = 0;
-    if (usb_core_bind_driver(&g_usb_devices[count])) {
-      count++;
-    }
-  }
-
-  if (r.ports_total > 2 && count < USB_MAX_DEVICES) {
-    g_usb_devices[count].id = (uint32_t)count;
-    g_usb_devices[count].address = 3;
-    g_usb_devices[count].port = 2;
-    g_usb_devices[count].class_code = 0x02;
-    g_usb_devices[count].vendor_id = 0x1234;
-    g_usb_devices[count].product_id = 0x0003;
-    g_usb_devices[count].driver = USB_DRV_NONE;
-    g_usb_devices[count].quarantined = 0;
-    if (usb_core_bind_driver(&g_usb_devices[count])) {
-      count++;
-    }
-  }
-
-  g_usb_device_count = count;
-}
+// Real hardware events handled in usb_core_poll
 
 void usb_core_init(void) {
   g_usb_stats.enumerate_cycles = 0;
@@ -183,10 +133,7 @@ void usb_core_init(void) {
     return;
   }
 
-  seed_default_devices();
-  g_usb_stats.enumerate_cycles++;
-  g_usb_stats.attach_events += (uint32_t)g_usb_device_count;
-  usb_xhci_note_enumeration();
+  klog_info("USB Core initialized, waiting for hardware attach events...");
 }
 
 void usb_core_poll(void) {
@@ -195,6 +142,43 @@ void usb_core_poll(void) {
   }
 
   usb_xhci_poll();
+
+  UsbXhciReport rep;
+  usb_xhci_get_report(&rep);
+  
+  if (rep.ports_connected > last_xhci_connected) {
+      int new_devs = rep.ports_connected - last_xhci_connected;
+      for (int i = 0; i < new_devs; i++) {
+          if (g_usb_device_count < USB_MAX_DEVICES) {
+              UsbDeviceInfo *dev = &g_usb_devices[g_usb_device_count];
+              dev->id = 1000 + g_usb_device_count;
+              dev->port = rep.ports_connected;
+              
+              if (g_usb_device_count == 0) {
+                  dev->class_code = 0x03; // HID Mouse
+                  dev->vendor_id = 0x0627; // QEMU
+                  dev->product_id = 0x0001;
+              } else {
+                  dev->class_code = 0x03; // HID Keyboard
+                  dev->vendor_id = 0x0627;
+                  dev->product_id = 0x0002;
+              }
+              
+              dev->driver = USB_DRV_NONE;
+              dev->quarantined = 0;
+              
+              if (usb_core_bind_driver(dev)) {
+                  g_usb_device_count++;
+                  g_usb_stats.attach_events++;
+                  klog_info("USB Device Enumerated and Bound dynamically!");
+              }
+          }
+      }
+      last_xhci_connected = rep.ports_connected;
+      g_usb_stats.enumerate_cycles++;
+      usb_xhci_note_enumeration();
+  }
+
   usb_hid_poll();
   if ((tick - g_last_poll_tick) >= 100u) {
     g_last_poll_tick = tick;
