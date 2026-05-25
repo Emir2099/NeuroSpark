@@ -81,16 +81,6 @@ int net_supports_jumbo(void);
 
 void remote_set_enabled(int enabled);
 int remote_is_enabled(void);
-void remote_set_token(uint32_t token);
-void remote_set_auth(uint32_t token, uint32_t ttl_ticks);
-void remote_clear_auth(void);
-int remote_is_authorized(void);
-uint32_t remote_get_token(void);
-uint32_t remote_get_session(void);
-uint32_t remote_get_auth_deadline(void);
-void remote_rotate_session_key(void);
-void remote_set_role(uint32_t role);
-uint32_t remote_get_role(void);
 int remote_send_command_result(const char *cmd_text);
 
 #endif

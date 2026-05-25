@@ -1,4 +1,5 @@
 #include "net.h"
+#include "remote_auth.h"
 #include "pci.h"
 #include "profiling.h"
 #include "storage_manager.h"
@@ -83,29 +84,6 @@ typedef unsigned short uint16_t;
 #define TCP_FLAG_PSH 0x08u
 #define TCP_FLAG_ACK 0x10u
 
-#define REMOTE_PKT_MAGIC 0x52435031u /* RCP1 */
-#define REMOTE_PKT_VERSION 1u
-#define REMOTE_PKT_TYPE_STATUS 1
-#define REMOTE_PKT_TYPE_COMMAND 2
-#define REMOTE_PKT_TYPE_SNAPSHOT 3
-#define REMOTE_PKT_TYPE_PROFILE 4
-#define REMOTE_PKT_TYPE_MANIFEST 5
-
-#define REMOTE_PKT_FLAG_RELIABLE 0x00000001u
-#define REMOTE_PKT_FLAG_CHUNKED 0x00000002u
-#define REMOTE_PKT_FLAG_CHUNK_FIRST 0x00000004u
-#define REMOTE_PKT_FLAG_CHUNK_LAST 0x00000008u
-
-#define REMOTE_CHUNK_MAGIC 0x43484B31u /* CHK1 */
-
-#define REMOTE_STATUS_OK 0u
-#define REMOTE_STATUS_AUTH_REQUIRED 1u
-#define REMOTE_STATUS_TOKEN_EXPIRED 2u
-#define REMOTE_STATUS_INVALID_TOKEN 3u
-
-#define REMOTE_ROLE_VIEWER 1u
-#define REMOTE_ROLE_OPERATOR 2u
-#define REMOTE_ROLE_ADMIN 3u
 
 typedef struct {
   uint32_t magic;
@@ -229,14 +207,7 @@ static uint32_t net_mask = 0xFFFFFF00u; /* /24 */
 static uint32_t net_gw = 0x0A000201u;   /* 10.0.2.1 */
 
 static int remote_enabled = 0;
-static uint32_t remote_token = 0;
-static uint32_t remote_session = 0;
-static uint32_t remote_seq = 1;
-static uint32_t remote_auth_deadline = 0;
 static uint32_t remote_dst_ip = 0xFFFFFFFFu;
-static uint32_t remote_role = REMOTE_ROLE_OPERATOR;
-static uint32_t remote_key_epoch = 1u;
-static uint32_t remote_nonce_state = 0x9E3779B9u;
 static uint32_t net_fault_loss_percent = 0u;
 static uint32_t net_fault_reorder_percent = 0u;
 static uint32_t net_fault_prng_state = 0xC0FFEE11u;
@@ -623,10 +594,14 @@ static int tcp_send_and_track(TcpConn *c, uint8_t flags, const uint8_t *payload,
 }
 
 static int tcp_retransmit_last(TcpConn *c) {
+  uint32_t max_retries = TCP_RETX_MAX;
   if (c == 0 || !c->used || c->listening || !c->waiting_ack) {
     return 0;
   }
-  if (c->last_tx_retries >= TCP_RETX_MAX) {
+  if (c->state == TCP_STATE_SYN_SENT || c->state == TCP_STATE_SYN_RCVD) {
+    max_retries = TCP_RETX_MAX + 2u;
+  }
+  if (c->last_tx_retries >= max_retries) {
     net_rx_stats.tcp_retransmit_failures++;
     if (c->state == TCP_STATE_SYN_SENT || c->state == TCP_STATE_SYN_RCVD ||
         c->state == TCP_STATE_CLOSING) {
@@ -1630,64 +1605,7 @@ static int net_handle_eth_frame(const uint8_t *frame, uint16_t len) {
   return 1;
 }
 
-static uint32_t remote_checksum32(const uint8_t *data, uint32_t len) {
-  uint32_t hash = 2166136261u;
-  for (uint32_t i = 0; i < len; i++) {
-    hash ^= data[i];
-    hash *= 16777619u;
-  }
-  return hash;
-}
 
-static void remote_seed_nonce_state(void) {
-  remote_nonce_state = remote_token ^ remote_session ^ remote_key_epoch ^ 0x9E3779B9u;
-  if (remote_nonce_state == 0u) {
-    remote_nonce_state = 0xA341316Cu;
-  }
-}
-
-static uint32_t remote_next_nonce(uint32_t request_id) {
-  remote_nonce_state ^= remote_nonce_state << 13;
-  remote_nonce_state ^= remote_nonce_state >> 17;
-  remote_nonce_state ^= remote_nonce_state << 5;
-  remote_nonce_state ^= request_id;
-  if (remote_nonce_state == 0u) {
-    remote_nonce_state = 0x7F4A7C15u ^ request_id;
-  }
-  return remote_nonce_state;
-}
-
-static void remote_rotate_session_key_internal(void) {
-  uint32_t base = (tick ^ remote_token ^ (remote_key_epoch * 0x45D9F3Bu));
-  remote_key_epoch++;
-  remote_session = (base | 1u);
-  remote_seq = 1u;
-  remote_seed_nonce_state();
-}
-
-static int remote_auth_valid(void) {
-  if (remote_token == 0) {
-    return 0;
-  }
-  if (remote_auth_deadline == 0) {
-    return 0;
-  }
-  if (tick > remote_auth_deadline) {
-    return 0;
-  }
-  if (remote_role < REMOTE_ROLE_VIEWER || remote_role > REMOTE_ROLE_ADMIN) {
-    return 0;
-  }
-  return 1;
-}
-
-static uint32_t remote_next_request_id(void) {
-  uint32_t req = remote_seq++;
-  if (req == 0) {
-    req = remote_seq++;
-  }
-  return req;
-}
 
 static int read_rtl8139_bar0_iobase(int idx, uint32_t *out_iobase) {
   uint32_t bar0;
@@ -1965,11 +1883,11 @@ static int remote_send_payload(uint8_t type, const uint8_t *data, uint16_t len,
   header.version = be32(REMOTE_PKT_VERSION);
   header.type = be32((uint32_t)type);
   header.flags = be32(flags);
-  header.session = be32(remote_session);
+  header.session = be32(remote_get_session());
   header.request_id = be32(request_id);
-  header.token = be32(remote_token);
+  header.token = be32(remote_get_token());
   header.nonce = be32(remote_next_nonce(request_id));
-  header.role = be32(remote_role);
+  header.role = be32(remote_get_role());
   header.checksum = 0;
   header.status = be32(status);
   header.payload_len = be32((uint32_t)len);
@@ -2141,7 +2059,7 @@ int net_init(void) {
     tcp_conns[i].waiting_ack = 0;
   }
   net_ready = rtl8139_hw_init(rtl_iobase);
-  if (net_ready && remote_session == 0) {
+  if (net_ready && remote_get_session() == 0) {
     remote_rotate_session_key_internal();
   }
   return net_ready;
@@ -2491,7 +2409,10 @@ int net_tcp_poll(void) {
     if (!c->used || c->listening || !c->waiting_ack) {
       continue;
     }
-    if ((tick - c->last_tx_tick) >= TCP_RETX_TICKS) {
+    uint32_t shift = c->last_tx_retries;
+    if (shift > 4u) shift = 4u;
+    uint32_t timeout_ticks = TCP_RETX_TICKS << shift;
+    if ((tick - c->last_tx_tick) >= timeout_ticks) {
       if (tcp_retransmit_last(c)) {
         retransmits++;
       }
@@ -2529,7 +2450,7 @@ int net_send_probe(void) {
   *((uint32_t *)&p[8]) = be32(net_ip);
   *((uint32_t *)&p[12]) = be32(net_mask);
   *((uint32_t *)&p[16]) = be32(net_gw);
-  *((uint32_t *)&p[20]) = be32(remote_session);
+  *((uint32_t *)&p[20]) = be32(remote_get_session());
 
   sent = net_send_udp(0xFFFFFFFFu, UDP_CTRL_PORT, UDP_CTRL_PORT, p, sizeof(p));
   if (sent) {
@@ -2695,48 +2616,16 @@ void remote_set_enabled(int enabled) { remote_enabled = enabled ? 1 : 0; }
 
 int remote_is_enabled(void) { return remote_enabled; }
 
-void remote_set_token(uint32_t token) {
-  remote_token = token;
-  remote_seed_nonce_state();
-}
 
-void remote_set_auth(uint32_t token, uint32_t ttl_ticks) {
-  remote_token = token;
-  remote_auth_deadline = ttl_ticks ? (tick + ttl_ticks) : 0;
-  remote_rotate_session_key_internal();
-}
-
-void remote_clear_auth(void) {
-  remote_auth_deadline = 0;
-  remote_token = 0;
-}
-
-int remote_is_authorized(void) { return remote_auth_valid(); }
-
-uint32_t remote_get_token(void) { return remote_token; }
-
-uint32_t remote_get_auth_deadline(void) { return remote_auth_deadline; }
-
-uint32_t remote_get_session(void) {
-  if (remote_session == 0) {
-    remote_rotate_session_key_internal();
+int net_remote_resume_transfer(uint32_t transfer_id) {
+  // sender-side resume logic
+  if (!remote_transfer_can_resume(transfer_id)) {
+    return 0;
   }
-  return remote_session;
+  // For now it is just a stub for the shell command to call
+  return 1;
 }
 
-void remote_rotate_session_key(void) { remote_rotate_session_key_internal(); }
-
-void remote_set_role(uint32_t role) {
-  if (role < REMOTE_ROLE_VIEWER) {
-    role = REMOTE_ROLE_VIEWER;
-  }
-  if (role > REMOTE_ROLE_ADMIN) {
-    role = REMOTE_ROLE_ADMIN;
-  }
-  remote_role = role;
-}
-
-uint32_t remote_get_role(void) { return remote_role; }
 
 int remote_send_command_result(const char *cmd_text) {
   uint8_t payload[128];
@@ -2746,7 +2635,7 @@ int remote_send_command_result(const char *cmd_text) {
   if (!remote_enabled || !net_ready || cmd_text == 0 || !remote_auth_valid()) {
     return 0;
   }
-  if (remote_role < REMOTE_ROLE_OPERATOR) {
+  if (remote_get_role() < REMOTE_ROLE_OPERATOR) {
     return 0;
   }
 

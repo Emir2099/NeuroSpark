@@ -13,6 +13,7 @@ typedef unsigned char uint8_t;
 #include "posix.h"
 #include "audio.h"
 #include "uapi_audio.h"
+#include "net_socket.h"
 
 extern int is_user_range(const void *ptr, uint32_t size);
 
@@ -131,41 +132,6 @@ enum {
 
 #define NS_ERR_INVALID_ARG ((uint32_t)-22)
 
-#define NS_SOCKET_FD_BASE 1024
-#define NS_SOCKET_MAX_PER_TASK 64
-
-#define NS_O_NONBLOCK 0x800
-
-#define NS_POLLIN 0x0001u
-#define NS_POLLOUT 0x0004u
-#define NS_POLLERR 0x0008u
-
-#define NS_EPOLL_OP_CREATE 1
-#define NS_EPOLL_OP_CTL 2
-#define NS_EPOLL_OP_WAIT 3
-#define NS_EPOLL_OP_CLOSE 4
-
-#define NS_EPOLL_CTL_ADD 1
-#define NS_EPOLL_CTL_MOD 2
-#define NS_EPOLL_CTL_DEL 3
-
-#define NS_EPOLL_FD_BASE 2048
-#define NS_EPOLL_MAX_PER_TASK 8
-#define NS_EPOLL_MAX_WATCH 64
-
-#define NS_AF_INET 2
-#define NS_SOCK_STREAM 1
-#define NS_SOCK_DGRAM 2
-
-#define NS_SOL_SOCKET 1
-#define NS_SO_REUSEADDR 2
-#define NS_SO_RCVTIMEO 3
-#define NS_SO_SNDTIMEO 4
-#define NS_SO_KEEPALIVE 5
-
-#define NS_SHUT_RD 0
-#define NS_SHUT_WR 1
-#define NS_SHUT_RDWR 2
 
 #define MMAP_ANON_BASE 0x50000000u
 #define MMAP_ANON_LIMIT 0xB0000000u
@@ -335,58 +301,6 @@ static uint32_t task_brk_current[MAX_TASKS];
 static uint32_t task_mmap_next[MAX_TASKS];
 static uint32_t task_alarm_tick[MAX_TASKS];
 
-typedef struct {
-  uint16_t sin_family;
-  uint16_t sin_port;
-  uint32_t sin_addr;
-} NsSockAddrIn;
-
-typedef struct {
-  int used;
-  int type;
-  int protocol;
-  int flags;
-  int bound;
-  uint16_t local_port;
-  uint32_t peer_ip;
-  uint16_t peer_port;
-  int listening;
-  int net_conn_id;
-  uint32_t rcv_timeout_ticks;
-  uint32_t snd_timeout_ticks;
-  uint8_t reuse_addr;
-  uint8_t keepalive;
-  uint8_t shut_rd;
-  uint8_t shut_wr;
-} NsSocketEntry;
-
-typedef struct {
-  int fd;
-  uint16_t events;
-  uint16_t revents;
-} NsPollFd;
-
-typedef struct {
-  int op;
-  NsPollFd event;
-} NsEpollCtlReq;
-
-typedef struct {
-  NsPollFd *events;
-  uint32_t maxevents;
-  uint32_t timeout_ticks;
-} NsEpollWaitReq;
-
-typedef struct {
-  int used;
-  int fd;
-  uint16_t events;
-} NsEpollWatch;
-
-typedef struct {
-  int used;
-  NsEpollWatch watches[NS_EPOLL_MAX_WATCH];
-} NsEpollObject;
 
 typedef struct {
   uint32_t opcode;
@@ -457,8 +371,6 @@ typedef struct {
   NsAioReq reqs[NS_AIO_MAX_REQ];
 } NsAioCtx;
 
-static NsSocketEntry task_sockets[MAX_TASKS][NS_SOCKET_MAX_PER_TASK];
-static NsEpollObject task_epolls[MAX_TASKS][NS_EPOLL_MAX_PER_TASK];
 static NsAioCtx aio_contexts[NS_AIO_MAX_CTX];
 
 static int validate_user_ptr(const void *ptr, uint32_t size);
@@ -472,221 +384,6 @@ static uint32_t ns_bswap32(uint32_t v) {
          ((v & 0x00FF0000u) >> 8) | ((v & 0xFF000000u) >> 24);
 }
 
-static int socket_fd_to_slot(int fd) {
-  int slot = fd - NS_SOCKET_FD_BASE;
-  if (slot < 0 || slot >= NS_SOCKET_MAX_PER_TASK) {
-    return -1;
-  }
-  return slot;
-}
-
-static NsSocketEntry *socket_entry_for_fd(int task_id, int fd) {
-  int slot;
-  if (task_id < 0 || task_id >= MAX_TASKS) {
-    return 0;
-  }
-  slot = socket_fd_to_slot(fd);
-  if (slot < 0 || !task_sockets[task_id][slot].used) {
-    return 0;
-  }
-  return &task_sockets[task_id][slot];
-}
-
-static int socket_alloc_fd(int task_id, int type, int protocol) {
-  if (task_id < 0 || task_id >= MAX_TASKS) {
-    return -1;
-  }
-  for (int i = 0; i < NS_SOCKET_MAX_PER_TASK; i++) {
-    if (!task_sockets[task_id][i].used) {
-      task_sockets[task_id][i].used = 1;
-      task_sockets[task_id][i].type = type;
-      task_sockets[task_id][i].protocol = protocol;
-      task_sockets[task_id][i].flags = 0;
-      task_sockets[task_id][i].bound = 0;
-      task_sockets[task_id][i].local_port = 0;
-      task_sockets[task_id][i].peer_ip = 0;
-      task_sockets[task_id][i].peer_port = 0;
-      task_sockets[task_id][i].listening = 0;
-      task_sockets[task_id][i].net_conn_id = -1;
-      task_sockets[task_id][i].rcv_timeout_ticks = 0xFFFFFFFFu;
-      task_sockets[task_id][i].snd_timeout_ticks = 0xFFFFFFFFu;
-      task_sockets[task_id][i].reuse_addr = 0;
-      task_sockets[task_id][i].keepalive = 0;
-      task_sockets[task_id][i].shut_rd = 0;
-      task_sockets[task_id][i].shut_wr = 0;
-      return NS_SOCKET_FD_BASE + i;
-    }
-  }
-  return -1;
-}
-
-static void socket_close_entry(NsSocketEntry *s) {
-  if (s == 0 || !s->used) {
-    return;
-  }
-  if (s->type == NS_SOCK_DGRAM && s->bound) {
-    (void)net_udp_unbind(s->local_port);
-  }
-  if (s->type == NS_SOCK_STREAM) {
-    if (s->listening && s->bound) {
-      (void)net_tcp_unlisten(s->local_port);
-    } else if (s->net_conn_id >= 0) {
-      (void)net_tcp_close(s->net_conn_id);
-    }
-  }
-  s->used = 0;
-  s->type = 0;
-  s->protocol = 0;
-  s->flags = 0;
-  s->bound = 0;
-  s->local_port = 0;
-  s->peer_ip = 0;
-  s->peer_port = 0;
-  s->listening = 0;
-  s->net_conn_id = -1;
-  s->rcv_timeout_ticks = 0xFFFFFFFFu;
-  s->snd_timeout_ticks = 0xFFFFFFFFu;
-  s->reuse_addr = 0;
-  s->keepalive = 0;
-  s->shut_rd = 0;
-  s->shut_wr = 0;
-}
-
-static int socket_is_nonblocking(const NsSocketEntry *s) {
-  return s != 0 && (s->flags & NS_O_NONBLOCK);
-}
-
-static int socket_ready_for_read(const NsSocketEntry *s) {
-  if (s == 0 || !s->used) {
-    return 0;
-  }
-  if (s->shut_rd) {
-    return 0;
-  }
-  if (s->type == NS_SOCK_DGRAM) {
-    return s->bound && net_udp_has_data(s->local_port);
-  }
-  if (s->type == NS_SOCK_STREAM) {
-    if (s->listening) {
-      return net_tcp_accept_ready(s->local_port);
-    }
-    return s->net_conn_id >= 0 && net_tcp_can_recv(s->net_conn_id);
-  }
-  return 0;
-}
-
-static int socket_ready_for_write(const NsSocketEntry *s) {
-  if (s == 0 || !s->used) {
-    return 0;
-  }
-  if (s->shut_wr) {
-    return 0;
-  }
-  if (s->type == NS_SOCK_DGRAM) {
-    return s->peer_ip != 0u && s->peer_port != 0u;
-  }
-  if (s->type == NS_SOCK_STREAM) {
-    return s->net_conn_id >= 0 && net_tcp_can_send(s->net_conn_id);
-  }
-  return 0;
-}
-
-static int socket_wait_for_readable(const NsSocketEntry *s, uint32_t timeout_ticks) {
-  uint32_t deadline = 0;
-  int infinite = (timeout_ticks == 0xFFFFFFFFu);
-
-  if (!infinite) {
-    deadline = scheduler_now_ticks() + timeout_ticks;
-  }
-
-  while (!socket_ready_for_read(s)) {
-    if (!infinite && scheduler_now_ticks() >= deadline) {
-      return 0;
-    }
-    task_sleep(1);
-  }
-  return 1;
-}
-
-static int socket_wait_for_writable(const NsSocketEntry *s, uint32_t timeout_ticks) {
-  uint32_t deadline = 0;
-  int infinite = (timeout_ticks == 0xFFFFFFFFu);
-
-  if (!infinite) {
-    deadline = scheduler_now_ticks() + timeout_ticks;
-  }
-
-  while (!socket_ready_for_write(s)) {
-    if (!infinite && scheduler_now_ticks() >= deadline) {
-      return 0;
-    }
-    task_sleep(1);
-  }
-  return 1;
-}
-
-static int epoll_fd_to_slot(int fd) {
-  int slot = fd - NS_EPOLL_FD_BASE;
-
-  if (slot < 0 || slot >= NS_EPOLL_MAX_PER_TASK) {
-    return -1;
-  }
-  return slot;
-}
-
-static NsEpollObject *epoll_object_for_fd(int task_id, int fd) {
-  int slot;
-
-  if (task_id < 0 || task_id >= MAX_TASKS) {
-    return 0;
-  }
-  slot = epoll_fd_to_slot(fd);
-  if (slot < 0 || !task_epolls[task_id][slot].used) {
-    return 0;
-  }
-  return &task_epolls[task_id][slot];
-}
-
-static int epoll_alloc_fd(int task_id) {
-  if (task_id < 0 || task_id >= MAX_TASKS) {
-    return -1;
-  }
-  for (int i = 0; i < NS_EPOLL_MAX_PER_TASK; i++) {
-    if (!task_epolls[task_id][i].used) {
-      task_epolls[task_id][i].used = 1;
-      for (int j = 0; j < NS_EPOLL_MAX_WATCH; j++) {
-        task_epolls[task_id][i].watches[j].used = 0;
-        task_epolls[task_id][i].watches[j].fd = -1;
-        task_epolls[task_id][i].watches[j].events = 0;
-      }
-      return NS_EPOLL_FD_BASE + i;
-    }
-  }
-  return -1;
-}
-
-static void epoll_close_object(NsEpollObject *obj) {
-  if (obj == 0 || !obj->used) {
-    return;
-  }
-  obj->used = 0;
-  for (int i = 0; i < NS_EPOLL_MAX_WATCH; i++) {
-    obj->watches[i].used = 0;
-    obj->watches[i].fd = -1;
-    obj->watches[i].events = 0;
-  }
-}
-
-static void epoll_close_all_for_task(int task_id) {
-  if (task_id < 0 || task_id >= MAX_TASKS) {
-    return;
-  }
-  for (int i = 0; i < NS_EPOLL_MAX_PER_TASK; i++) {
-    if (task_epolls[task_id][i].used) {
-      epoll_close_object(&task_epolls[task_id][i]);
-    }
-  }
-}
 
 static int aio_ctx_handle_to_slot(uint32_t handle) {
   int slot = (int)handle - 1;
@@ -877,188 +574,6 @@ static int aio_process_events(NsAioCtx *ctx, NsIoEvent *events, uint32_t maxeven
   return (int)to_process;
 }
 
-static int fd_poll_revents(int fd, uint16_t events, uint16_t *revents_out) {
-  NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
-  uint16_t revents = 0;
-
-  if (s != 0) {
-    if (socket_ready_for_read(s) && (events & NS_POLLIN) != 0u) {
-      revents |= NS_POLLIN;
-    }
-    if (socket_ready_for_write(s) && (events & NS_POLLOUT) != 0u) {
-      revents |= NS_POLLOUT;
-    }
-    if (revents_out != 0) {
-      *revents_out = revents;
-    }
-    return revents != 0u;
-  }
-
-  if (vfs_fcntl(fd, VFS_F_GETFL, 0) >= 0) {
-    if ((events & NS_POLLIN) != 0u) {
-      revents |= NS_POLLIN;
-    }
-    if ((events & NS_POLLOUT) != 0u) {
-      revents |= NS_POLLOUT;
-    }
-    if (revents_out != 0) {
-      *revents_out = revents;
-    }
-    return revents != 0u;
-  }
-
-  if (revents_out != 0) {
-    *revents_out = NS_POLLERR;
-  }
-  return 0;
-}
-
-static int poll_socket_array(NsPollFd *fds, uint32_t count) {
-  int ready = 0;
-
-  for (uint32_t i = 0; i < count; i++) {
-    fds[i].revents = 0;
-    (void)fd_poll_revents(fds[i].fd, fds[i].events, &fds[i].revents);
-    if (fds[i].revents != 0u) {
-      ready++;
-    }
-  }
-
-  return ready;
-}
-
-static int poll_socket_array_wait(NsPollFd *fds, uint32_t count, uint32_t timeout_ticks) {
-  uint32_t deadline = 0;
-
-  if (timeout_ticks != 0u) {
-    deadline = scheduler_now_ticks() + timeout_ticks;
-  }
-
-  while (1) {
-    int ready = poll_socket_array(fds, count);
-    if (ready > 0 || timeout_ticks == 0u) {
-      return ready;
-    }
-    if (scheduler_now_ticks() >= deadline) {
-      return 0;
-    }
-    task_sleep(1);
-  }
-}
-
-static int epoll_ctl_apply(NsEpollObject *obj, const NsEpollCtlReq *req) {
-  int free_slot = -1;
-  int found_slot = -1;
-
-  if (obj == 0 || req == 0 || req->event.fd < 0) {
-    return (int)NS_ERR_INVALID_ARG;
-  }
-
-  for (int i = 0; i < NS_EPOLL_MAX_WATCH; i++) {
-    if (!obj->watches[i].used && free_slot < 0) {
-      free_slot = i;
-    }
-    if (obj->watches[i].used && obj->watches[i].fd == req->event.fd) {
-      found_slot = i;
-      break;
-    }
-  }
-
-  if (req->op == NS_EPOLL_CTL_ADD) {
-    if (found_slot >= 0) {
-      return (int)NS_ERR_INVALID_ARG;
-    }
-    if (free_slot < 0) {
-      return (int)VFS_ERR_NO_SPACE;
-    }
-    obj->watches[free_slot].used = 1;
-    obj->watches[free_slot].fd = req->event.fd;
-    obj->watches[free_slot].events = req->event.events;
-    return NS_OK;
-  }
-
-  if (req->op == NS_EPOLL_CTL_MOD) {
-    if (found_slot < 0) {
-      return (int)NS_ERR_INVALID_ARG;
-    }
-    obj->watches[found_slot].events = req->event.events;
-    return NS_OK;
-  }
-
-  if (req->op == NS_EPOLL_CTL_DEL) {
-    if (found_slot < 0) {
-      return (int)NS_ERR_INVALID_ARG;
-    }
-    obj->watches[found_slot].used = 0;
-    obj->watches[found_slot].fd = -1;
-    obj->watches[found_slot].events = 0;
-    return NS_OK;
-  }
-
-  return (int)NS_ERR_INVALID_ARG;
-}
-
-static int epoll_collect_ready(NsEpollObject *obj, NsPollFd *out, uint32_t maxevents) {
-  int ready = 0;
-
-  if (obj == 0 || out == 0 || maxevents == 0u) {
-    return 0;
-  }
-
-  for (int i = 0; i < NS_EPOLL_MAX_WATCH; i++) {
-    uint16_t revents = 0;
-
-    if (!obj->watches[i].used) {
-      continue;
-    }
-    (void)fd_poll_revents(obj->watches[i].fd, obj->watches[i].events, &revents);
-    if (revents == 0u) {
-      continue;
-    }
-
-    out[ready].fd = obj->watches[i].fd;
-    out[ready].events = obj->watches[i].events;
-    out[ready].revents = revents;
-    ready++;
-    if ((uint32_t)ready >= maxevents) {
-      break;
-    }
-  }
-
-  return ready;
-}
-
-static int epoll_wait_ready(NsEpollObject *obj, NsPollFd *out, uint32_t maxevents,
-                            uint32_t timeout_ticks) {
-  uint32_t deadline = 0;
-  int infinite = (timeout_ticks == 0xFFFFFFFFu);
-
-  if (!infinite && timeout_ticks != 0u) {
-    deadline = scheduler_now_ticks() + timeout_ticks;
-  }
-
-  while (1) {
-    int ready = epoll_collect_ready(obj, out, maxevents);
-    if (ready > 0 || timeout_ticks == 0u) {
-      return ready;
-    }
-    if (!infinite && scheduler_now_ticks() >= deadline) {
-      return 0;
-    }
-    task_sleep(1);
-  }
-}
-
-static void socket_close_all_for_task(int task_id) {
-  if (task_id < 0 || task_id >= MAX_TASKS) {
-    return;
-  }
-  for (int i = 0; i < NS_SOCKET_MAX_PER_TASK; i++) {
-    if (task_sockets[task_id][i].used) {
-      socket_close_entry(&task_sockets[task_id][i]);
-    }
-  }
-}
 
 static void aio_close_all_for_task(int task_id) {
   if (task_id < 0 || task_id >= MAX_TASKS) {
@@ -1449,8 +964,8 @@ void syscall_handler(uint32_t *regs) {
     task_mmap_next[child] = task_mmap_next[parent];
     task_alarm_tick[child] = task_alarm_tick[parent];
 
-    socket_close_all_for_task(child);
-    epoll_close_all_for_task(child);
+    ns_socket_close_all_for_task(child);
+    ns_epoll_close_all_for_task(child);
 
     vfs_clone_task_fds(parent, child);
     posix_clone_fd_rights(parent, child);
@@ -1470,18 +985,18 @@ void syscall_handler(uint32_t *regs) {
         syscall_complete(regs, syscall_num, NS_ERR_BAD_POINTER);
         break;
       }
-      s = socket_entry_for_fd(os_current_task, fd);
+      s = ns_socket_entry_for_fd(os_current_task, fd);
       if (s != 0) {
         if (s->shut_rd) {
           syscall_complete(regs, syscall_num, (uint32_t)NS_ERR_INVALID_ARG);
           break;
         }
-        if (!socket_ready_for_read(s)) {
-          if (socket_is_nonblocking(s)) {
+        if (!ns_socket_ready_for_read(s)) {
+          if (ns_socket_is_nonblocking(s)) {
             syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
             break;
           }
-          if (!socket_wait_for_readable(s, s->rcv_timeout_ticks)) {
+          if (!ns_socket_wait_for_readable(s, s->rcv_timeout_ticks)) {
             syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
             break;
           }
@@ -1512,13 +1027,13 @@ void syscall_handler(uint32_t *regs) {
     {
       int fd = (int)regs[4];
       int rc;
-      NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
-      NsEpollObject *ep = epoll_object_for_fd(os_current_task, fd);
+      NsSocketEntry *s = ns_socket_entry_for_fd(os_current_task, fd);
+      NsEpollObject *ep = ns_epoll_object_for_fd(os_current_task, fd);
       if (s != 0) {
-        socket_close_entry(s);
+        ns_socket_close_entry(s);
         rc = NS_OK;
       } else if (ep != 0) {
-        epoll_close_object(ep);
+        ns_epoll_close_object(ep);
         rc = NS_OK;
       } else {
         rc = vfs_close(fd);
@@ -1591,7 +1106,7 @@ void syscall_handler(uint32_t *regs) {
     int fd = (int)regs[4];
     int cmd = (int)regs[6];
     int arg = (int)regs[5];
-    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+    NsSocketEntry *s = ns_socket_entry_for_fd(os_current_task, fd);
     int rc;
 
     if (s != 0) {
@@ -1729,8 +1244,8 @@ void syscall_handler(uint32_t *regs) {
       syscall_complete(regs, syscall_num, NS_ERR_PERMISSION);
       break;
     }
-    socket_close_all_for_task(os_current_task);
-    epoll_close_all_for_task(os_current_task);
+    ns_socket_close_all_for_task(os_current_task);
+    ns_epoll_close_all_for_task(os_current_task);
     aio_close_all_for_task(os_current_task);
     posix_clear_task_fds(os_current_task);
     syscall_complete(regs, syscall_num, NS_OK);
@@ -2526,7 +2041,7 @@ void syscall_handler(uint32_t *regs) {
       break;
     }
 
-    fd = socket_alloc_fd(os_current_task, type, protocol);
+    fd = ns_socket_alloc_fd(os_current_task, type, protocol);
     if (fd < 0) {
       syscall_complete(regs, syscall_num, (uint32_t)VFS_ERR_NO_SPACE);
       break;
@@ -2547,7 +2062,7 @@ void syscall_handler(uint32_t *regs) {
       break;
     }
 
-    s = socket_entry_for_fd(os_current_task, fd);
+    s = ns_socket_entry_for_fd(os_current_task, fd);
     if (s == 0 || addr == 0 || addr->sin_family != NS_AF_INET) {
       syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
       break;
@@ -2577,7 +2092,7 @@ void syscall_handler(uint32_t *regs) {
 
   case SYS_LISTEN: {
     int fd = (int)regs[4];
-    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+    NsSocketEntry *s = ns_socket_entry_for_fd(os_current_task, fd);
     int conn_id;
 
     if (s == 0 || s->type != NS_SOCK_STREAM || !s->bound) {
@@ -2600,7 +2115,7 @@ void syscall_handler(uint32_t *regs) {
   case SYS_ACCEPT: {
     int fd = (int)regs[4];
     NsSockAddrIn *peer = (NsSockAddrIn *)regs[6];
-    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+    NsSocketEntry *s = ns_socket_entry_for_fd(os_current_task, fd);
     uint32_t peer_ip = 0;
     uint16_t peer_port = 0;
     int conn_id;
@@ -2616,12 +2131,12 @@ void syscall_handler(uint32_t *regs) {
       break;
     }
 
-    if (!socket_ready_for_read(s)) {
-      if (socket_is_nonblocking(s)) {
+    if (!ns_socket_ready_for_read(s)) {
+      if (ns_socket_is_nonblocking(s)) {
         syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
         break;
       }
-      if (!socket_wait_for_readable(s, s->rcv_timeout_ticks)) {
+      if (!ns_socket_wait_for_readable(s, s->rcv_timeout_ticks)) {
         syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
         break;
       }
@@ -2633,14 +2148,14 @@ void syscall_handler(uint32_t *regs) {
       break;
     }
 
-    newfd = socket_alloc_fd(os_current_task, NS_SOCK_STREAM, 0);
+    newfd = ns_socket_alloc_fd(os_current_task, NS_SOCK_STREAM, 0);
     if (newfd < 0) {
       (void)net_tcp_close(conn_id);
       syscall_complete(regs, syscall_num, (uint32_t)VFS_ERR_NO_SPACE);
       break;
     }
 
-    child = socket_entry_for_fd(os_current_task, newfd);
+    child = ns_socket_entry_for_fd(os_current_task, newfd);
     child->bound = 1;
     child->local_port = s->local_port;
     child->peer_ip = peer_ip;
@@ -2668,7 +2183,7 @@ void syscall_handler(uint32_t *regs) {
   case SYS_CONNECT: {
     int fd = (int)regs[4];
     const NsSockAddrIn *addr = (const NsSockAddrIn *)regs[6];
-    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+    NsSocketEntry *s = ns_socket_entry_for_fd(os_current_task, fd);
     uint16_t port;
     uint32_t ip;
     int conn_id;
@@ -2711,7 +2226,7 @@ void syscall_handler(uint32_t *regs) {
     s->peer_port = port;
     s->net_conn_id = conn_id;
     s->listening = 0;
-    if (socket_is_nonblocking(s)) {
+    if (ns_socket_is_nonblocking(s)) {
       syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
       break;
     }
@@ -2741,7 +2256,7 @@ void syscall_handler(uint32_t *regs) {
     int fd = (int)regs[4];
     const void *buf = (const void *)regs[6];
     uint32_t len = regs[5];
-    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+    NsSocketEntry *s = ns_socket_entry_for_fd(os_current_task, fd);
     int rc = (int)NS_ERR_INVALID_ARG;
 
     if (cpl == 3 && !validate_user_ptr(buf, len)) {
@@ -2767,12 +2282,12 @@ void syscall_handler(uint32_t *regs) {
       }
       rc = rc ? (int)len : (int)NS_ERR_WOULD_BLOCK;
     } else if (s->type == NS_SOCK_STREAM && s->net_conn_id >= 0) {
-      if (!socket_ready_for_write(s)) {
-        if (socket_is_nonblocking(s)) {
+      if (!ns_socket_ready_for_write(s)) {
+        if (ns_socket_is_nonblocking(s)) {
           syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
           break;
         }
-        if (!socket_wait_for_writable(s, s->snd_timeout_ticks)) {
+        if (!ns_socket_wait_for_writable(s, s->snd_timeout_ticks)) {
           syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
           break;
         }
@@ -2788,7 +2303,7 @@ void syscall_handler(uint32_t *regs) {
     int fd = (int)regs[4];
     void *buf = (void *)regs[6];
     uint32_t len = regs[5];
-    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+    NsSocketEntry *s = ns_socket_entry_for_fd(os_current_task, fd);
     int rc = (int)NS_ERR_INVALID_ARG;
 
     if (cpl == 3 && !validate_user_ptr(buf, len)) {
@@ -2807,12 +2322,12 @@ void syscall_handler(uint32_t *regs) {
     if (s->type == NS_SOCK_DGRAM && s->bound) {
       uint32_t src_ip = 0;
       uint16_t src_port = 0;
-      if (!socket_ready_for_read(s)) {
-        if (socket_is_nonblocking(s)) {
+      if (!ns_socket_ready_for_read(s)) {
+        if (ns_socket_is_nonblocking(s)) {
           syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
           break;
         }
-        if (!socket_wait_for_readable(s, s->rcv_timeout_ticks)) {
+        if (!ns_socket_wait_for_readable(s, s->rcv_timeout_ticks)) {
           syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
           break;
         }
@@ -2823,12 +2338,12 @@ void syscall_handler(uint32_t *regs) {
         s->peer_port = src_port;
       }
     } else if (s->type == NS_SOCK_STREAM && s->net_conn_id >= 0) {
-      if (!socket_ready_for_read(s)) {
-        if (socket_is_nonblocking(s)) {
+      if (!ns_socket_ready_for_read(s)) {
+        if (ns_socket_is_nonblocking(s)) {
           syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
           break;
         }
-        if (!socket_wait_for_readable(s, s->rcv_timeout_ticks)) {
+        if (!ns_socket_wait_for_readable(s, s->rcv_timeout_ticks)) {
           syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
           break;
         }
@@ -2847,7 +2362,7 @@ void syscall_handler(uint32_t *regs) {
     int fd = (int)regs[4];
     int opt = (int)regs[5];
     uint32_t val = regs[6];
-    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+    NsSocketEntry *s = ns_socket_entry_for_fd(os_current_task, fd);
 
     if (s == 0) {
       syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
@@ -2881,7 +2396,7 @@ void syscall_handler(uint32_t *regs) {
   case SYS_GETSOCKOPT: {
     int fd = (int)regs[4];
     int opt = (int)regs[5];
-    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+    NsSocketEntry *s = ns_socket_entry_for_fd(os_current_task, fd);
     uint32_t out = 0;
 
     if (s == 0) {
@@ -2916,7 +2431,7 @@ void syscall_handler(uint32_t *regs) {
   case SYS_SHUTDOWN: {
     int fd = (int)regs[4];
     int how = (int)regs[5];
-    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+    NsSocketEntry *s = ns_socket_entry_for_fd(os_current_task, fd);
 
     if (s == 0 || (how != NS_SHUT_RD && how != NS_SHUT_WR && how != NS_SHUT_RDWR)) {
       syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
@@ -3029,7 +2544,7 @@ void syscall_handler(uint32_t *regs) {
       break;
     }
 
-    rc = poll_socket_array_wait(fds, count, timeout_ticks);
+    rc = ns_poll_socket_array_wait(os_current_task, fds, count, timeout_ticks);
     syscall_complete(regs, syscall_num, (uint32_t)rc);
     break;
   }
@@ -3040,7 +2555,7 @@ void syscall_handler(uint32_t *regs) {
     uint32_t arg = regs[6];
 
     if (op == NS_EPOLL_OP_CREATE) {
-      int newfd = epoll_alloc_fd(os_current_task);
+      int newfd = ns_epoll_alloc_fd(os_current_task);
       if (newfd < 0) {
         syscall_complete(regs, syscall_num, (uint32_t)VFS_ERR_NO_SPACE);
       } else {
@@ -3050,18 +2565,18 @@ void syscall_handler(uint32_t *regs) {
     }
 
     if (op == NS_EPOLL_OP_CLOSE) {
-      NsEpollObject *obj = epoll_object_for_fd(os_current_task, epfd);
+      NsEpollObject *obj = ns_epoll_object_for_fd(os_current_task, epfd);
       if (obj == 0) {
         syscall_complete(regs, syscall_num, NS_ERR_INVALID_ARG);
       } else {
-        epoll_close_object(obj);
+        ns_epoll_close_object(obj);
         syscall_complete(regs, syscall_num, NS_OK);
       }
       break;
     }
 
     if (op == NS_EPOLL_OP_CTL) {
-      NsEpollObject *obj = epoll_object_for_fd(os_current_task, epfd);
+      NsEpollObject *obj = ns_epoll_object_for_fd(os_current_task, epfd);
       NsEpollCtlReq *req = (NsEpollCtlReq *)arg;
       int rc;
 
@@ -3074,13 +2589,13 @@ void syscall_handler(uint32_t *regs) {
         break;
       }
 
-      rc = epoll_ctl_apply(obj, req);
+      rc = ns_epoll_ctl_apply(obj, req);
       syscall_complete(regs, syscall_num, (uint32_t)rc);
       break;
     }
 
     if (op == NS_EPOLL_OP_WAIT) {
-      NsEpollObject *obj = epoll_object_for_fd(os_current_task, epfd);
+      NsEpollObject *obj = ns_epoll_object_for_fd(os_current_task, epfd);
       NsEpollWaitReq *req = (NsEpollWaitReq *)arg;
       int rc;
 
@@ -3101,7 +2616,7 @@ void syscall_handler(uint32_t *regs) {
         break;
       }
 
-      rc = epoll_wait_ready(obj, req->events, req->maxevents, req->timeout_ticks);
+      rc = ns_epoll_wait_ready(obj, req->events, req->maxevents, req->timeout_ticks);
       syscall_complete(regs, syscall_num, (uint32_t)rc);
       break;
     }
@@ -3370,7 +2885,7 @@ void syscall_handler(uint32_t *regs) {
     const void *buf = (const void *)regs[6];
     uint32_t size = regs[5];
     int wrote = VFS_ERR_INVALID_ARG;
-    NsSocketEntry *s = socket_entry_for_fd(os_current_task, fd);
+    NsSocketEntry *s = ns_socket_entry_for_fd(os_current_task, fd);
 
     if (s != 0 && buf != 0 && size > 0) {
       if (cpl == 3 && !validate_user_ptr(buf, size)) {
@@ -3383,12 +2898,12 @@ void syscall_handler(uint32_t *regs) {
       }
 
       if (s->type == NS_SOCK_STREAM && s->net_conn_id >= 0) {
-        if (!socket_ready_for_write(s)) {
-          if (socket_is_nonblocking(s)) {
+        if (!ns_socket_ready_for_write(s)) {
+          if (ns_socket_is_nonblocking(s)) {
             syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
             break;
           }
-          if (!socket_wait_for_writable(s, s->snd_timeout_ticks)) {
+          if (!ns_socket_wait_for_writable(s, s->snd_timeout_ticks)) {
             syscall_complete(regs, syscall_num, NS_ERR_WOULD_BLOCK);
             break;
           }

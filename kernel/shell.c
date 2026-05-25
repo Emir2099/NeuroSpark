@@ -7,6 +7,7 @@
 #include "vfs.h"
 #include "usermode.h"
 #include "net.h"
+#include "remote_auth.h"
 #include "profiling.h"
 #include "model_manager.h"
 #include "task.h"
