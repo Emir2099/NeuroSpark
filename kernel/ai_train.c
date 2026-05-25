@@ -1,8 +1,23 @@
 #include "ai_train.h"
 
 #include "ai_runtime.h"
+#include "vfs.h"
 
 static AiTrainStats g_train;
+
+#define AI_TRAIN_CKPT_PATH "/ai_train.ckpt"
+#define AI_TRAIN_CKPT_MAGIC 0x314B5043u /* CPK1 */
+
+typedef struct {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t total_steps;
+  uint32_t learning_rate_ppm;
+  uint32_t max_drift;
+  int current_bias;
+  int checkpoint_bias;
+  char model_name[16];
+} AiTrainCheckpoint;
 
 static void copy_name(char *dst, int dst_len, const char *src) {
   int i = 0;
@@ -22,6 +37,59 @@ static void copy_name(char *dst, int dst_len, const char *src) {
 
 static int abs_i32(int v) {
   return (v < 0) ? -v : v;
+}
+
+static int str_eq_local(const char *a, const char *b) {
+  int i = 0;
+  if (a == 0 || b == 0) {
+    return 0;
+  }
+  while (a[i] && b[i]) {
+    if (a[i] != b[i]) {
+      return 0;
+    }
+    i++;
+  }
+  return a[i] == '\0' && b[i] == '\0';
+}
+
+static int ai_train_save_checkpoint(void) {
+  AiTrainCheckpoint ckpt;
+  ckpt.magic = AI_TRAIN_CKPT_MAGIC;
+  ckpt.version = 1u;
+  ckpt.total_steps = g_train.total_steps;
+  ckpt.learning_rate_ppm = g_train.learning_rate_ppm;
+  ckpt.max_drift = g_train.max_drift;
+  ckpt.current_bias = g_train.current_bias;
+  ckpt.checkpoint_bias = g_train.checkpoint_bias;
+  copy_name(ckpt.model_name, (int)sizeof(ckpt.model_name), g_train.model_name);
+  return vfs_write_file(AI_TRAIN_CKPT_PATH, &ckpt, (uint32_t)sizeof(ckpt)) == (int)sizeof(ckpt);
+}
+
+static int ai_train_load_checkpoint(const char *expected_model) {
+  AiTrainCheckpoint ckpt;
+  if (vfs_read_file(AI_TRAIN_CKPT_PATH, &ckpt, (uint32_t)sizeof(ckpt)) != (int)sizeof(ckpt)) {
+    return 0;
+  }
+  if (ckpt.magic != AI_TRAIN_CKPT_MAGIC || ckpt.version != 1u) {
+    return 0;
+  }
+  if (expected_model != 0 && expected_model[0] != '\0' &&
+      !ai_runtime_get_model_bias(expected_model, &g_train.current_bias)) {
+    return 0;
+  }
+  if (expected_model != 0 && expected_model[0] != '\0' &&
+      !str_eq_local(expected_model, ckpt.model_name)) {
+    return 0;
+  }
+
+  g_train.total_steps = ckpt.total_steps;
+  g_train.learning_rate_ppm = ckpt.learning_rate_ppm;
+  g_train.max_drift = ckpt.max_drift;
+  g_train.current_bias = ckpt.current_bias;
+  g_train.checkpoint_bias = ckpt.checkpoint_bias;
+  copy_name(g_train.model_name, (int)sizeof(g_train.model_name), ckpt.model_name);
+  return ai_runtime_set_model_bias(g_train.model_name, g_train.current_bias);
 }
 
 void ai_train_init(void) {
@@ -65,6 +133,7 @@ int ai_train_start(const char *model_name, uint32_t learning_rate_ppm,
   g_train.current_bias = bias;
   g_train.checkpoint_bias = bias;
   copy_name(g_train.model_name, sizeof(g_train.model_name), model_name);
+  (void)ai_train_load_checkpoint(model_name);
   return 1;
 }
 
@@ -129,12 +198,17 @@ int ai_train_checkpoint(void) {
   }
   g_train.checkpoint_bias = g_train.current_bias;
   g_train.checkpoints++;
+  (void)ai_train_save_checkpoint();
   return 1;
 }
 
 int ai_train_rollback(void) {
   if (!g_train.active) {
     return 0;
+  }
+  if (ai_train_load_checkpoint(g_train.model_name)) {
+    g_train.rollbacks++;
+    return 1;
   }
   g_train.current_bias = g_train.checkpoint_bias;
   g_train.rollbacks++;

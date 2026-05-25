@@ -9,9 +9,93 @@ typedef unsigned char uint8_t;
 static AiModelInfo g_models[AI_MAX_MODELS];
 static AiRuntimeStats g_stats;
 
+typedef int (*AiBackendInferFn)(const AiModelInfo *m, int input_value,
+                                uint32_t seed, int *out_value,
+                                uint32_t *out_hash);
+
+typedef struct {
+  uint32_t id;
+  uint32_t capability_flags;
+  AiBackendInferFn infer;
+} AiBackendAdapter;
+
+#define AI_BACKEND_CAP_DETERMINISTIC 0x1u
+#define AI_BACKEND_CAP_SPIKE_NATIVE 0x2u
+
 static void copy_name(char *dst, int dst_len, const char *src);
 static int name_valid(const char *name);
 static uint32_t mix_u32(uint32_t x);
+
+static int cpu_backend_infer(const AiModelInfo *m, int input_value,
+                             uint32_t seed, int *out_value,
+                             uint32_t *out_hash);
+static int neuro_backend_infer(const AiModelInfo *m, int input_value,
+                               uint32_t seed, int *out_value,
+                               uint32_t *out_hash);
+
+static const AiBackendAdapter g_backends[] = {
+    {AI_BACKEND_CPU, AI_BACKEND_CAP_DETERMINISTIC, cpu_backend_infer},
+    {AI_BACKEND_NEURO,
+     AI_BACKEND_CAP_DETERMINISTIC | AI_BACKEND_CAP_SPIKE_NATIVE,
+     neuro_backend_infer},
+};
+
+static const AiBackendAdapter *resolve_backend(uint32_t backend_id) {
+  uint32_t i;
+  for (i = 0; i < (uint32_t)(sizeof(g_backends) / sizeof(g_backends[0])); i++) {
+    if (g_backends[i].id == backend_id) {
+      return &g_backends[i];
+    }
+  }
+  return 0;
+}
+
+static int cpu_backend_infer(const AiModelInfo *m, int input_value,
+                             uint32_t seed, int *out_value,
+                             uint32_t *out_hash) {
+  uint32_t s;
+  int out;
+  if (m == 0 || out_value == 0) {
+    return 0;
+  }
+  s = seed ? seed : m->seed;
+  s = mix_u32(s ^ (uint32_t)(input_value + 0x13579));
+  s = mix_u32(s ^ m->checksum);
+  s = mix_u32(s ^ m->artifact_hash);
+  out = (int)(s % 2048u) + input_value + m->bias;
+  if (m->kind == AI_MODEL_KIND_SNN) {
+    out += (int)((s >> 8) & 0x3Fu);
+  }
+  *out_value = out;
+  if (out_hash != 0) {
+    *out_hash = s;
+  }
+  return 1;
+}
+
+static int neuro_backend_infer(const AiModelInfo *m, int input_value,
+                               uint32_t seed, int *out_value,
+                               uint32_t *out_hash) {
+  uint32_t s;
+  int out;
+  if (m == 0 || out_value == 0) {
+    return 0;
+  }
+  s = seed ? seed : m->seed;
+  s = mix_u32(s ^ (uint32_t)(input_value + 0x2468Bu));
+  s = mix_u32(s ^ (m->checksum << 1));
+  s = mix_u32(s ^ m->artifact_hash ^ 0x5A5AA11u);
+  out = (int)(s % 1024u) + (input_value * 2) + m->bias;
+  out += (int)((s >> 7) & 0x7Fu);
+  if (m->kind == AI_MODEL_KIND_SNN) {
+    out += (int)((s >> 3) & 0x3Fu);
+  }
+  *out_value = out;
+  if (out_hash != 0) {
+    *out_hash = s;
+  }
+  return 1;
+}
 
 static uint32_t hash_init(void) {
   return 0xC0FFEE11u;
@@ -561,8 +645,8 @@ int ai_runtime_infer(const char *name, int input_value, uint32_t seed,
                      int *out_value) {
   int idx = find_model_index(name);
   AiModelInfo *m;
-  uint32_t s;
-  int out;
+  uint32_t s = 0;
+  const AiBackendAdapter *backend;
 
   if (idx < 0 || out_value == 0) {
     g_stats.infer_fail++;
@@ -570,22 +654,17 @@ int ai_runtime_infer(const char *name, int input_value, uint32_t seed,
   }
 
   m = &g_models[idx];
-  s = seed ? seed : m->seed;
-  s = mix_u32(s ^ (uint32_t)(input_value + 0x13579));
-  s = mix_u32(s ^ m->checksum);
-  s = mix_u32(s ^ m->artifact_hash);
-
-  if (g_stats.active_backend == AI_BACKEND_CPU) {
-    out = (int)(s % 2048u) + input_value + m->bias;
-  } else {
-    out = (int)(s % 1024u) + (input_value * 2) + m->bias;
+  backend = resolve_backend(g_stats.active_backend);
+  if (backend == 0 || backend->infer == 0) {
+    g_stats.infer_fail++;
+    return 0;
   }
 
-  if (m->kind == AI_MODEL_KIND_SNN) {
-    out += (int)((s >> 8) & 0x3Fu);
+  if (!backend->infer(m, input_value, seed, out_value, &s)) {
+    g_stats.infer_fail++;
+    return 0;
   }
 
-  *out_value = out;
   g_stats.infer_ok++;
   g_stats.last_hash = s;
   return 1;

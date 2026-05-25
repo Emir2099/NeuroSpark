@@ -15,9 +15,12 @@ typedef struct {
   uint32_t qos_mode;
   uint32_t budget_pct;
   uint32_t queue_depth;
+  uint32_t stream_queue_depth;
+  uint32_t batch_queue_depth;
   uint32_t max_queue_depth;
   uint32_t submitted;
   uint32_t completed;
+  uint32_t processed_jobs;
   uint32_t dropped;
   uint32_t latency_accum;
   uint32_t latency_max;

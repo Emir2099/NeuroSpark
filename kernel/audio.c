@@ -3,13 +3,25 @@
 
 typedef int int32_t;
 
+typedef struct {
+  int voltage;
+  int spike_count;
+  int id;
+  int synaptic_weight;
+  int refractory_timer;
+  int dynamic_threshold;
+} Neuron;
+
+typedef struct {
+  Neuron neurons[5];
+  unsigned char current_phase;
+  int pixel_recent_spikes;
+} NeuralPixel;
+
+extern NeuralPixel os_memory_map[2];
+
 #define AUDIO_MIX_RING 1024
 #define AUDIO_MAX_VOLUME 100
-
-#define AUDIO_CTL_STOP 1u
-#define AUDIO_CTL_SET_VOLUME 2u
-#define AUDIO_CTL_SET_FREQ 3u
-#define AUDIO_CTL_SONIFY 4u
 
 static AudioStream g_streams[AUDIO_MAX_STREAMS];
 static int16_t g_mix_ring[AUDIO_MIX_RING];
@@ -83,6 +95,41 @@ static int16_t generate_stream_sample(AudioStream *s) {
   return sample;
 }
 
+static int16_t generate_capture_sample(uint32_t stream_id) {
+  int px;
+  int n;
+  int activity = 0;
+  int amp;
+
+  for (px = 0; px < 2; px++) {
+    activity += os_memory_map[px].pixel_recent_spikes;
+    for (n = 0; n < 5; n++) {
+      activity += os_memory_map[px].neurons[n].spike_count;
+    }
+  }
+
+  amp = (activity % 64) * 400;
+  if (((stream_id + activity) & 1u) == 0u) {
+    return (int16_t)amp;
+  }
+  return (int16_t)(-amp);
+}
+
+static uint32_t sample_spike_activity(void) {
+  uint32_t sum = 0;
+  int px;
+  int n;
+
+  for (px = 0; px < 2; px++) {
+    sum += (uint32_t)(os_memory_map[px].pixel_recent_spikes & 0xFFFF);
+    for (n = 0; n < 5; n++) {
+      sum += (uint32_t)(os_memory_map[px].neurons[n].spike_count & 0xFFFF);
+    }
+  }
+
+  return sum;
+}
+
 static uint32_t normalized_sample_rate(uint32_t sample_rate) {
   if (sample_rate < 50u) {
     return g_stats.tick_hz ? g_stats.tick_hz : 100u;
@@ -148,11 +195,14 @@ void audio_init(uint32_t tick_hz) {
     g_streams[i].channels = 1;
     g_streams[i].bits_per_sample = 16;
     g_streams[i].flags = 0;
+    g_streams[i].priority_qos = 1u;
+    g_streams[i].max_samples_per_tick = 1u;
     g_streams[i].phase_accum = 0;
     g_streams[i].phase_step = 0;
     g_streams[i].ring_r = 0;
     g_streams[i].ring_w = 0;
     g_streams[i].underruns = 0;
+    g_streams[i].policy_drops = 0;
     g_streams[i].produced_samples = 0;
     g_streams[i].mixed_samples = 0;
   }
@@ -166,7 +216,8 @@ static void refresh_sonify_stream(void) {
     return;
   }
 
-  tone_seed = tick;
+  /* Bind sonification to current neural activity, not only global time. */
+  tone_seed = sample_spike_activity() + tick;
   freq = g_stats.sonify_base_hz +
       (tone_seed & 0xFFu) * g_stats.sonify_span_hz / 255u;
 
@@ -192,16 +243,31 @@ void audio_tick(void) {
   for (i = 0; i < AUDIO_MAX_STREAMS; i++) {
     AudioStream *s = &g_streams[i];
     int16_t sample;
+    uint32_t generated_this_tick = 0;
 
     if (!s->active) {
       continue;
     }
 
-    if (s->mode != AUDIO_STREAM_MODE_TONE) {
+    if (s->max_samples_per_tick == 0u) {
+      s->max_samples_per_tick = 1u;
+    }
+
+    if (s->mode == AUDIO_STREAM_MODE_TONE) {
+      sample = generate_stream_sample(s);
+      generated_this_tick = 1u;
+    } else if (s->mode == AUDIO_STREAM_MODE_CAPTURE) {
+      sample = generate_capture_sample((uint32_t)s->id);
+      generated_this_tick = 1u;
+    } else {
       continue;
     }
 
-    sample = generate_stream_sample(s);
+    if (generated_this_tick > s->max_samples_per_tick) {
+      s->policy_drops++;
+      continue;
+    }
+
     if (!stream_ring_push(s, sample)) {
       s->underruns++;
       g_stats.mix_underruns++;
@@ -216,9 +282,21 @@ void audio_tick(void) {
       continue;
     }
 
+    /* Capture streams are producer-only for user reads; do not drain here. */
+    if (s->mode == AUDIO_STREAM_MODE_CAPTURE) {
+      continue;
+    }
+
     if (!stream_ring_pop(s, &sample)) {
       s->underruns++;
       g_stats.mix_underruns++;
+      continue;
+    }
+
+    if (s->max_samples_per_tick > 0u && s->mixed_samples > 0u &&
+        (s->mixed_samples % s->max_samples_per_tick) == 0u &&
+        s->priority_qos == 0u) {
+      s->policy_drops++;
       continue;
     }
 
@@ -284,17 +362,21 @@ int audio_stream_open(uint32_t sample_rate, uint32_t channels,
 
     s->active = 1;
     s->volume_pct = 80;
-    s->mode = AUDIO_STREAM_MODE_PCM;
+    s->mode = (flags & AUDIO_STREAM_FLAG_CAPTURE) ?
+            AUDIO_STREAM_MODE_CAPTURE : AUDIO_STREAM_MODE_PCM;
     s->freq_hz = 0;
     s->sample_rate = negotiated_rate;
     s->channels = negotiated_channels;
     s->bits_per_sample = negotiated_bits;
     s->flags = flags;
+    s->priority_qos = 1u;
+    s->max_samples_per_tick = 1u;
     s->phase_accum = 0;
     s->phase_step = 0;
     s->ring_r = 0;
     s->ring_w = 0;
     s->underruns = 0;
+    s->policy_drops = 0;
     s->produced_samples = 0;
     s->mixed_samples = 0;
     return s->id;
@@ -350,6 +432,47 @@ int audio_stream_write(int stream_id, const void *pcm, uint32_t bytes) {
   return (int)(written * s->channels * 2u);
 }
 
+int audio_stream_read(int stream_id, void *pcm, uint32_t bytes) {
+  AudioStream *s;
+  int16_t *dst = (int16_t *)pcm;
+  uint32_t frames;
+  uint32_t read_frames = 0;
+
+  if (stream_id < 0 || stream_id >= AUDIO_MAX_STREAMS || pcm == 0 || bytes == 0u) {
+    return -1;
+  }
+
+  s = &g_streams[stream_id];
+  if (!s->active || s->mode != AUDIO_STREAM_MODE_CAPTURE || s->bits_per_sample != 16u) {
+    return -1;
+  }
+  if (s->channels == 0u) {
+    return -1;
+  }
+
+  frames = bytes / (2u * s->channels);
+  if (frames == 0u) {
+    return 0;
+  }
+
+  while (read_frames < frames) {
+    int16_t sample;
+    uint32_t ch;
+    if (!stream_ring_pop(s, &sample)) {
+      break;
+    }
+    for (ch = 0; ch < s->channels; ch++) {
+      dst[(read_frames * s->channels) + ch] = sample;
+    }
+    read_frames++;
+  }
+
+  if (read_frames == 0u) {
+    return -3;
+  }
+  return (int)(read_frames * s->channels * 2u);
+}
+
 int audio_stop_stream(int stream_id) {
   if (stream_id < 0 || stream_id >= AUDIO_MAX_STREAMS) {
     return 0;
@@ -361,10 +484,13 @@ int audio_stop_stream(int stream_id) {
   g_streams[stream_id].channels = 1;
   g_streams[stream_id].bits_per_sample = 16;
   g_streams[stream_id].flags = 0;
+  g_streams[stream_id].priority_qos = 1u;
+  g_streams[stream_id].max_samples_per_tick = 1u;
   g_streams[stream_id].phase_accum = 0;
   g_streams[stream_id].phase_step = 0;
   g_streams[stream_id].ring_r = 0;
   g_streams[stream_id].ring_w = 0;
+  g_streams[stream_id].policy_drops = 0;
   return 1;
 }
 
@@ -424,6 +550,20 @@ int audio_stream_ctl(int stream_id, uint32_t cmd, uint32_t arg0, uint32_t arg1) 
   }
   if (cmd == AUDIO_CTL_SET_FREQ) {
     return audio_set_stream_freq(stream_id, arg0);
+  }
+  if (cmd == AUDIO_CTL_SET_PRIORITY) {
+    if (arg0 > 3u) {
+      return 0;
+    }
+    g_streams[stream_id].priority_qos = arg0;
+    return 1;
+  }
+  if (cmd == AUDIO_CTL_SET_RATE_LIMIT) {
+    if (arg0 == 0u || arg0 > 64u) {
+      return 0;
+    }
+    g_streams[stream_id].max_samples_per_tick = arg0;
+    return 1;
   }
 
   return 0;

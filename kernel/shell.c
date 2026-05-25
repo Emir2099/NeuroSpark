@@ -606,6 +606,9 @@ void scroll_shell(void) {
 }
 
 void list_files(void) {
+  int found = 0;
+  int count = 0;
+
   if (ata_disk_available) {
     disk_read_sector(TFS_DIR_LBA, (uint16_t *)root_directory);
   }
@@ -613,7 +616,6 @@ void list_files(void) {
   gprint("NAME         LBA    SIZE\n", 0x99EEFF);
   gprint("------------------------\n", 0x557799);
 
-  int found = 0;
   for (int i = 0; i < TFS_MAX_FILES; i++) {
     if (root_directory[i].flags == 1) {
       gprint(root_directory[i].name, 0x00FF88);
@@ -623,11 +625,18 @@ void list_files(void) {
       gprint_dec((int)root_directory[i].size, 0xFFFFFF);
       gprint("\n", 0x000000);
       found = 1;
+      count++;
     }
   }
 
   if (!found) {
     gprint("NO FILES FOUND.\n", 0xFF5555);
+    set_cmd_output("LS EMPTY");
+    return;
+  }
+
+  if (count > 0) {
+    set_cmd_output("LS OK");
   }
 }
 
@@ -661,9 +670,10 @@ static void cmd_help(const char *args) {
   gprint("phase28:  kdbg show|stack|mem|trace  trace <pid> on|off|show\n", 0x77C8FF);
   gprint("          profile samples [n]  profile export <path>\n", 0x77C8FF);
   gprint("phase30/31: phasecheck [usb_cycles] [audio_frames]\n", 0x77C8FF);
-  gprint("phase31:  audio play [hz] [vol]  audio stop [id|all]  audio stat\n", 0x77C8FF);
+  gprint("phase31:  audio play [hz] [vol]  audio stop [id|all]  audio stat  audio policy <id> <prio> <rate>\n", 0x77C8FF);
   gprint("          audio drv stat|reset|loopback [frames] [hz] [ch] [bits]  sonify on|off|stat\n", 0x77C8FF);
-  gprint("phase32:  ai model ls|load|import|verify  ai qos  ai infer  ai bench  ai train ...\n", 0x77C8FF);
+  gprint("          audio cap open|read|close ...\n", 0x77C8FF);
+  gprint("phase32:  ai model ls|load|import|verify  ai qos  ai infer  ai bench  ai train ...  ai export [path]\n", 0x77C8FF);
   gprint("system:   tz show | tz set <+HH[:MM]|-HH[:MM]>\n", 0x77C8FF);
   set_cmd_output("HELP: pci usb audio help");
 }
@@ -1765,6 +1775,67 @@ static void cmd_ai(const char *args) {
     return;
   }
 
+  if (str_eq(sub, "export")) {
+    char path[48];
+    char blob[320];
+    int at = 0;
+    int wrote;
+
+    copy_cmd_text(path, b[0] ? b : "/ai_telemetry.txt", sizeof(path));
+    ai_runtime_get_stats(&rt);
+    ai_scheduler_get_stats(&sched);
+    ai_train_get_stats(&tr);
+
+    append_text(blob, sizeof(blob), &at, "AI telemetry\n");
+    append_text(blob, sizeof(blob), &at, "model_count=");
+    append_dec(blob, sizeof(blob), &at, (int)rt.model_count);
+    append_text(blob, sizeof(blob), &at, " backend=");
+    append_dec(blob, sizeof(blob), &at, (int)rt.active_backend);
+    append_text(blob, sizeof(blob), &at, " infer_ok=");
+    append_dec(blob, sizeof(blob), &at, (int)rt.infer_ok);
+    append_text(blob, sizeof(blob), &at, " infer_fail=");
+    append_dec(blob, sizeof(blob), &at, (int)rt.infer_fail);
+    append_text(blob, sizeof(blob), &at, "\n");
+
+    append_text(blob, sizeof(blob), &at, "qos=");
+    append_dec(blob, sizeof(blob), &at, (int)sched.qos_mode);
+    append_text(blob, sizeof(blob), &at, " budget=");
+    append_dec(blob, sizeof(blob), &at, (int)sched.budget_pct);
+    append_text(blob, sizeof(blob), &at, " q_total=");
+    append_dec(blob, sizeof(blob), &at, (int)sched.queue_depth);
+    append_text(blob, sizeof(blob), &at, " q_stream=");
+    append_dec(blob, sizeof(blob), &at, (int)sched.stream_queue_depth);
+    append_text(blob, sizeof(blob), &at, " q_batch=");
+    append_dec(blob, sizeof(blob), &at, (int)sched.batch_queue_depth);
+    append_text(blob, sizeof(blob), &at, " drop=");
+    append_dec(blob, sizeof(blob), &at, (int)sched.dropped);
+    append_text(blob, sizeof(blob), &at, "\n");
+
+    append_text(blob, sizeof(blob), &at, "train_active=");
+    append_dec(blob, sizeof(blob), &at, (int)tr.active);
+    append_text(blob, sizeof(blob), &at, " steps=");
+    append_dec(blob, sizeof(blob), &at, (int)tr.total_steps);
+    append_text(blob, sizeof(blob), &at, " ckpt=");
+    append_dec(blob, sizeof(blob), &at, (int)tr.checkpoints);
+    append_text(blob, sizeof(blob), &at, " rollback=");
+    append_dec(blob, sizeof(blob), &at, (int)tr.rollbacks);
+    append_text(blob, sizeof(blob), &at, "\n");
+
+    append_text(blob, sizeof(blob), &at, "replay_rec=");
+    append_dec(blob, sizeof(blob), &at, replay_recording ? 1 : 0);
+    append_text(blob, sizeof(blob), &at, " replay_cmds=");
+    append_dec(blob, sizeof(blob), &at, replay_count);
+    append_text(blob, sizeof(blob), &at, "\n");
+
+    wrote = vfs_write_file(path, blob, (uint32_t)at);
+    if (wrote != at) {
+      set_cmd_output("AI EXPORT FAIL");
+      return;
+    }
+    set_cmd_output("AI EXPORT OK");
+    return;
+  }
+
   if (str_eq(sub, "train")) {
     if (a[0] == '\0' || str_eq(a, "stat")) {
       ai_train_get_stats(&tr);
@@ -1853,7 +1924,7 @@ static void cmd_ai(const char *args) {
     return;
   }
 
-  set_cmd_output("USAGE: ai model|qos|infer|bench|train|stat");
+  set_cmd_output("USAGE: ai model|qos|infer|bench|train|export|stat");
 }
 
 static uint32_t metric_avg_cycles(const ProfileMetric *m) {
@@ -4663,8 +4734,16 @@ static void cmd_audio(const char *args) {
       gprint_dec((int)streams[i].freq_hz, 0xFFFFFF);
       gprint(" vol=", 0xAAAAAA);
       gprint_dec(streams[i].volume_pct, 0xFFFFFF);
+      gprint(" mode=", 0xAAAAAA);
+      gprint_dec((int)streams[i].mode, 0xFFFFFF);
+      gprint(" qos=", 0xAAAAAA);
+      gprint_dec((int)streams[i].priority_qos, 0xFFFFFF);
+      gprint(" rlim=", 0xAAAAAA);
+      gprint_dec((int)streams[i].max_samples_per_tick, 0xFFFFFF);
       gprint("% underrun=", 0xAAAAAA);
       gprint_dec((int)streams[i].underruns, 0xFFFFFF);
+      gprint(" pdrop=", 0xAAAAAA);
+      gprint_dec((int)streams[i].policy_drops, 0xFFFFFF);
       gprint("\n", 0x000000);
     }
     if (!active) {
@@ -4756,6 +4835,148 @@ static void cmd_audio(const char *args) {
       return;
     }
     set_cmd_output("AUDIO VOLUME");
+    return;
+  }
+
+  if (str_eq(sub, "policy")) {
+    int stream_id;
+    int prio;
+    int rate_limit;
+    if (!is_dec_number(arg1) || !is_dec_number(arg2) || !is_dec_number(arg3)) {
+      set_cmd_output("USAGE: audio policy <id> <prio0..3> <rate1..64>");
+      return;
+    }
+    stream_id = parse_u32_dec(arg1);
+    prio = parse_u32_dec(arg2);
+    rate_limit = parse_u32_dec(arg3);
+    if (!audio_stream_ctl(stream_id, AUDIO_CTL_SET_PRIORITY, (uint32_t)prio, 0) ||
+        !audio_stream_ctl(stream_id, AUDIO_CTL_SET_RATE_LIMIT, (uint32_t)rate_limit, 0)) {
+      set_cmd_output("AUDIO POLICY FAIL");
+      return;
+    }
+    set_cmd_output("AUDIO POLICY");
+    return;
+  }
+
+  if (str_eq(sub, "cap")) {
+    int cap_id;
+    uint32_t hz = 16000;
+    uint32_t ch = 1;
+    uint32_t bits = 16;
+    uint32_t frames = 128;
+
+    if (arg1[0] == '\0' || str_eq(arg1, "stat")) {
+      set_cmd_output("USAGE: audio cap open|read|close ...");
+      return;
+    }
+    if (str_eq(arg1, "open")) {
+      if (arg2[0] != '\0') {
+        if (!is_dec_number(arg2)) {
+          set_cmd_output("USAGE: audio cap open [hz] [ch] [bits]");
+          return;
+        }
+        hz = (uint32_t)parse_u32_dec(arg2);
+      }
+      if (arg3[0] != '\0') {
+        if (!is_dec_number(arg3)) {
+          set_cmd_output("USAGE: audio cap open [hz] [ch] [bits]");
+          return;
+        }
+        ch = (uint32_t)parse_u32_dec(arg3);
+      }
+      if (arg4[0] != '\0') {
+        if (!is_dec_number(arg4)) {
+          set_cmd_output("USAGE: audio cap open [hz] [ch] [bits]");
+          return;
+        }
+        bits = (uint32_t)parse_u32_dec(arg4);
+      }
+      cap_id = audio_stream_open(hz, ch, bits, AUDIO_STREAM_FLAG_CAPTURE);
+      if (cap_id < 0) {
+        set_cmd_output("AUDIO CAP OPEN FAIL");
+        return;
+      }
+      set_cmd_output("AUDIO CAP OPEN");
+      return;
+    }
+    if (str_eq(arg1, "read")) {
+      int16_t scratch[256 * 2];
+      AudioStream streams[AUDIO_MAX_STREAMS];
+      char status[80];
+      int si = 0;
+      int scount;
+      uint32_t channels = 1u;
+      int bytes;
+      int sample0 = 0;
+      int sample1 = 0;
+      if (!is_dec_number(arg2)) {
+        set_cmd_output("USAGE: audio cap read <id> [frames]");
+        return;
+      }
+      cap_id = parse_u32_dec(arg2);
+      if (arg3[0] != '\0') {
+        if (!is_dec_number(arg3)) {
+          set_cmd_output("USAGE: audio cap read <id> [frames]");
+          return;
+        }
+        frames = (uint32_t)parse_u32_dec(arg3);
+      }
+      if (frames > 256u) {
+        frames = 256u;
+      }
+
+      scount = audio_get_streams(streams, AUDIO_MAX_STREAMS);
+      if (cap_id >= 0 && cap_id < scount && streams[cap_id].channels > 0u) {
+        channels = streams[cap_id].channels;
+      }
+
+      bytes = audio_stream_read(cap_id, scratch, frames * channels * 2u);
+      if (bytes <= 0) {
+        set_cmd_output("AUDIO CAP READ EMPTY");
+        return;
+      }
+      sample0 = scratch[0];
+      if (bytes >= 4) {
+        sample1 = scratch[1];
+      }
+      gprint("AUDIO CAP bytes=", 0x99EEFF);
+      gprint_dec(bytes, 0xFFFFFF);
+      gprint(" s0=", 0x99EEFF);
+      gprint_dec(sample0, 0xFFFFFF);
+      gprint(" s1=", 0x99EEFF);
+      gprint_dec(sample1, 0xFFFFFF);
+      gprint("\n", 0x000000);
+      copy_cmd_text(status, "AUDIO CAP READ bytes=", sizeof(status));
+      while (status[si] && si < (int)sizeof(status) - 1) {
+        si++;
+      }
+      if (si < (int)sizeof(status) - 1) {
+        append_dec(status, sizeof(status), &si, bytes);
+      }
+      if (si < (int)sizeof(status) - 4) {
+        append_text(status, sizeof(status), &si, " s0=");
+        append_dec(status, sizeof(status), &si, sample0);
+      }
+      if (si < (int)sizeof(status) - 4) {
+        append_text(status, sizeof(status), &si, " s1=");
+        append_dec(status, sizeof(status), &si, sample1);
+      }
+      set_cmd_output(status);
+      return;
+    }
+    if (str_eq(arg1, "close")) {
+      if (!is_dec_number(arg2)) {
+        set_cmd_output("USAGE: audio cap close <id>");
+        return;
+      }
+      if (!audio_stop_stream(parse_u32_dec(arg2))) {
+        set_cmd_output("AUDIO CAP CLOSE FAIL");
+        return;
+      }
+      set_cmd_output("AUDIO CAP CLOSE");
+      return;
+    }
+    set_cmd_output("USAGE: audio cap open|read|close ...");
     return;
   }
 
@@ -4869,7 +5090,7 @@ static void cmd_audio(const char *args) {
     return;
   }
 
-  set_cmd_output("USAGE: audio list|play [hz] [vol]|stop [id|all]|stat|volume <id> <0..100>|drv ...");
+  set_cmd_output("USAGE: audio list|play|stop|stat|volume|policy|cap|drv ...");
 }
 
 static void cmd_sonify(const char *args) {

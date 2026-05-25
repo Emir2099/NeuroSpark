@@ -49,6 +49,8 @@ static int prev_mouse_buttons = 0;
 static int mouse_enabled = 0;
 
 static int key_shift = 0;
+static int key_lshift = 0;
+static int key_rshift = 0;
 static int key_ctrl = 0;
 static int key_alt = 0;
 static int key_caps = 0;
@@ -161,8 +163,12 @@ static char get_ascii(uint8_t scancode) {
 }
 
 static void update_modifier(uint8_t scancode, int pressed) {
-  if (scancode == 0x2A || scancode == 0x36) {
-    key_shift = pressed;
+  if (scancode == 0x2A) {
+    key_lshift = pressed;
+    key_shift = key_lshift || key_rshift;
+  } else if (scancode == 0x36) {
+    key_rshift = pressed;
+    key_shift = key_lshift || key_rshift;
   } else if (scancode == 0x1D) {
     key_ctrl = pressed;
   } else if (scancode == 0x38) {
@@ -174,6 +180,8 @@ static void update_modifier(uint8_t scancode, int pressed) {
 
 void init_input_stack(void) {
   key_shift = 0;
+  key_lshift = 0;
+  key_rshift = 0;
   key_ctrl = 0;
   key_alt = 0;
   key_caps = 0;
@@ -222,6 +230,11 @@ void keyboard_handler(void) {
     return;
 
   char c = get_ascii(code);
+
+  /* Robust '-'/'_' mapping across main and keypad minus keys. */
+  if (code == 0x0C || code == 0x4A) {
+    c = key_shift ? '_' : '-';
+  }
 
   if (!wm_focused_needs_keyboard()) {
     if (code == 0x3B || code == 0x3C || code == 0x3D || code == 0x3E ||

@@ -3,12 +3,12 @@
 
 typedef unsigned int uint32_t;
 
-enum {
-  AUDIO_CTL_STOP = 1,
-  AUDIO_CTL_SET_VOLUME = 2,
-  AUDIO_CTL_SET_FREQ = 3,
-  AUDIO_CTL_SONIFY = 4
-};
+#define AUDIO_CTL_STOP 1u
+#define AUDIO_CTL_SET_VOLUME 2u
+#define AUDIO_CTL_SET_FREQ 3u
+#define AUDIO_CTL_SONIFY 4u
+#define AUDIO_CTL_SET_PRIORITY 5u
+#define AUDIO_CTL_SET_RATE_LIMIT 6u
 
 typedef struct {
   uint32_t sample_rate;
