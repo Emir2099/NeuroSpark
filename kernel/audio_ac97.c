@@ -1,5 +1,4 @@
 #include "audio_ac97.h"
-
 #include "audio.h"
 #include "pci.h"
 
@@ -14,6 +13,52 @@ typedef int int32_t;
 #define AC97_ERR_RESET_INJECTED 5u
 
 static AudioAc97Report g_ac97;
+
+static uint32_t nambar = 0;
+static uint32_t nabmbar = 0;
+
+/* BDL structures */
+typedef struct {
+  uint32_t buffer_addr;
+  uint16_t length;
+  uint16_t flags;
+} __attribute__((packed)) Ac97BDL;
+
+#define AC97_BDL_IOC 0x8000
+#define AC97_BDL_BUP 0x4000
+
+#define BDL_ENTRIES 32
+
+static Ac97BDL *bdl;
+static int16_t *pcm_buffers;
+static uint8_t current_lvi = 0;
+
+extern void *pmm_alloc_page(void);
+
+static inline void outb(uint16_t port, uint8_t val) {
+  __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+static inline uint8_t inb(uint16_t port) {
+  uint8_t ret;
+  __asm__ volatile("inb %1, %0" : "=a"(ret) : "Nd"(port));
+  return ret;
+}
+static inline void outw(uint16_t port, uint16_t val) {
+  __asm__ volatile("outw %0, %1" : : "a"(val), "Nd"(port));
+}
+static inline uint16_t inw(uint16_t port) {
+  uint16_t ret;
+  __asm__ volatile("inw %1, %0" : "=a"(ret) : "Nd"(port));
+  return ret;
+}
+static inline void outl(uint16_t port, uint32_t val) {
+  __asm__ volatile("outl %0, %1" : : "a"(val), "Nd"(port));
+}
+static inline uint32_t inl(uint16_t port) {
+  uint32_t ret;
+  __asm__ volatile("inl %1, %0" : "=a"(ret) : "Nd"(port));
+  return ret;
+}
 
 static int is_supported_rate(uint32_t hz) {
   return hz == 8000u || hz == 11025u || hz == 16000u || hz == 22050u ||
@@ -50,8 +95,17 @@ static uint32_t crc32ish_mix(uint32_t crc, uint16_t v) {
   return crc;
 }
 
+static void ac97_real_reset(void) {
+  if (!nambar || !nabmbar) return;
+  outw(nambar + 0x00, 1);
+  for(volatile int i=0; i<10000; i++) {}
+  outw(nambar + 0x02, 0x0000);
+  outw(nambar + 0x18, 0x0000);
+}
+
 void audio_ac97_driver_init(void) {
   int i;
+  uint32_t cmd;
 
   g_ac97.detected = 0;
   g_ac97.enabled = 0;
@@ -69,13 +123,39 @@ void audio_ac97_driver_init(void) {
     PciDevice *dev = &pci_found[i];
     if (dev->class_code == 0x04 && dev->subclass == 0x01) {
       g_ac97.detected = 1;
-      g_ac97.enabled = 1;
       g_ac97.bus = dev->bus;
       g_ac97.slot = dev->slot;
       g_ac97.function = dev->function;
       g_ac97.vendor = dev->vendor;
       g_ac97.device = dev->device_id;
-      g_ac97.last_error = AC97_ERR_NONE;
+      
+      nambar = pci_read_config(dev->bus, dev->slot, dev->function, 0x10) & ~1u;
+      nabmbar = pci_read_config(dev->bus, dev->slot, dev->function, 0x14) & ~1u;
+
+      if (nambar && nabmbar) {
+        cmd = pci_read_config(dev->bus, dev->slot, dev->function, 0x04);
+        pci_write_config(dev->bus, dev->slot, dev->function, 0x04, cmd | 0x05);
+        
+        bdl = (Ac97BDL *)pmm_alloc_page();
+        pcm_buffers = (int16_t *)pmm_alloc_page();
+      }
+      
+      if (bdl && pcm_buffers) {
+        int j;
+        for (j=0; j<BDL_ENTRIES; j++) {
+            bdl[j].buffer_addr = (uint32_t)pcm_buffers + (j * 128);
+            bdl[j].length = 64;
+            bdl[j].flags = AC97_BDL_IOC;
+        }
+        
+        ac97_real_reset();
+
+        outb(nabmbar + 0x1B, 0x02);
+        outl(nabmbar + 0x10, (uint32_t)bdl);
+        
+        g_ac97.enabled = 1;
+        g_ac97.last_error = AC97_ERR_NONE;
+      }
       return;
     }
   }
@@ -123,8 +203,19 @@ int audio_ac97_negotiate_format(uint32_t sample_rate, uint32_t channels,
 }
 
 int audio_ac97_submit_frames(uint32_t frames) {
-  if (frames == 0u) {
+  if (frames == 0u || !g_ac97.enabled) {
     return 1;
+  }
+  
+  if (nambar && nabmbar) {
+      uint8_t civ = inb(nabmbar + 0x14);
+      current_lvi = (civ + 2) % BDL_ENTRIES;
+      outb(nabmbar + 0x15, current_lvi);
+      
+      uint8_t cr = inb(nabmbar + 0x1B);
+      if ((cr & 1) == 0) {
+          outb(nabmbar + 0x1B, cr | 1);
+      }
   }
 
   g_ac97.dma_frames += frames;
@@ -148,6 +239,8 @@ int audio_ac97_reset(int inject_fault) {
     g_ac97.last_error = AC97_ERR_NO_DEVICE;
     return 0;
   }
+
+  ac97_real_reset();
 
   g_ac97.enabled = 1;
   g_ac97.reset_ok++;
@@ -220,11 +313,6 @@ int audio_ac97_run_loopback_test(uint32_t frames, uint32_t sample_rate,
       return 0;
     }
 
-    /*
-     * In phasecheck/driver self-tests there may be no periodic scheduler tick
-     * draining PCM rings. Drain explicitly so loopback validates I/O behavior
-     * instead of failing on temporary ring backpressure.
-     */
     for (i = 0; i < wrote_frames; i++) {
       audio_tick();
     }
