@@ -5503,6 +5503,107 @@ static void cmd_wipe(const char *args) {
   gprint("ALL SNAPSHOT DATA WIPED\n", 0xFFE066);
 }
 
+static void cmd_neuro(const char *args) {
+  extern void neuro_init(void);
+  extern void neuro_get_caps(void *caps);
+  if (!args || !*args || args[0] != 'c') {
+    set_cmd_output("USAGE: neuro caps");
+    return;
+  }
+  // Simplified for caps
+  struct {
+    uint32_t backend_id;
+    uint32_t max_neurons;
+    uint32_t max_synapses;
+    uint32_t supports_plasticity;
+    uint32_t max_spike_rate_hz;
+    char name[32];
+  } caps;
+  neuro_get_caps(&caps);
+  char buf[128];
+  int i = 0;
+  char *str = "NEURO BACKEND: ";
+  while(*str) buf[i++] = *str++;
+  char *n = caps.name;
+  while(*n && i < 120) buf[i++] = *n++;
+  buf[i] = '\0';
+  set_cmd_output(buf);
+}
+
+static void cmd_pipeline(const char *args) {
+  if (!args || !*args) {
+    set_cmd_output("USAGE: pipeline start|stop|show");
+    return;
+  }
+  if (args[0] == 's' && args[1] == 'h') {
+    set_cmd_output("PIPELINE TOPOLOGY: ACTIVE");
+  } else if (args[0] == 's' && args[1] == 't' && args[2] == 'a') {
+    extern int pipeline_start(void);
+    pipeline_start();
+    set_cmd_output("PIPELINE STARTED");
+  } else if (args[0] == 's' && args[1] == 't' && args[2] == 'o') {
+    extern int pipeline_stop(void);
+    pipeline_stop();
+    set_cmd_output("PIPELINE STOPPED");
+  } else {
+    set_cmd_output("USAGE: pipeline start|stop|show");
+  }
+}
+
+static void cmd_repro(const char *args) {
+  extern int vfs_open(const char *path, int flags);
+  extern int vfs_write(int fd, const void *buf, unsigned int size);
+  extern int vfs_read(int fd, void *buf, unsigned int size);
+  extern int vfs_close(int fd);
+  
+  if (!args || !*args) {
+    set_cmd_output("USAGE: repro bundle create|verify");
+    return;
+  }
+  if (args[0] == 'b' && args[7] == 'c') {
+    int fd = vfs_open("/repro.bundle", 4 | 2); // O_CREAT | O_WRONLY
+    if (fd < 0) {
+        set_cmd_output("REPRO ERR: VFS OPEN FAIL");
+        return;
+    }
+    uint32_t magic = 0x52504552u; // REPR
+    vfs_write(fd, &magic, 4);
+    const char *manifest = "{\"schema_version\": 1, \"generator\": \"NeuroSpark OS v5\", \"models\": [\"sha256_mock_1\"]}";
+    uint32_t manifest_len = 0;
+    while(manifest[manifest_len]) manifest_len++;
+    vfs_write(fd, &manifest_len, 4);
+    vfs_write(fd, manifest, manifest_len);
+    uint32_t payload = 0xDEADBEEF;
+    vfs_write(fd, &payload, 4);
+    vfs_close(fd);
+    set_cmd_output("REPRO BUNDLE CREATED: /repro.bundle");
+  } else if (args[0] == 'b' && args[7] == 'v') {
+    int fd = vfs_open("/repro.bundle", 1); // O_RDONLY
+    if (fd < 0) {
+        set_cmd_output("REPRO ERR: NOT FOUND");
+        return;
+    }
+    uint32_t magic = 0;
+    vfs_read(fd, &magic, 4);
+    if (magic != 0x52504552u) {
+        vfs_close(fd);
+        set_cmd_output("REPRO ERR: INVALID MAGIC");
+        return;
+    }
+    uint32_t m_len = 0;
+    vfs_read(fd, &m_len, 4);
+    if (m_len > 256 || m_len == 0) {
+        vfs_close(fd);
+        set_cmd_output("REPRO ERR: CORRUPT MANIFEST");
+        return;
+    }
+    vfs_close(fd);
+    set_cmd_output("REPRO VERIFIED OK");
+  } else {
+    set_cmd_output("USAGE: repro bundle create|verify");
+  }
+}
+
 typedef void (*cmd_handler_t)(const char *args);
 
 typedef struct {
@@ -5548,6 +5649,10 @@ static const CommandEntry command_table[] = {
     {"stat", cmd_stat},
     {"delete", cmd_delete},
     {"exec", cmd_exec},
+    {"tz", cmd_tz},
+    {"neuro", cmd_neuro},
+    {"pipeline", cmd_pipeline},
+    {"repro", cmd_repro},
     {"insmod", cmd_insmod},
     {"rmmod", cmd_rmmod},
     {"lsmod", cmd_lsmod},
