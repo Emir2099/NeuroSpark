@@ -1,3 +1,0 @@
-run: NeuroSpark.bin
-	@echo "Booting as Hard Disk 0x80..."
-	qemu-system-i386 -drive file=$<,format=raw,index=0,media=disk -display curseso
