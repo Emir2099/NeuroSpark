@@ -1,5 +1,4 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/neurospark/neurospark/main/assets/neurospark_logo.png" alt="NeuroSpark OS Logo" width="150"/>
   <h1>NeuroSpark OS</h1>
   <p><b>A Neuromorphic-First Operating System for Edge AI</b></p>
 
