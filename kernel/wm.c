@@ -1323,7 +1323,17 @@ static void draw_content_console(int x, int y, int w, int h) {
     cursor_y = ty + 6;
     gprint("Axiom Console", 0xAEDDFF);
 
-    if (cmd_output_valid) {
+    extern char cmd_ml_buf[20][80];
+    extern int  cmd_ml_count;
+    if (cmd_ml_count > 0) {
+        /* Multi-line output (e.g. profile show) */
+        int max_lines = (th - 50) / 11;  /* leave room for header + prompt */
+        if (max_lines > cmd_ml_count) max_lines = cmd_ml_count;
+        if (max_lines > 20) max_lines = 20;
+        for (int ln = 0; ln < max_lines; ln++) {
+            draw_console_line_clipped(tx + 6, ty + 24 + ln * 11, chars, cmd_ml_buf[ln], 0x68E8A3);
+        }
+    } else if (cmd_output_valid) {
         draw_console_line_clipped(tx + 6, ty + 24, chars, cmd_output, 0x68E8A3);
     }
 

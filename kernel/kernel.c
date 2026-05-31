@@ -250,6 +250,8 @@ int cmd_output_valid = 0;
 volatile int cmd_output_timeout = 0;  /* Frames left to display output */
 
 void set_cmd_output(const char *text) {
+  extern int cmd_ml_count;
+  cmd_ml_count = 0;  /* clear multi-line output when switching to single-line */
   if (text == 0) { cmd_output_valid = 0; return; }
   int len = 0;
   while (text[len] && len < CMD_OUTPUT_LEN - 1) len++;
@@ -257,6 +259,35 @@ void set_cmd_output(const char *text) {
   cmd_output[len] = '\0';
   cmd_output_valid = 1;
   cmd_output_timeout = 300;  /* Show for ~3 seconds at 100 FPS */
+}
+
+/* Multi-line output buffer: used by commands like 'profile show'
+ * that need to persist across render frames.                       */
+#define CMD_ML_LINES  20
+#define CMD_ML_WIDTH  80
+char cmd_ml_buf[CMD_ML_LINES][CMD_ML_WIDTH];
+int  cmd_ml_count = 0;
+
+void set_cmd_output_ml(const char *text) {
+  int line = 0, col = 0;
+  cmd_output_valid = 0;   /* suppress the single-line bar */
+  for (int i = 0; i < CMD_ML_LINES; i++) cmd_ml_buf[i][0] = '\0';
+  if (!text) { cmd_ml_count = 0; return; }
+  while (*text && line < CMD_ML_LINES) {
+    if (*text == '\n') {
+      cmd_ml_buf[line][col] = '\0';
+      line++;
+      col = 0;
+    } else if (col < CMD_ML_WIDTH - 1) {
+      cmd_ml_buf[line][col++] = *text;
+    }
+    text++;
+  }
+  if (col > 0 || line == 0) {
+    cmd_ml_buf[line][col] = '\0';
+    line++;
+  }
+  cmd_ml_count = line;
 }
 
 /* VESA Graphics Globals */
@@ -1509,11 +1540,26 @@ void shell_render() {
   shell_cursor_x = 16 + (buffer_idx * 8); /* 16 = "> " width */
 
   /* Draw persistent command output BELOW input line (y=330+) */
-  clear_region(0, 330, 800, 345, 0x000033);
-  if (cmd_output_valid) {
-    cursor_x = 0;
-    cursor_y = 330;
-    gprint(cmd_output, 0x44FF88);  /* green text */
+  extern char cmd_ml_buf[20][80];
+  extern int  cmd_ml_count;
+  if (cmd_ml_count > 0) {
+    /* Multi-line mode: clear enough rows and redraw every line */
+    int ml_h = cmd_ml_count * 11 + 4;
+    if (ml_h < 16) ml_h = 16;
+    clear_region(0, 328, 800, 328 + ml_h, 0x000033);
+    for (int ln = 0; ln < cmd_ml_count; ln++) {
+      cursor_x = 0;
+      cursor_y = 330 + ln * 11;
+      gprint(cmd_ml_buf[ln], 0x44FF88);
+    }
+  } else {
+    /* Single-line mode: original behaviour */
+    clear_region(0, 330, 800, 345, 0x000033);
+    if (cmd_output_valid) {
+      cursor_x = 0;
+      cursor_y = 330;
+      gprint(cmd_output, 0x44FF88);
+    }
   }
 
   /* Restore gprint cursor */

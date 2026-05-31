@@ -1968,88 +1968,104 @@ static void cmd_profile(const char *args) {
   next_token(args, path, sizeof(path));
 
   if (sub[0] == '\0' || str_eq(sub, "show")) {
+    /* ----------------------------------------------------------------
+     * Raw gprint() output is erased on the very next render frame.
+     * Build the stats into a static ML buffer and hand it to
+     * set_cmd_output_ml() so shell_render() redraws it every frame.
+     * ---------------------------------------------------------------- */
+    extern void set_cmd_output_ml(const char *text);
+    extern void itoa(int n, char *str);
+
+    static char ml[1200];   /* ~20 lines x 60 chars */
+    static char tmp[24];
+    int pos = 0;
+
+/* helpers: append string / integer / newline into ml[] */
+#define MLA(literal)  do { \
+    const char *_p = (literal); \
+    while (*_p && pos < (int)sizeof(ml) - 2) ml[pos++] = *_p++; \
+  } while (0)
+#define MLI(v)  do { itoa((int)(v), tmp); MLA(tmp); } while (0)
+#define MLN()   do { ml[pos++] = '\n'; } while (0)
+
     profile_snapshot(&snap);
     cmd_stat_count = profile_get_command_stats(cmd_stats, 6);
-    sample_count = profile_get_stack_samples(samples, 8);
-    gprint("PROFILE ", 0x99EEFF);
-    gprint(snap.enabled ? "ON" : "OFF", snap.enabled ? 0x44FF88 : 0xFFAA66);
-    gprint(" HUD:", 0x99EEFF);
-    gprint(profile_get_hud_mode() == PROFILE_HUD_DETAILED ? "DETAIL" : "COMPACT", 0xFFFFFF);
-    gprint("\n", 0x000000);
+    sample_count   = profile_get_stack_samples(samples, 8);
 
-    gprint("RENDER  avg:", 0xAACCEE);
-    gprint_dec((int)metric_avg_cycles(&snap.slots[PROFILE_SLOT_RENDER_PASS]), 0xFFFFFF);
-    gprint(" roll:", 0xAACCEE);
-    gprint_dec((int)metric_rolling_cycles(PROFILE_SLOT_RENDER_PASS), 0xFFFFFF);
-    gprint(" min:", 0xAACCEE);
-    gprint_dec((int)metric_min_cycles(&snap.slots[PROFILE_SLOT_RENDER_PASS]), 0xFFFFFF);
-    gprint(" max:", 0xAACCEE);
-    gprint_dec((int)metric_max_cycles(&snap.slots[PROFILE_SLOT_RENDER_PASS]), 0xFFFFFF);
-    gprint("\n", 0x000000);
+    MLA("PROFILE "); MLA(snap.enabled ? "ON" : "OFF");
+    MLA("  HUD:"); MLA(profile_get_hud_mode() == PROFILE_HUD_DETAILED ? "DETAIL" : "COMPACT");
+    MLN();
 
-    gprint("SCHED   avg:", 0xAACCEE);
-    gprint_dec((int)metric_avg_cycles(&snap.slots[PROFILE_SLOT_SCHED_TICK]), 0xFFFFFF);
-    gprint(" roll:", 0xAACCEE);
-    gprint_dec((int)metric_rolling_cycles(PROFILE_SLOT_SCHED_TICK), 0xFFFFFF);
-    gprint(" min:", 0xAACCEE);
-    gprint_dec((int)metric_min_cycles(&snap.slots[PROFILE_SLOT_SCHED_TICK]), 0xFFFFFF);
-    gprint(" max:", 0xAACCEE);
-    gprint_dec((int)metric_max_cycles(&snap.slots[PROFILE_SLOT_SCHED_TICK]), 0xFFFFFF);
-    gprint("\n", 0x000000);
+    MLA("RENDER  avg:"); MLI(metric_avg_cycles(&snap.slots[PROFILE_SLOT_RENDER_PASS]));
+    MLA(" roll:");       MLI(metric_rolling_cycles(PROFILE_SLOT_RENDER_PASS));
+    MLA(" min:");        MLI(metric_min_cycles(&snap.slots[PROFILE_SLOT_RENDER_PASS]));
+    MLA(" max:");        MLI(metric_max_cycles(&snap.slots[PROFILE_SLOT_RENDER_PASS]));
+    MLN();
 
-    gprint("SPIKE   avg:", 0xAACCEE);
-    gprint_dec((int)metric_avg_cycles(&snap.slots[PROFILE_SLOT_SPIKE_UPDATE]), 0xFFFFFF);
-    gprint(" roll:", 0xAACCEE);
-    gprint_dec((int)metric_rolling_cycles(PROFILE_SLOT_SPIKE_UPDATE), 0xFFFFFF);
-    gprint(" min:", 0xAACCEE);
-    gprint_dec((int)metric_min_cycles(&snap.slots[PROFILE_SLOT_SPIKE_UPDATE]), 0xFFFFFF);
-    gprint(" max:", 0xAACCEE);
-    gprint_dec((int)metric_max_cycles(&snap.slots[PROFILE_SLOT_SPIKE_UPDATE]), 0xFFFFFF);
-    gprint("\n", 0x000000);
+    MLA("SCHED   avg:"); MLI(metric_avg_cycles(&snap.slots[PROFILE_SLOT_SCHED_TICK]));
+    MLA(" roll:");       MLI(metric_rolling_cycles(PROFILE_SLOT_SCHED_TICK));
+    MLA(" min:");        MLI(metric_min_cycles(&snap.slots[PROFILE_SLOT_SCHED_TICK]));
+    MLA(" max:");        MLI(metric_max_cycles(&snap.slots[PROFILE_SLOT_SCHED_TICK]));
+    MLN();
 
-    gprint("CMD     avg:", 0xAACCEE);
-    gprint_dec((int)metric_avg_cycles(&snap.slots[PROFILE_SLOT_COMMAND]), 0xFFFFFF);
-    gprint(" roll:", 0xAACCEE);
-    gprint_dec((int)metric_rolling_cycles(PROFILE_SLOT_COMMAND), 0xFFFFFF);
-    gprint(" min:", 0xAACCEE);
-    gprint_dec((int)metric_min_cycles(&snap.slots[PROFILE_SLOT_COMMAND]), 0xFFFFFF);
-    gprint(" max:", 0xAACCEE);
-    gprint_dec((int)metric_max_cycles(&snap.slots[PROFILE_SLOT_COMMAND]), 0xFFFFFF);
-    gprint("\n", 0x000000);
+    MLA("SPIKE   avg:"); MLI(metric_avg_cycles(&snap.slots[PROFILE_SLOT_SPIKE_UPDATE]));
+    MLA(" roll:");       MLI(metric_rolling_cycles(PROFILE_SLOT_SPIKE_UPDATE));
+    MLA(" min:");        MLI(metric_min_cycles(&snap.slots[PROFILE_SLOT_SPIKE_UPDATE]));
+    MLA(" max:");        MLI(metric_max_cycles(&snap.slots[PROFILE_SLOT_SPIKE_UPDATE]));
+    MLN();
 
-    gprint("HIST <50k/200k/500k/1M/>1M: ", 0x99EEFF);
+    MLA("CMD     avg:"); MLI(metric_avg_cycles(&snap.slots[PROFILE_SLOT_COMMAND]));
+    MLA(" roll:");       MLI(metric_rolling_cycles(PROFILE_SLOT_COMMAND));
+    MLA(" min:");        MLI(metric_min_cycles(&snap.slots[PROFILE_SLOT_COMMAND]));
+    MLA(" max:");        MLI(metric_max_cycles(&snap.slots[PROFILE_SLOT_COMMAND]));
+    MLN();
+
+    MLA("HIST:");
     for (int i = 0; i < PROFILE_CMD_HIST_BUCKETS; i++) {
-      gprint_dec((int)snap.cmd_hist[i], 0xFFFFFF);
-      if (i != PROFILE_CMD_HIST_BUCKETS - 1) {
-        gprint("/", 0x666666);
-      }
+      MLI(snap.cmd_hist[i]);
+      if (i != PROFILE_CMD_HIST_BUCKETS - 1) MLA("/");
     }
-    gprint("\n", 0x000000);
+    MLN();
 
     if (cmd_stat_count > 0) {
-      gprint("TOP CMDS avg/roll: ", 0x99EEFF);
-      gprint("\n", 0x000000);
+      MLA("TOP CMDS avg/roll:"); MLN();
       for (int i = 0; i < cmd_stat_count; i++) {
-        gprint(" ", 0x000000);
-        gprint(cmd_stats[i].name, 0x77C8FF);
-        gprint(" ", 0x000000);
+        MLA("  "); MLA(cmd_stats[i].name); MLA(" ");
         if (cmd_stats[i].metric.count > 0) {
-          gprint_dec((int)(cmd_stats[i].metric.total_cycles / cmd_stats[i].metric.count), 0xFFFFFF);
+          MLI(cmd_stats[i].metric.total_cycles / cmd_stats[i].metric.count);
         } else {
-          gprint_dec(0, 0xFFFFFF);
+          MLA("0");
         }
-        gprint("/", 0x666666);
-        gprint_dec((int)cmd_stats[i].rolling_avg_cycles, 0xFFFFFF);
-        gprint("\n", 0x000000);
+        MLA("/"); MLI(cmd_stats[i].rolling_avg_cycles);
+        MLN();
       }
     }
 
-    gprint("SAMPLES: ", 0x99EEFF);
-    gprint_dec(sample_count, 0xFFFFFF);
-    gprint("\n", 0x000000);
-    for (int i = 0; i < sample_count; i++) {
-      print_profile_sample_line(&samples[i]);
+    MLA("SAMPLES:"); MLI(sample_count); MLN();
+    for (int i = 0; i < sample_count && i < 3; i++) {
+      MLA("  t:"); MLI(samples[i].task_id);
+      MLA(" tk:"); MLI(samples[i].tick);
+      MLA(" sp:");
+      for (uint32_t j = 0; j < samples[i].depth && j < 2; j++) {
+        uint32_t val = samples[i].frames[j];
+        MLA("0x");
+        for (int shift = 28; shift >= 0; shift -= 4) {
+          int digit = (val >> shift) & 0xF;
+          char c = (digit < 10) ? ('0' + digit) : ('a' + (digit - 10));
+          char buf[2] = {c, '\0'};
+          MLA(buf);
+        }
+        if (j + 1 < samples[i].depth && j + 1 < 2) MLA(";");
+      }
+      MLN();
     }
+
+#undef MLA
+#undef MLI
+#undef MLN
+
+    ml[pos] = '\0';
+    set_cmd_output_ml(ml);
     return;
   }
 
